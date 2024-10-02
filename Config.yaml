@@ -1,0 +1,49 @@
+[sinks.my_syslog_forwarder]
+  type = "syslog"
+  address = "syslog-forwarder.<namespace>.svc.cluster.local:5140"
+  mode = "tcp"
+  encoding.codec = "text"
+
+oc expose svc/syslog-forwarder --port=5140 --target-port=5140 --name=syslog-forwarder
+
+oc start-build syslog-forwarder --from-dir=. --follow
+
+oc new-app golang:latest --name=syslog-forwarder --binary
+
+oc new-app golang:latest~https://github.com/username/syslog-forwarder.git --name=syslog-forwarder
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: syslog-forwarder
+  labels:
+    app: syslog-forwarder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: syslog-forwarder
+  template:
+    metadata:
+      labels:
+        app: syslog-forwarder
+    spec:
+      containers:
+      - name: syslog-forwarder
+        image: image-registry.openshift-image-registry.svc:5000/<namespace>/syslog-forwarder:latest
+        ports:
+        - containerPort: 5140
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: syslog-forwarder
+spec:
+  selector:
+    app: syslog-forwarder
+  ports:
+  - protocol: TCP
+    port: 5140
+    targetPort: 5140
