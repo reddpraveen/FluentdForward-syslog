@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: fluentd-apps
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      @id container-input
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    # Filter by namespaces lpre-tms-dev01 and lprj-thx-sit01
+    <filter kubernetes.**>
+      @type record_transformer
+      <record>
+        namespace ${record["kubernetes"]["namespace_name"]}
+      </record>
+    </filter>
+
+    <match kubernetes.**>
+      @type grep
+      <regexp>
+        key namespace
+        pattern ^(lpre-tms-dev01|lprj-thx-sit01)$
+      </regexp>
+    </match>
+
+    # Forward logs to Fluentd forwarder or another output
+    <match kubernetes.**>
+      @type forward
+      <server>
+        host fluentd-remote-server
+        port 24224
+      </server>
+    </match>
