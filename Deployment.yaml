@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluentd-forward
+  namespace: fluentd-forward
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd-forward
+      containers:
+      - name: fluentd
+        image: registry.redhat.io/openshift-logging/fluentd-rhel9:latest
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/fluent/configs.d/user  # Custom configuration mounted here
+        - name: log-volume
+          mountPath: /var/log/fluentd-forward
+        - name: ca-bundle
+          mountPath: /etc/fluent/ca
+        ports:
+        - containerPort: 24224
+        env:
+        - name: FLUENT_CONF
+          value: "fluent.conf"  # This environment variable tells Fluentd where to find the configuration
+        - name: LOG_LEVEL
+          value: "info"  # Adjust the log level if needed (default is "info")
+        - name: BUFFER_PATH
+          value: "/var/log/fluentd-forward/buffer"  # Buffer for Fluentd
+      volumes:
+      - name: config-volume
+        configMap:
+          name: fluentd-config
+      - name: log-volume
+        hostPath:
+          path: /var/log/fluentd-forward
+          type: Directory
+      - name: ca-bundle
+        secret:
+          secretName: ca-bundle-secret
+
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: fluentd-forward
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      path /var/log/fluentd-forward/*.log
+      pos_file /var/log/fluentd-forward/pos/fluentd-forward.log.pos
+      tag application.*
+      <parse>
+        @type json
+      </parse>
+    </source>
+
+    <match application.**>
+      @type forward
+      <server>
+        name remote-fluentd
+        host your-remote-server.com
+        port 24224
+        tls true
+        tls_verify_hostname true
+        ca_cert /etc/fluent/ca/ca-bundle.crt
+      </server>
+    </match>
