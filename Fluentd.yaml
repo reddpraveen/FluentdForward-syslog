@@ -1,0 +1,140 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: fluentd-apps
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      @id container-input
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    # Exclude audit and system logs (if included earlier)
+    <filter kubernetes.var.log.audit>
+      @type grep
+      exclude audit
+    </filter>
+
+    # Example: send container logs to a Fluentd forward server
+    <match kubernetes.**>
+      @type forward
+      <server>
+        host fluentd-remote-server
+        port 24224
+      </server>
+    </match>
+
+#!/bin/bash
+set -e
+
+CFG_DIR=/etc/fluent/configs.d
+
+# Fluentd arguments initialization
+fluentdargs="--umask 0077 --no-supervisor"
+
+# Set the Fluentd configuration to point to our custom config
+FLUENT_CONF=$CFG_DIR/user/fluent.conf
+
+# Check if the configuration exists
+if [ ! -f "$FLUENT_CONF" ]; then
+  echo "ERROR: The configuration $FLUENT_CONF does not exist"
+  exit 1
+fi
+
+# Ensure the Fluentd logs directory is in place
+FILE_BUFFER_PATH=/var/lib/fluentd
+mkdir -p $FILE_BUFFER_PATH
+
+# Start Fluentd using the specified config
+exec fluentd -c $FLUENT_CONF -v
+
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluentd
+  namespace: fluentd-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      containers:
+      - name: fluentd
+        image: registry.redhat.io/openshift-logging/fluentd-rhel9:latest
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/fluent/configs.d
+        - name: log-volume
+          mountPath: /var/log/containers  # Ensure logs are mounted
+        - name: run-script
+          mountPath: /etc/fluent/run.sh
+          subPath: run.sh
+        command: ["/bin/bash"]
+        args: ["/etc/fluent/run.sh"]
+        securityContext:
+          privileged: true  # Adjust based on your security requirements
+      volumes:
+      - name: config-volume
+        configMap:
+          name: fluentd-config
+      - name: log-volume
+        hostPath:
+          path: /var/log/containers  # Use the directory where container logs are written
+          type: DirectoryOrCreate
+      - name: run-script
+        configMap:
+          name: fluentd-run-script
+  restartPolicy: Always
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-run-script
+  namespace: fluentd-apps
+data:
+  run.sh: |
+    #!/bin/bash
+    set -e
+
+    CFG_DIR=/etc/fluent/configs.d
+
+    # Fluentd arguments initialization
+    fluentdargs="--umask 0077 --no-supervisor"
+
+    # Set the Fluentd configuration to point to our custom config
+    FLUENT_CONF=$CFG_DIR/user/fluent.conf
+
+    # Check if the configuration exists
+    if [ ! -f "$FLUENT_CONF" ]; then
+      echo "ERROR: The configuration $FLUENT_CONF does not exist"
+      exit 1
+    fi
+
+    # Ensure the Fluentd logs directory is in place
+    FILE_BUFFER_PATH=/var/lib/fluentd
+    mkdir -p $FILE_BUFFER_PATH
+
+    # Start Fluentd using the specified config
+    exec fluentd -c $FLUENT_CONF -v
+
+
+
+oc apply -f fluentd-config.yaml
+oc apply -f fluentd-run-script.yaml
+oc apply -f fluentd-deployment.yaml
+
