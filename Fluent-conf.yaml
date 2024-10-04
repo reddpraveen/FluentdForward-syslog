@@ -41,3 +41,13 @@ data:
         port 24224
       </server>
     </match>
+
+
+<match **>
+  @type file
+  path /fluentd/log/test_output.log
+  append true
+  <buffer>
+    flush_interval 5s
+  </buffer>
+</match>
