@@ -1,0 +1,166 @@
+package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func metricsPageHandler(w http.ResponseWriter, r *http.Request) {
+    htmlContent := `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Cluster Insights</title>
+        <script>
+            async function getMustGatherData() {
+                const response = await fetch('/gather');
+                const data = await response.text();
+                document.getElementById('output').innerText = data;
+            }
+        </script>
+    </head>
+    <body>
+        <h1>Cluster Insights</h1>
+        <button onclick="getMustGatherData()">Run Must-Gather</button>
+        <pre id="output"></pre>
+    </body>
+    </html>`
+    
+    fmt.Fprintf(w, htmlContent)
+}
+
+func gatherHandler(w http.ResponseWriter, r *http.Request) {
+    // Dummy data or logic to run oc adm must-gather
+    result := "Must-Gather command output will appear here"
+    fmt.Fprintf(w, result)
+}
+
+func main() {
+    http.HandleFunc("/", metricsPageHandler)
+    http.HandleFunc("/gather", gatherHandler)
+
+    fmt.Println("Server started on port 8080...")
+    http.ListenAndServe(":8080", nil)
+}
+
+
+FROM golang:1.18 AS build
+
+WORKDIR /app
+COPY . .
+RUN go build -o must-gather-app .
+
+FROM gcr.io/distroless/base
+COPY --from=build /app/must-gather-app /must-gather-app
+COPY ./static /static
+CMD ["/must-gather-app"]
+
+
+
+---/////---------/-/
+
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/exec"
+)
+
+// Execute the oc login command using a token
+func ocLogin() error {
+    apiURL := os.Getenv("OC_API_URL")
+    token := os.Getenv("OC_TOKEN")
+
+    if apiURL == "" || token == "" {
+        return fmt.Errorf("missing required environment variables (OC_API_URL, OC_TOKEN)")
+    }
+
+    // Use the token for login
+    cmd := exec.Command("oc", "login", apiURL, "--token", token)
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        return fmt.Errorf("error running oc login: %v\nOutput: %s", err, string(output))
+    }
+    log.Printf("Logged in successfully: %s", string(output))
+    return nil
+}
+
+// Execute the must-gather command
+func runMustGather() (string, error) {
+    cmd := exec.Command("oc", "adm", "must-gather")
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        return "", fmt.Errorf("error running must-gather: %v\nOutput: %s", err, string(output))
+    }
+    return string(output), nil
+}
+
+func gatherHandler(w http.ResponseWriter, r *http.Request) {
+    // Perform oc login using token before running must-gather
+    err := ocLogin()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    // Run must-gather
+    result, err := runMustGather()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    fmt.Fprintf(w, "Must-Gather Output:\n%s", result)
+}
+
+func main() {
+    http.HandleFunc("/gather", gatherHandler)
+    log.Println("Server started on port 8080...")
+    http.ListenAndServe(":8080", nil)
+}
+
+
+
+export OC_API_URL="https://api.cluster.openshift.com:6443"
+export OC_TOKEN="your-oauth-token"
+
+oc create secret generic must-gather-token \
+  --from-literal=OC_API_URL="https://api.cluster.openshift.com:6443" \
+  --from-literal=OC_TOKEN="your-oauth-token"
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: must-gather-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: must-gather-app
+  template:
+    metadata:
+      labels:
+        app: must-gather-app
+    spec:
+      containers:
+      - name: must-gather-container
+        image: image-registry.openshift-image-registry.svc:5000/yourproject/must-gather-app
+        env:
+        - name: OC_API_URL
+          valueFrom:
+            secretKeyRef:
+              name: must-gather-token
+              key: OC_API_URL
+        - name: OC_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: must-gather-token
+              key: OC_TOKEN
+        ports:
+        - containerPort: 8080
+
+
+
