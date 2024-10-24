@@ -167,3 +167,37 @@ These enhancements would not only make LokiStack a more versatile and high-perfo
 
 
 
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "LokiLogLifecycle",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": [
+            "blockBlob"
+          ],
+          "prefixMatch": [
+            "loki/"
+          ]
+        },
+        "actions": {
+          "baseBlob": {
+            "tierToCool": {
+              "daysAfterModificationGreaterThan": 30
+            },
+            "tierToArchive": {
+              "daysAfterModificationGreaterThan": 90
+            },
+            "delete": {
+              "daysAfterModificationGreaterThan": 180
+            }
+          }
+        }
+      }
+    }
+  ]
+}
+
+
