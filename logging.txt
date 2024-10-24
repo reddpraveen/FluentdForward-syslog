@@ -201,3 +201,79 @@ These enhancements would not only make LokiStack a more versatile and high-perfo
 }
 
 
+
+Sample Lifecycle Policy with enableAutoTierToHotFromCool
+This policy:
+
+Transitions logs to Cool after 30 days.
+Auto-tiers back to Hot if frequently accessed in the Cool tier.
+Transitions logs to Archive after 90 days.
+Deletes logs after 180 days.
+json
+Copy code
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "LokiLogLifecycle",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": [
+            "blockBlob"
+          ],
+          "prefixMatch": [
+            "loki/"
+          ]
+        },
+        "actions": {
+          "baseBlob": {
+            "tierToCool": {
+              "daysAfterModificationGreaterThan": 30
+            },
+            "tierToArchive": {
+              "daysAfterModificationGreaterThan": 90
+            },
+            "delete": {
+              "daysAfterModificationGreaterThan": 180
+            },
+            "enableAutoTierToHotFromCool": true
+          }
+        }
+      }
+    }
+  ]
+}
+Explanation:
+tierToCool: Moves blobs to the Cool tier after 30 days of no modification.
+enableAutoTierToHotFromCool: true: This enables automatic tiering from the Cool tier back to the Hot tier if the blob is frequently accessed while in Cool. This is beneficial if some logs suddenly become important and need frequent access.
+tierToArchive: Moves blobs to the Archive tier after 90 days of no modification.
+delete: Deletes the blobs after 180 days.
+Benefits of enableAutoTierToHotFromCool:
+Cost Optimization: You keep costs low by keeping rarely accessed logs in the Cool tier. However, if logs need to be accessed more frequently than expected, Azure automatically moves them back to the Hot tier to optimize performance.
+Performance: Improves access speed for logs that are accessed more frequently by moving them back to Hot without manual intervention.
+Automation: Eliminates the need for manual monitoring of blob access patterns.
+How It Works:
+When a blob in the Cool tier is accessed frequently, Azure will move it back to the Hot tier to improve access speed.
+This can be especially useful in a logging context where logs from months ago might suddenly need to be reviewed during an incident or investigation.
+Applying the Lifecycle Policy:
+Once you've created or modified the JSON policy, apply it to your Azure Storage account in the Azure Portal under Lifecycle Management or by using Azure CLI:
+
+Using Azure CLI to Apply the Policy:
+
+Save the JSON policy in a file (e.g., lifecycle_policy.json).
+Run the following Azure CLI command to apply the policy:
+bash
+Copy code
+az storage account management-policy create --account-name <storage_account_name> --policy @lifecycle_policy.json
+This will apply the lifecycle management policy, including auto-tiering, to your storage account.
+
+Monitoring the Policy:
+Once the policy is applied:
+
+Azure will automatically handle the transition of blobs between Hot, Cool, and Archive tiers based on the policy.
+You can monitor blob access and transitions via the Azure Storage monitoring tools to ensure that logs are being correctly managed.
+Summary:
+You can enable auto-tiering from Cool to Hot for frequently accessed blobs in Azure by using the enableAutoTierToHotFromCool option in the lifecycle management policy.
+This feature helps optimize performance and cost by automatically moving logs back to the Hot tier when needed.
+This is especially beneficial in scenarios where historical logs need to be accessed suddenly and frequently.
