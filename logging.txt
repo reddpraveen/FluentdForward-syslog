@@ -291,3 +291,17 @@ az storage blob list \
   --account-key <account-key> \
   --query 'sort_by([].{Name:name, LastModified:properties.lastModified}, &LastModified)[0]' \
   --output table
+
+
+az storage account blob-service-properties update \
+  --account-name <storage-account-name> \
+  --enable-last-access-tracking true
+
+
+
+az storage account management-policy create \
+  --account-name <storage-account-name> \
+  --policy @lifecycle_policy.json
+
+az storage account blob-service-properties show \
+  --account-name <storage-account-name>
