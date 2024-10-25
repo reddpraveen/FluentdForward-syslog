@@ -1,0 +1,18 @@
+import signal
+
+def timeout_handler(signum, frame):
+    raise Exception("Script timed out")
+
+# Set the timeout to 10 seconds (or any duration you prefer)
+signal.signal(signal.SIGALRM, timeout_handler)
+signal.alarm(10)  # Set the timeout in seconds
+
+# Your script logic
+try:
+    while True:
+        print("Running")
+        # Simulate some long-running task
+except Exception as e:
+    print(e)
+finally:
+    print("Exiting")
