@@ -305,3 +305,24 @@ az storage account management-policy create \
 
 az storage account blob-service-properties show \
   --account-name <storage-account-name>
+
+
+
+az storage blob list \
+  --account-name <storage-account-name> \
+  --container-name <container-name> \
+  --account-key <account-key> \
+  --query '[].{Name:name, AccessTier:properties.accessTier, LastModified:properties.lastModified}' \
+  --output table
+
+from azure.storage.blob import BlobServiceClient
+
+blob_service_client = BlobServiceClient.from_connection_string("<connection-string>")
+
+container_client = blob_service_client.get_container_client("<container-name>")
+
+blobs = container_client.list_blobs()
+for blob in blobs:
+    print(f"Blob name: {blob.name}, Access Tier: {blob.blob_tier}, Last Modified: {blob.last_modified}")
+
+
