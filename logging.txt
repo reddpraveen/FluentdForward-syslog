@@ -388,3 +388,6 @@ echo "Breakdown of blobs by tier:"
 for tier in "${!tier_count[@]}"; do
   echo "Tier: $tier - Count: ${tier_count[$tier]} - Latest Blob LastModified: ${latest_blob_timestamp[$tier]}"
 done
+
+
+FIFTEEN_DAYS_AGO=$(date -u -d "@$(($(date +%s) - 1296000))" +%Y-%m-%dT%H:%M:%S)
