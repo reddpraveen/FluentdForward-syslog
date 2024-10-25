@@ -350,3 +350,41 @@ for blob_name in $(az storage blob list --account-name <storage-account-name> --
 
 
 for blob_name in $(az storage blob list --account-name <storage-account-name> --container-name <container-name> --account-key <account-key> --query '[].name' --output tsv); do az storage blob show --account-name <storage-account-name> --container-name <container-name> --name $blob_name --account-key <account-key> --query '{Name:name, AccessTier:properties.blobTier, LastModified:properties.lastModified}' --output table; done
+
+
+#!/bin/bash
+
+# Define the date 15 days ago
+FIFTEEN_DAYS_AGO=$(date -d '15 days ago' +%Y-%m-%dT%H:%M:%S)
+
+# Initialize counters for each tier
+declare -A tier_count
+declare -A latest_blob_timestamp
+
+# Loop through each blob in the container
+for blob_name in $(az storage blob list --account-name <storage-account-name> --container-name <container-name> --account-key <account-key> --query '[].name' --output tsv); do
+  # Get the blob's AccessTier and LastModified properties
+  blob_info=$(az storage blob show --account-name <storage-account-name> --container-name <container-name> --name $blob_name --account-key <account-key> --query '{Name:name, AccessTier:properties.blobTier, LastModified:properties.lastModified}' --output tsv)
+  
+  # Parse the AccessTier and LastModified from the output
+  blob_name=$(echo "$blob_info" | awk '{print $1}')
+  access_tier=$(echo "$blob_info" | awk '{print $2}')
+  last_modified=$(echo "$blob_info" | awk '{print $3}')
+  
+  # Compare LastModified with 15 days ago
+  if [[ "$last_modified" < "$FIFTEEN_DAYS_AGO" ]]; then
+    # Increment count for the corresponding tier
+    ((tier_count["$access_tier"]++))
+    
+    # Update the latest timestamp for each tier
+    if [[ -z "${latest_blob_timestamp[$access_tier]}" ]] || [[ "$last_modified" > "${latest_blob_timestamp[$access_tier]}" ]]; then
+      latest_blob_timestamp[$access_tier]=$last_modified
+    fi
+  fi
+done
+
+# Output the count and latest timestamp for each tier
+echo "Breakdown of blobs by tier:"
+for tier in "${!tier_count[@]}"; do
+  echo "Tier: $tier - Count: ${tier_count[$tier]} - Latest Blob LastModified: ${latest_blob_timestamp[$tier]}"
+done
