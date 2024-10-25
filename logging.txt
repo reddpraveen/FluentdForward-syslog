@@ -277,3 +277,17 @@ Summary:
 You can enable auto-tiering from Cool to Hot for frequently accessed blobs in Azure by using the enableAutoTierToHotFromCool option in the lifecycle management policy.
 This feature helps optimize performance and cost by automatically moving logs back to the Hot tier when needed.
 This is especially beneficial in scenarios where historical logs need to be accessed suddenly and frequently.
+
+az storage blob list \
+  --account-name <storage-account-name> \
+  --container-name <container-name> \
+  --account-key <account-key> \
+  --output table \
+  --query '[].{Name:name, LastModified:properties.lastModified}'
+
+az storage blob list \
+  --account-name <storage-account-name> \
+  --container-name <container-name> \
+  --account-key <account-key> \
+  --query 'sort_by([].{Name:name, LastModified:properties.lastModified}, &LastModified)[0]' \
+  --output table
