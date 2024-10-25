@@ -348,3 +348,5 @@ done
 for blob_name in $(az storage blob list --account-name <storage-account-name> --container-name <container-name> --account-key <account-key> --query '[].name' --output tsv); do az storage blob show --account-name <storage-account-name> --container-name <container-name> --name $blob_name --account-key <account-key> --query '{Name:name, AccessTier:properties.accessTier, LastModified:properties.lastModified}' --output table; done
 
 
+
+for blob_name in $(az storage blob list --account-name <storage-account-name> --container-name <container-name> --account-key <account-key> --query '[].name' --output tsv); do az storage blob show --account-name <storage-account-name> --container-name <container-name> --name $blob_name --account-key <account-key> --query '{Name:name, AccessTier:properties.blobTier, LastModified:properties.lastModified}' --output table; done
