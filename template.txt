@@ -1,0 +1,19 @@
+- name: Write registered variable and another variable to separate columns in a CSV file
+  hosts: localhost
+  tasks:
+    - name: Run a command to get some output (example task)
+      command: echo "value_from_command"
+      register: X
+
+    - name: Define another variable
+      set_fact:
+        var2: "value2"
+
+    - name: Write data to CSV file using template
+      template:
+        src: data.csv.j2
+        dest: /path/to/yourfile.csv
+        mode: '0644'
+      vars:
+        var1: "{{ X.stdout }}"
+        var2: "{{ var2 }}"
