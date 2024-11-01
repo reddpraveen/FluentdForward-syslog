@@ -143,3 +143,97 @@ objects:
         name: react-frontend
       port:
         targetPort: 80
+
+
+# Build stage
+FROM registry.access.redhat.com/ubi8/go-toolset as builder
+
+WORKDIR /app
+COPY . .
+
+# Build the Go app
+RUN go mod download
+RUN CGO_ENABLED=0 GOOS=linux go build -o server main.go
+
+# Run stage with UBI Minimal
+FROM registry.access.redhat.com/ubi8/ubi-minimal
+WORKDIR /root/
+
+# Copy the binary from the build stage
+COPY --from=builder /app/server .
+
+# Set environment variables (will be overridden in OpenShift)
+ENV CENTRAL_SERVER_URL=""
+ENV CENTRAL_TOKEN=""
+ENV EAST_SERVER_URL=""
+ENV EAST_TOKEN=""
+
+# Expose the port
+EXPOSE 8080
+
+# Run the Go app
+CMD ["./server"]
+
+
+# Build stage
+FROM registry.access.redhat.com/ubi8/nodejs-18 as builder
+
+WORKDIR /app
+COPY . .
+RUN npm install
+RUN npm run build
+
+# Run stage with UBI Nginx
+FROM registry.access.redhat.com/ubi8/nginx-120
+COPY --from=builder /app/build /usr/share/nginx/html
+
+# Expose the port for Nginx
+EXPOSE 8080
+CMD ["nginx", "-g", "daemon off;"]
+
+
+oc registry login
+# Go Backend
+docker build -t $(oc registry info)/<project>/go-backend:latest -f Dockerfile .
+docker push $(oc registry info)/<project>/go-backend:latest
+
+# React Frontend
+docker build -t $(oc registry info)/<project>/react-frontend:latest -f Dockerfile .
+docker push $(oc registry info)/<project>/react-frontend:latest
+
+
+# Deploy the Go backend
+oc new-app $(oc registry info)/<project>/go-backend:latest \
+  -e CENTRAL_SERVER_URL=https://api.central.openshift.example.com:6443 \
+  -e CENTRAL_TOKEN=your-central-token \
+  -e EAST_SERVER_URL=https://api.east.openshift.example.com:6443 \
+  -e EAST_TOKEN=your-east-token \
+  --name=go-backend
+
+# Expose the Go backend as a service
+oc expose svc/go-backend
+
+# Deploy the React frontend
+oc new-app $(oc registry info)/<project>/react-frontend:latest --name=react-frontend
+
+# Expose the React frontend as a service
+oc expose svc/react-frontend
+
+- name: go-backend
+  image: $(oc registry info)/<project>/go-backend:latest
+
+
+
+parameters:
+  - name: CENTRAL_SERVER_URL
+    description: "OpenShift API server URL for the first (central) cluster"
+    value: "https://api.central.openshift.example.com:6443"
+  - name: CENTRAL_TOKEN
+    description: "Bearer token for the first (central) cluster"
+    value: "default-central-token"
+  - name: EAST_SERVER_URL
+    description: "OpenShift API server URL for the second (east) cluster"
+    value: "https://api.east.openshift.example.com:6443"
+  - name: EAST_TOKEN
+    description: "Bearer token for the second (east) cluster"
+    value: "default-east-token"
