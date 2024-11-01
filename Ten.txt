@@ -66,3 +66,56 @@ function App() {
 }
 
 export default App;
+
+
+{
+  "name": "my-react-app",
+  "version": "1.0.0",
+  "description": "A sample React project",
+  "main": "index.js",
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "dependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-scripts": "5.0.0"
+  },
+  "devDependencies": {},
+  "author": "Your Name",
+  "license": "ISC"
+}
+
+
+# Use an official Node.js image as the base
+FROM node:18 AS builder
+
+# Set the working directory
+WORKDIR /app
+
+# Copy package.json and package-lock.json to the working directory
+COPY package.json package-lock.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application files
+COPY . .
+
+# Run npx commands, e.g., building a React app
+RUN npx react-scripts build
+
+# Production stage
+FROM nginx:alpine
+
+# Copy the build output from the previous stage
+COPY --from=builder /app/build /usr/share/nginx/html
+
+# Expose the port
+EXPOSE 80
+
+# Run Nginx
+CMD ["nginx", "-g", "daemon off;"]
