@@ -492,7 +492,7 @@ func main() {
     log.Fatal(http.ListenAndServe(":8080", router))
 }
 
-===================
+----------------------
 npx create-react-app crd-comparator
 cd crd-comparator
 npm install axios
