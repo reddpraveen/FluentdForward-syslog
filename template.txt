@@ -237,3 +237,131 @@ parameters:
   - name: EAST_TOKEN
     description: "Bearer token for the second (east) cluster"
     value: "default-east-token"
+
+
+
+// main.go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+
+    "github.com/gorilla/mux"
+    "k8s.io/client-go/kubernetes"
+    "k8s.io/client-go/rest"
+    "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+    "k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// ClusterConfig holds cluster name and client
+type ClusterConfig struct {
+    Name   string
+    Client *kubernetes.Clientset
+}
+
+// FetchCRDs fetches all CRDs from the given Kubernetes cluster
+func FetchCRDs(client *kubernetes.Clientset) ([]unstructured.Unstructured, error) {
+    gvr := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+    crdList, err := client.RESTClient().Get().Resource(gvr.Resource).DoRaw()
+    if err != nil {
+        return nil, err
+    }
+
+    var crds []unstructured.Unstructured
+    json.Unmarshal(crdList, &crds)
+    return crds, nil
+}
+
+// CompareCRDs compares CRDs between two clusters and highlights differences
+func CompareCRDs(crdsA, crdsB []unstructured.Unstructured) []string {
+    var diffs []string
+    // Logic to compare CRDs and store the differences in diffs slice
+    // Placeholder: Add actual comparison logic
+    return diffs
+}
+
+// fetchAndCompareHandler fetches and compares CRDs from two clusters
+func fetchAndCompareHandler(w http.ResponseWriter, r *http.Request) {
+    clusterA := r.URL.Query().Get("clusterA")
+    clusterB := r.URL.Query().Get("clusterB")
+
+    // Fetch CRDs for both clusters
+    crdsA, err := FetchCRDs(clients[clusterA])
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    crdsB, err := FetchCRDs(clients[clusterB])
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    diffs := CompareCRDs(crdsA, crdsB)
+
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "crdsA":  crdsA,
+        "crdsB":  crdsB,
+        "diffs":  diffs,
+    })
+}
+
+// SetupClusterClient initializes a client for a given cluster token and server URL
+func SetupClusterClient(serverURL, token string) (*kubernetes.Clientset, error) {
+    config := &rest.Config{
+        Host:        serverURL,
+        BearerToken: token,
+        TLSClientConfig: rest.TLSClientConfig{
+            Insecure: true, // Set to false if you have certificates for secure communication
+        },
+    }
+    clientset, err := kubernetes.NewForConfig(config)
+    if err != nil {
+        return nil, err
+    }
+    return clientset, nil
+}
+
+var clients map[string]*kubernetes.Clientset
+
+func main() {
+    clients = make(map[string]*kubernetes.Clientset)
+
+    // Read environment variables for server URLs and tokens
+    clusterConfigs := []struct {
+        name      string
+        serverURL string
+        token     string
+    }{
+        {
+            name:      "central",
+            serverURL: os.Getenv("CENTRAL_SERVER_URL"),
+            token:     os.Getenv("CENTRAL_TOKEN"),
+        },
+        {
+            name:      "east",
+            serverURL: os.Getenv("EAST_SERVER_URL"),
+            token:     os.Getenv("EAST_TOKEN"),
+        },
+    }
+
+    // Initialize clients for each cluster
+    for _, cluster := range clusterConfigs {
+        client, err := SetupClusterClient(cluster.serverURL, cluster.token)
+        if err != nil {
+            log.Fatalf("Failed to setup client for cluster %s: %v", cluster.name, err)
+        }
+        clients[cluster.name] = client
+    }
+
+    router := mux.NewRouter()
+    router.HandleFunc("/api/crds/compare", fetchAndCompareHandler).Methods("GET")
+
+    fmt.Println("Server running on port 8080")
+    log.Fatal(http.ListenAndServe(":8080", router))
+}
+
