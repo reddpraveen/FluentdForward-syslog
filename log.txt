@@ -638,3 +638,45 @@ Run npm install locally inside the frontend folder to ensure all dependencies ar
 npm install
 npm run build
 Look for errors during the npm install step.
+
+
+------------------------------------------------------
+Solution
+1. Add a Default browserslist Configuration
+
+To avoid the prompt, add a browserslist field to your package.json. Update your package.json as follows:
+
+"browserslist": {
+  "production": [
+    ">0.2%",
+    "not dead",
+    "not op_mini all"
+  ],
+  "development": [
+    "last 1 chrome version",
+    "last 1 firefox version",
+    "last 1 safari version"
+  ]
+}
+This configuration specifies supported browsers for both production and development environments.
+
+2. Rebuild the Docker Image
+
+After adding the browserslist configuration to package.json, rebuild the Docker image:
+
+docker build -t <registry>/<namespace>/logs-downloader-frontend:latest .
+3. Automatic Non-Interactive Build
+
+If you want to prevent prompts during the build (e.g., in Docker or CI environments), ensure the CI environment variable is set to true. Update your Dockerfile as follows:
+
+# Build the React app for production
+RUN CI=true npm run build
+This sets CI=true, ensuring that prompts like the one you're encountering are skipped during the build process.
+
+4. Verify the Build Locally
+
+Before rebuilding the Docker image, you can test the build locally to ensure everything works:
+
+npm install
+npm run build
+If it works locally, it will also work in Docker.
