@@ -1,0 +1,284 @@
+Complete Steps: Develop, Containerize, and Deploy OAuth-Integrated App in OpenShift
+Below are detailed instructions covering frontend, backend, containerization, and OpenShift deployment.
+
+Step 1: Backend Development
+
+We’ll use FastAPI for the backend.
+
+Backend Directory Structure
+backend/
+├── app.py
+├── requirements.txt
+├── .env
+├── Dockerfile
+Backend Code: app.py
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.responses import RedirectResponse
+import requests
+from authlib.integrations.starlette_client import OAuth
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID")
+OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")
+OPENSHIFT_CLUSTER = os.getenv("OPENSHIFT_CLUSTER")
+
+app = FastAPI()
+
+# Configure OAuth
+oauth = OAuth()
+oauth.register(
+    name="openshift",
+    client_id=OAUTH_CLIENT_ID,
+    client_secret=OAUTH_CLIENT_SECRET,
+    access_token_url=f"https://{OPENSHIFT_CLUSTER}/oauth/token",
+    authorize_url=f"https://{OPENSHIFT_CLUSTER}/oauth/authorize",
+    client_kwargs={"scope": "user:info"},
+)
+
+# In-memory user session
+user_sessions = {}
+
+@app.get("/")
+def home():
+    return {"message": "Welcome to the Logs Downloader App! Please authenticate to access logs."}
+
+
+@app.get("/login")
+async def login(request: Request):
+    # Redirect to OpenShift OAuth login
+    return await oauth.openshift.authorize_redirect(request, REDIRECT_URI)
+
+
+@app.get("/callback")
+async def callback(request: Request):
+    # Exchange the authorization code for a token
+    token = await oauth.openshift.authorize_access_token(request)
+    user_info = requests.get(
+        f"https://{OPENSHIFT_CLUSTER}/apis/user.openshift.io/v1/users/~",
+        headers={"Authorization": f"Bearer {token['access_token']}"},
+    ).json()
+
+    # Store user session
+    user_sessions[user_info["metadata"]["name"]] = {"token": token, "info": user_info}
+    return {"message": "Login successful", "user": user_info}
+
+
+def get_current_user(request: Request):
+    # Extract user session
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = auth_header.split(" ")[1]
+
+    for user, session in user_sessions.items():
+        if session["token"]["access_token"] == token:
+            return session["info"]
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+
+@app.get("/logs")
+def get_logs(namespace: str, pod: str, start: str, end: str, user=Depends(get_current_user)):
+    # RBAC for access
+    roles = user.get("groups", [])
+    if "admin" not in roles and "developer" not in roles:
+        raise HTTPException(status_code=403, detail="Access denied: insufficient permissions")
+
+    # Placeholder log retrieval logic
+    logs = {"namespace": namespace, "pod": pod, "start": start, "end": end}
+    return {"logs": logs, "user": user["metadata"]["name"]}
+Dependencies: requirements.txt
+fastapi
+uvicorn
+requests
+authlib
+python-dotenv
+Environment Variables: .env
+OAUTH_CLIENT_ID=logs-downloader-app
+OAUTH_CLIENT_SECRET=logs-downloader-secret
+REDIRECT_URI=https://<your-app-route>/callback
+OPENSHIFT_CLUSTER=<your-openshift-cluster>
+Replace the placeholders with your actual values.
+
+Step 2: Frontend Development
+
+We’ll use React.js for the frontend.
+
+Frontend Directory Structure
+frontend/
+├── src/
+│   ├── App.js
+│   ├── index.js
+│   ├── components/
+│       ├── LoginButton.js
+│       ├── LogViewer.js
+├── package.json
+Frontend Code
+App.js
+
+import React, { useState } from "react";
+import LoginButton from "./components/LoginButton";
+import LogViewer from "./components/LogViewer";
+
+function App() {
+  const [user, setUser] = useState(null);
+
+  return (
+    <div>
+      <h1>Logs Downloader App</h1>
+      {!user ? (
+        <LoginButton setUser={setUser} />
+      ) : (
+        <LogViewer user={user} />
+      )}
+    </div>
+  );
+}
+
+export default App;
+LoginButton.js
+
+import React from "react";
+
+function LoginButton({ setUser }) {
+  const login = () => {
+    window.location.href = "/login";
+  };
+
+  return <button onClick={login}>Login</button>;
+}
+
+export default LoginButton;
+LogViewer.js
+
+import React from "react";
+
+function LogViewer({ user }) {
+  return <div>Welcome, {user.metadata.name}! Logs will appear here.</div>;
+}
+
+export default LogViewer;
+Dependencies
+Install dependencies:
+
+npm install react react-dom
+Step 3: Containerization
+
+Backend Dockerfile
+FROM python:3.9-slim
+
+WORKDIR /app
+
+COPY . .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+Frontend Dockerfile
+FROM node:16-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm install
+
+COPY . .
+
+RUN npm run build
+
+CMD ["npx", "serve", "build"]
+Step 4: OpenShift Deployment
+
+1. Build and Push Images
+docker build -t <registry>/<namespace>/logs-downloader-backend:latest ./backend
+docker build -t <registry>/<namespace>/logs-downloader-frontend:latest ./frontend
+
+docker push <registry>/<namespace>/logs-downloader-backend:latest
+docker push <registry>/<namespace>/logs-downloader-frontend:latest
+2. Deploy in OpenShift
+ConfigMap
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logs-downloader-config
+data:
+  OAUTH_CLIENT_ID: logs-downloader-app
+  OAUTH_CLIENT_SECRET: logs-downloader-secret
+  REDIRECT_URI: https://<your-route>/callback
+  OPENSHIFT_CLUSTER: <your-openshift-cluster>
+Backend Deployment
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logs-downloader-backend
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: logs-downloader-backend
+    spec:
+      containers:
+      - name: backend
+        image: <registry>/<namespace>/logs-downloader-backend:latest
+        envFrom:
+        - configMapRef:
+            name: logs-downloader-config
+Frontend Deployment
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logs-downloader-frontend
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: logs-downloader-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: <registry>/<namespace>/logs-downloader-frontend:latest
+Service and Route
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-downloader
+spec:
+  selector:
+    app: logs-downloader-backend
+  ports:
+    - port: 8000
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: logs-downloader
+spec:
+  to:
+    kind: Service
+    name: logs-downloader
+  tls:
+    termination: edge
+Apply Resources
+oc apply -f configmap.yaml
+oc apply -f backend-deployment.yaml
+oc apply -f frontend-deployment.yaml
+oc apply -f service.yaml
+oc apply -f route.yaml
+Test the App
+Access the app URL from the Route.
+Verify OAuth login and RBAC functionality.
+Debug issues using oc logs.
+Let me know if you need further assistance!
