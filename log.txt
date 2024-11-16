@@ -435,3 +435,152 @@ oc apply -f service.yaml
 oc apply -f route.yaml
 Access the frontend via the Route created for logs-downloader-frontend.
 Verify OAuth functionality and the app's behavior.
+
+
+=========================================================
+
+package.json for Backend
+{
+  "name": "logs-downloader-backend",
+  "version": "1.0.0",
+  "description": "OAuth-integrated backend for Logs Downloader App",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.0.3",
+    "authlib": "^1.1.0",
+    "axios": "^1.3.0"
+  },
+  "author": "Your Name",
+  "license": "ISC"
+}
+app.js Example Code (Node.js)
+Here’s how you can replicate the FastAPI backend functionality using Node.js and Express.js:
+
+const express = require("express");
+const axios = require("axios");
+const dotenv = require("dotenv");
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 8000;
+
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID;
+const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET;
+const REDIRECT_URI = process.env.REDIRECT_URI;
+const OPENSHIFT_CLUSTER = process.env.OPENSHIFT_CLUSTER;
+
+let userSessions = {};
+
+// Home route
+app.get("/", (req, res) => {
+  res.json({ message: "Welcome to the Logs Downloader App! Authenticate to proceed." });
+});
+
+// OAuth login route
+app.get("/login", (req, res) => {
+  const oauthUrl = `https://${OPENSHIFT_CLUSTER}/oauth/authorize?client_id=${OAUTH_CLIENT_ID}&response_type=code&redirect_uri=${REDIRECT_URI}`;
+  res.redirect(oauthUrl);
+});
+
+// Callback route for OAuth
+app.get("/callback", async (req, res) => {
+  const authCode = req.query.code;
+
+  try {
+    // Exchange code for access token
+    const tokenResponse = await axios.post(
+      `https://${OPENSHIFT_CLUSTER}/oauth/token`,
+      {
+        grant_type: "authorization_code",
+        code: authCode,
+        redirect_uri: REDIRECT_URI,
+        client_id: OAUTH_CLIENT_ID,
+        client_secret: OAUTH_CLIENT_SECRET,
+      }
+    );
+
+    const accessToken = tokenResponse.data.access_token;
+
+    // Get user info
+    const userResponse = await axios.get(
+      `https://${OPENSHIFT_CLUSTER}/apis/user.openshift.io/v1/users/~`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+
+    const userInfo = userResponse.data;
+    userSessions[userInfo.metadata.name] = { token: accessToken, info: userInfo };
+
+    res.json({ message: "Login successful", user: userInfo });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Logs route (protected)
+app.get("/logs", (req, res) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  const user = Object.values(userSessions).find(session => session.token === token);
+
+  if (!user) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  // RBAC logic
+  const roles = user.info.groups || [];
+  if (!roles.includes("admin") && !roles.includes("developer")) {
+    return res.status(403).json({ error: "Access denied: insufficient permissions" });
+  }
+
+  res.json({ logs: "Your logs here", user: user.info.metadata.name });
+});
+
+app.listen(PORT, () => {
+  console.log(`Backend running on http://localhost:${PORT}`);
+});
+Backend Dockerfile (Node.js)
+# Use an official Node.js runtime as the base image
+FROM node:16-alpine
+
+# Set the working directory
+WORKDIR /app
+
+# Copy package.json and package-lock.json
+COPY package.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application code
+COPY . .
+
+# Expose the application port
+EXPOSE 8000
+
+# Command to run the application
+CMD ["npm", "start"]
+Environment Variables in .env
+Same as FastAPI:
+
+OAUTH_CLIENT_ID=logs-downloader-app
+OAUTH_CLIENT_SECRET=logs-downloader-secret
+REDIRECT_URI=https://<your-app-route>/callback
+OPENSHIFT_CLUSTER=<your-openshift-cluster>
+Node.js Backend Deployment Steps
+Build Docker Image:
+docker build -t <registry>/<namespace>/logs-downloader-backend:latest ./backend
+Push to Container Registry:
+docker push <registry>/<namespace>/logs-downloader-backend:latest
+Deploy in OpenShift: Use the backend deployment YAML provided in previous steps.
