@@ -282,3 +282,156 @@ Access the app URL from the Route.
 Verify OAuth login and RBAC functionality.
 Debug issues using oc logs.
 Let me know if you need further assistance!
+
+
+========================
+front end
+
+{
+  "name": "logs-downloader-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "devDependencies": {}
+}
+
+2. index.html in public/
+
+The main HTML file that React will inject into.
+
+public/index.html:
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Logs Downloader App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+3. index.js
+
+Entry point for the React application.
+
+src/index.js:
+
+import React from "react";
+import ReactDOM from "react-dom";
+import App from "./App";
+
+ReactDOM.render(<App />, document.getElementById("root"));
+4. Frontend Dockerfile
+
+To include dependencies (react, react-dom), run the npm install command during the container build process.
+
+frontend/Dockerfile:
+
+# Use an official Node.js image as the base
+FROM node:16-alpine
+
+# Set the working directory
+WORKDIR /app
+
+# Copy package.json and package-lock.json
+COPY package.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application code
+COPY . .
+
+# Build the React app for production
+RUN npm run build
+
+# Serve the app using a simple static file server
+RUN npm install -g serve
+CMD ["serve", "-s", "build"]
+
+# Expose the port
+EXPOSE 3000
+Frontend Setup Instructions
+Initialize Frontend Project:
+Inside the frontend folder, add the files described above (package.json, src, and public directories).
+Build Frontend Docker Image:
+Run the following command in the frontend directory where the Dockerfile exists:
+docker build -t <registry>/<namespace>/logs-downloader-frontend:latest .
+Push Frontend Image to Registry:
+docker push <registry>/<namespace>/logs-downloader-frontend:latest
+Backend and Frontend Deployment Recap
+Now that the frontend Dockerfile and dependencies are properly set up:
+
+Build and push both backend and frontend Docker images.
+Backend:
+docker build -t <registry>/<namespace>/logs-downloader-backend:latest ./backend
+docker push <registry>/<namespace>/logs-downloader-backend:latest
+Frontend:
+docker build -t <registry>/<namespace>/logs-downloader-frontend:latest ./frontend
+docker push <registry>/<namespace>/logs-downloader-frontend:latest
+Deploy the backend and frontend in OpenShift:
+Use the backend deployment YAML from the previous instructions.
+Use the frontend deployment YAML below.
+Frontend Deployment YAML
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logs-downloader-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logs-downloader-frontend
+  template:
+    metadata:
+      labels:
+        app: logs-downloader-frontend
+    spec:
+      containers:
+      - name: logs-downloader-frontend
+        image: <registry>/<namespace>/logs-downloader-frontend:latest
+        ports:
+        - containerPort: 3000
+Frontend Service and Route YAML
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-downloader-frontend
+spec:
+  selector:
+    app: logs-downloader-frontend
+  ports:
+    - port: 80
+      targetPort: 3000
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: logs-downloader-frontend
+spec:
+  to:
+    kind: Service
+    name: logs-downloader-frontend
+  tls:
+    termination: edge
+Test the Deployment
+Apply all resources:
+oc apply -f configmap.yaml
+oc apply -f backend-deployment.yaml
+oc apply -f frontend-deployment.yaml
+oc apply -f service.yaml
+oc apply -f route.yaml
+Access the frontend via the Route created for logs-downloader-frontend.
+Verify OAuth functionality and the app's behavior.
