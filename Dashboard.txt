@@ -1,0 +1,29 @@
+import os
+import json
+
+# Define the folder containing the JSON files
+input_folder = "path_to_input_folder"  # Replace with your input folder path
+output_folder = "path_to_output_folder"  # Replace with your output folder path
+
+# Create the output folder if it doesn't exist
+os.makedirs(output_folder, exist_ok=True)
+
+# Iterate over each file in the input folder
+for filename in os.listdir(input_folder):
+    if filename.endswith(".json"):  # Process only JSON files
+        input_file_path = os.path.join(input_folder, filename)
+        
+        with open(input_file_path, 'r') as file:
+            data = json.load(file)  # Load the JSON content
+        
+        # Extract the "dashboard" key content
+        if "dashboard" in data:
+            dashboard_content = data["dashboard"]
+            
+            # Save the extracted "dashboard" content to a new file
+            output_file_path = os.path.join(output_folder, filename)
+            with open(output_file_path, 'w') as output_file:
+                json.dump(dashboard_content, output_file, indent=4)  # Keep proper indentation for Grafana
+            print(f"Processed: {filename}")
+        else:
+            print(f"No 'dashboard' key found in: {filename}")
