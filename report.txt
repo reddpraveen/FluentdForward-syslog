@@ -1,0 +1,183 @@
+import pandas as pd
+from pandas import ExcelWriter
+from openpyxl import load_workbook
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+
+def get_machineset_details(machine_set):
+    oc_command = f"oc get machineset {machine_set} -n openshift-machine-api -o json"
+    output = subprocess.check_output(oc_command, shell=True).decode('utf-8')
+    machineset_data = json.loads(output)
+    desired = machineset_data['spec']['replicas']
+    current = machineset_data['status']['replicas']
+
+def prometheus_query(query_tr, node_to_verify):
+    token_command = "oc sa get-token prometheus-k8s -n openshift-monitoring"
+    token = subprocess.check_output(token_command.split()).strip()
+
+    pod_command = "oc get pods -n openshift-monitoring | head -1"
+    pod_list = subprocess.check_output(pod_command, shell=True).strip()
+    pod = pod_list.split()[0] if pod_list else None
+
+    if not pod:
+        return "No pod found"
+
+    route_command = "oc get route -n openshift-monitoring prometheus-k8s -o=jsonpath='{.spec.host}'"
+    route = subprocess.check_output(route_command.split()).strip()
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    query_url = f"https://{route}/api/v1/query"
+    response = requests.get(query_url, headers=headers, verify=False)
+
+    if response.status_code == 200:
+        query_data = response.json()
+        if 'data' in query_data and 'result' in query_data['data']:
+            value = float(query_data['data']['result'][0]['value'][1])
+            return value
+    return None
+
+
+-------------
+
+import subprocess
+import json
+import requests
+import urllib.parse
+from openpyxl import Workbook, load_workbook
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import os
+
+# Disable warnings from unverified HTTPS requests
+from urllib3.exceptions import InsecureRequestWarning
+import urllib3
+urllib3.disable_warnings(InsecureRequestWarning)
+
+def get_machineset_details(machine_set):
+    try:
+        oc_command = f"oc get machineset {machine_set} -n openshift-machine-api -o json"
+        output = subprocess.check_output(oc_command, shell=True, text=True)
+        machineset_data = json.loads(output)
+        desired = machineset_data['spec']['replicas']
+        current = machineset_data['status']['replicas']
+        ready = machineset_data['status'].get('readyReplicas', 0)
+        available = machineset_data['status'].get('availableReplicas', 0)
+        age = machineset_data['metadata']['creationTimestamp']
+        return desired, current, ready, available, age
+    except subprocess.CalledProcessError as e:
+        print(f"Error fetching machineset details: {e}")
+        return None, None, None, None, None
+
+def prometheus_query(query, node_to_verify):
+    try:
+        # Fetch authentication token
+        token_command = "oc sa get-token prometheus-k8s -n openshift-monitoring"
+        token = subprocess.check_output(token_command.split(), text=True).strip()
+
+        # Fetch Prometheus route
+        route_command = "oc get route prometheus-k8s -n openshift-monitoring -o jsonpath='{.spec.host}'"
+        route = subprocess.check_output(route_command, shell=True, text=True).strip()
+
+        # Construct query URL
+        query_url = f"https://{route}/api/v1/query"
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+        query_params = {
+            'query': query.format(node=node_to_verify)
+        }
+        response = requests.get(query_url, headers=headers, params=query_params, verify=False)
+        
+        if response.status_code == 200:
+            query_data = response.json()
+            if query_data.get('data') and query_data['data'].get('result'):
+                value = float(query_data['data']['result'][0]['value'][1])
+                return value
+        else:
+            print(f"Failed to query Prometheus: {response.status_code}")
+        return None
+    except Exception as e:
+        print(f"Error querying Prometheus: {e}")
+        return None
+
+def send_email(file_name, from_email, to_email, subject):
+    try:
+        message = MIMEMultipart()
+        message['From'] = from_email
+        message['To'] = to_email
+        message['Subject'] = subject
+
+        with open(file_name, "rb") as f:
+            attachment = MIMEApplication(f.read(), _subtype="xlsx")
+            attachment.add_header('Content-Disposition', 'attachment', filename=file_name)
+            message.attach(attachment)
+
+        server = smtplib.SMTP('your-smtp-server.com')
+        server.starttls()
+        # Uncomment and set your credentials if needed
+        # server.login('your-username', 'your-password')
+        server.sendmail(from_email, to_email.split(','), message.as_string())
+        server.quit()
+        print("Email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+def main():
+    results = []
+    try:
+        # Get list of nodes
+        node_command = "oc get nodes -o json"
+        node_output = subprocess.check_output(node_command, shell=True, text=True)
+        node_data = json.loads(node_output)
+
+        for item in node_data['items']:
+            node_name = item['metadata']['name']
+            if 'master' in node_name:  # Skip master nodes
+                continue
+
+            machine_set = "-".join(node_name.split("-")[:-1])  # Extract machineset
+            desired, current, ready, available, age = get_machineset_details(machine_set)
+
+            # Query Prometheus for CPU and memory usage
+            cpu_query = 'sum by (node) (sum by (node, pod) (kube_pod_container_resource_requests{{node="{node}", resource="cpu"}}))'
+            memory_query = 'sum by (node) (sum by (node, pod) (kube_pod_container_resource_requests{{node="{node}", resource="memory"}}))'
+            cpu_usage = prometheus_query(cpu_query, node_name)
+            memory_usage = prometheus_query(memory_query, node_name)
+
+            results.append([
+                machine_set, desired, current, ready, available, age, node_name, cpu_usage, memory_usage
+            ])
+
+        # Save results to Excel
+        file_name = "openshift_clusters_comparison_report.xlsx"
+        if os.path.exists(file_name):
+            wb = load_workbook(file_name)
+        else:
+            wb = Workbook()
+
+        ws = wb.active
+        ws.title = "Cluster Comparison"
+        ws.append(["MachineSet", "Desired", "Current", "Ready", "Available", "Age", "NodeName", "CPU Usage", "Memory Usage"])
+        for row in results:
+            ws.append(row)
+
+        wb.save(file_name)
+
+        # Send the report via email
+        send_email(
+            file_name=file_name,
+            from_email="your-email@example.com",
+            to_email="recipient@example.com",
+            subject="OpenShift Clusters Comparison Report"
+        )
+    except Exception as e:
+        print(f"Error in main execution: {e}")
+
+if __name__ == "__main__":
+    main()
