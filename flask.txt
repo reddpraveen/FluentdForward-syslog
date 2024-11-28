@@ -1,0 +1,28 @@
+from datetime import datetime
+
+def update_alert(alert_data):
+    """
+    Updates the severity key value to 'warning' if it is 'critical' and
+    the current time is outside of business hours (9 AM - 5 PM).
+    
+    Args:
+        alert_data (dict): A dictionary containing the 'severity' key.
+    
+    Returns:
+        dict: Updated alert data.
+    """
+    current_time = datetime.now()
+    business_start = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
+    business_end = current_time.replace(hour=17, minute=0, second=0, microsecond=0)
+    
+    # Check if the current time is outside business hours
+    if current_time < business_start or current_time > business_end:
+        if alert_data.get('severity') == 'critical':
+            alert_data['severity'] = 'warning'
+    
+    return alert_data
+
+# Example usage
+alert_data = {'severity': 'critical', 'other_key': 'value'}
+updated_data = update_alert(alert_data)
+print(updated_data)
