@@ -79,6 +79,70 @@ def critical_alert(alert):
     # Check critical alert criteria
     is_critical = (
         bool(re.search(r'severity[":\s]+critical', alert)) and
+
+
+import datetime
+import pytz
+import re
+
+# List of Canadian statutory holidays
+STAT_HOLIDAYS_CANADA = {
+    "2024-01-01", "2024-03-29", "2024-07-01", "2024-09-02", "2024-09-30",
+    "2024-10-14", "2024-12-25",  # Add more holidays as needed
+}
+
+def critical_alert(alert):
+    """
+    Determine if the alert is critical based on its content and the current time in EST.
+    Alerts are considered critical only during business hours (9 AM - 5 PM EST) on weekdays
+    and not on Canadian statutory holidays.
+
+    Args:
+        alert (str): The alert string to evaluate.
+
+    Returns:
+        bool: True if the alert is critical, False otherwise.
+    """
+    try:
+        # Get current UTC time
+        utc_time = datetime.datetime.now(datetime.timezone.utc)
+
+        # Convert UTC to EST
+        est_tz = pytz.timezone("America/Toronto")
+        est_time = utc_time.astimezone(est_tz)
+
+        # Extract current date in EST
+        current_date_str = est_time.strftime("%Y-%m-%d")
+
+        # Define business hours in EST
+        business_start = est_time.replace(hour=9, minute=0, second=0, microsecond=0)
+        business_end = est_time.replace(hour=17, minute=0, second=0, microsecond=0)
+
+        # Check if today is a statutory holiday in Canada
+        if current_date_str in STAT_HOLIDAYS_CANADA:
+            return False
+
+        # Check if today is a weekday (Monday to Friday)
+        if est_time.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+            return False
+
+        # Check if current time is within business hours in EST
+        if not (business_start <= est_time <= business_end):
+            return False
+
+        # Check critical alert criteria
+        is_critical = (
+            bool(re.search(r'severity[":\s]+critical', alert)) and
+            bool(re.search(r'status[":\s]+firing', alert)) and
+            bool(re.search(r'ClusterOperatorDown.*?name[":\s]+image-registry', alert))
+        )
+
+        return is_critical
+
+    except AttributeError as e:
+        print(f"Error occurred: {e}")
+        return False
+
         bool(re.search(r'status[":\s]+firing', alert)) and
         bool(re.search(r'ClusterOperatorDown.*?name[":\s]+image-registry', alert))
     )
