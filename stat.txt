@@ -1,0 +1,86 @@
+from datetime import datetime
+import re
+
+# List of Canadian statutory holidays from 2024 to 2028
+STAT_HOLIDAYS_CANADA = {
+    # 2024
+    "2024-01-01",  # New Year's Day
+    "2024-03-29",  # Good Friday
+    "2024-07-01",  # Canada Day
+    "2024-09-02",  # Labour Day
+    "2024-09-30",  # National Day for Truth and Reconciliation
+    "2024-10-14",  # Thanksgiving Day
+    "2024-12-25",  # Christmas Day
+    # 2025
+    "2025-01-01",  # New Year's Day
+    "2025-04-18",  # Good Friday
+    "2025-07-01",  # Canada Day
+    "2025-09-01",  # Labour Day
+    "2025-09-30",  # National Day for Truth and Reconciliation
+    "2025-10-13",  # Thanksgiving Day
+    "2025-12-25",  # Christmas Day
+    # 2026
+    "2026-01-01",  # New Year's Day
+    "2026-04-03",  # Good Friday
+    "2026-07-01",  # Canada Day
+    "2026-09-07",  # Labour Day
+    "2026-09-30",  # National Day for Truth and Reconciliation
+    "2026-10-12",  # Thanksgiving Day
+    "2026-12-25",  # Christmas Day
+    # 2027
+    "2027-01-01",  # New Year's Day
+    "2027-03-26",  # Good Friday
+    "2027-07-01",  # Canada Day
+    "2027-09-06",  # Labour Day
+    "2027-09-30",  # National Day for Truth and Reconciliation
+    "2027-10-11",  # Thanksgiving Day
+    "2027-12-25",  # Christmas Day
+    # 2028
+    "2028-01-01",  # New Year's Day
+    "2028-04-14",  # Good Friday
+    "2028-07-01",  # Canada Day
+    "2028-09-04",  # Labour Day
+    "2028-09-30",  # National Day for Truth and Reconciliation
+    "2028-10-09",  # Thanksgiving Day
+    "2028-12-25",  # Christmas Day
+}
+
+def critical_alert(alert):
+    """
+    Determines if an alert is critical based on its content and the current date and time.
+    The alert is considered critical only during business hours (9 AM - 5 PM) on weekdays
+    that are not Canadian statutory holidays.
+
+    Args:
+        alert (str): The alert string to evaluate.
+
+    Returns:
+        bool: True if the alert is critical and within business hours on a valid day; False otherwise.
+    """
+    current_time = datetime.now()
+    current_date_str = current_time.strftime("%Y-%m-%d")
+
+    # Define business hours
+    business_start = current_time.replace(hour=9, minute=0, second=0, microsecond=0)
+    business_end = current_time.replace(hour=17, minute=0, second=0, microsecond=0)
+
+    # Check if today is a statutory holiday in Canada
+    if current_date_str in STAT_HOLIDAYS_CANADA:
+        return False
+
+    # Check if today is a weekday (Monday to Friday)
+    if current_time.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+        return False
+
+    # Check if current time is within business hours
+    if not (business_start <= current_time <= business_end):
+        return False
+
+    # Check critical alert criteria
+    is_critical = (
+        bool(re.search(r'severity[":\s]+critical', alert)) and
+        bool(re.search(r'status[":\s]+firing', alert)) and
+        bool(re.search(r'ClusterOperatorDown.*?name[":\s]+image-registry', alert))
+    )
+
+    return is_critical
