@@ -1,0 +1,93 @@
+Yes, that is correct in most cases. Fluentd uses buffering to handle log data before sending it to its outputs. If one output plugin is unable to send data (e.g., to a target syslog server), and its buffer becomes full, it can cause Fluentd to stop processing logs for other outputs, depending on your configuration.
+
+Explanation
+
+Fluentd works as a pipeline with the following key stages:
+	1.	Input Plugins: Collect data from sources.
+	2.	Buffering: Stores logs temporarily before sending them to the output.
+	3.	Output Plugins: Sends logs to target systems (e.g., syslog, Elasticsearch, S3).
+
+If an output’s buffer is full:
+	•	Buffer Overflow: The logs destined for that output cannot be buffered further, causing Fluentd to stop accepting new logs for that output.
+	•	Impact on Other Outputs: Depending on your configuration, this may block the entire Fluentd pipeline, even affecting other outputs.
+
+Why Does This Happen?
+	•	Fluentd has a single-threaded event loop. If one output becomes slow or stuck due to network issues or a misbehaving target, it can block the event loop.
+	•	When one output’s buffer fills up, Fluentd’s default behavior is to stop accepting new logs from all inputs to avoid data loss.
+
+How to Fix This Issue
+
+To avoid this bottleneck, you can tweak your Fluentd configuration.
+
+1. Separate Buffers for Each Output
+
+Ensure each output plugin has its own buffer by using different buffer configurations for each. This isolates issues with one output from affecting others.
+
+Example:
+
+<match **>
+  @type copy
+  <store>
+    @type syslog
+    buffer_type file
+    buffer_path /var/log/fluentd/buffer/syslog
+  </store>
+  <store>
+    @type elasticsearch
+    buffer_type file
+    buffer_path /var/log/fluentd/buffer/elasticsearch
+  </store>
+</match>
+
+2. Increase Buffer Size
+
+If the target syslog server is slow but eventually catches up, increase the buffer size to accommodate the backlog.
+
+Example:
+
+<buffer>
+  @type file
+  path /var/log/fluentd/buffer/syslog
+  flush_interval 10s
+  chunk_limit_size 8MB
+  total_limit_size 1GB
+</buffer>
+
+3. Use Asynchronous Output Plugins
+
+Some Fluentd output plugins support asynchronous communication, allowing Fluentd to keep processing logs even if one output is slow.
+
+Example for Syslog:
+
+<match **>
+  @type syslog
+  async true
+</match>
+
+4. Retry Configuration
+
+Adjust the retry parameters for the affected output plugin to ensure Fluentd doesn’t block the pipeline indefinitely.
+
+Example:
+
+<match **>
+  @type syslog
+  @id syslog_output
+  host syslog.example.com
+  port 514
+  <buffer>
+    retry_forever true
+    retry_max_interval 60s
+  </buffer>
+</match>
+
+5. Use Dead Letter Queue (DLQ)
+
+Consider sending failed logs to a backup location if the target host is unavailable. This avoids blocking other outputs.
+
+Best Practices
+	•	Isolate problematic outputs with dedicated buffers.
+	•	Monitor Fluentd’s health using tools like Prometheus and Grafana.
+	•	Ensure that critical outputs (e.g., logs for compliance) are prioritized over less critical outputs.
+
+Let me know if you’d like detailed configuration examples for your specific setup!
