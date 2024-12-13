@@ -1,0 +1,36 @@
+spec:
+  collection:
+    logs:
+      type: fluentd
+      fluentd:
+        pipelines:
+        - name: high-volume-pipeline
+          buffer:
+            chunk_limit_size: "16m"
+            total_limit_size: "10Gi"
+            queue_limit_length: 2048
+        - name: low-volume-pipeline
+          buffer:
+            chunk_limit_size: "8m"
+            total_limit_size: "2Gi"
+            queue_limit_length: 512
+
+apiVersion: "logging.openshift.io/v1"
+kind: "ClusterLogging"
+metadata:
+  name: "instance"
+  namespace: "openshift-logging"
+spec:
+  collection:
+    logs:
+      type: fluentd
+      fluentd:
+        resources:
+          requests:
+            memory: "2Gi"
+          limits:
+            memory: "4Gi"
+        buffer:
+          chunk_limit_size: "16m"
+          total_limit_size: "10Gi"
+          queue_limit_length: 2048
