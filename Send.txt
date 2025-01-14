@@ -1,1 +1,9 @@
 (echo "From: you@example.com"; echo "To: recipient@example.com"; echo "Subject: Your Excel Report"; echo "MIME-Version: 1.0"; echo "Content-Type: multipart/mixed; boundary=\"boundary\""; echo; echo "--boundary"; echo "Content-Type: text/plain"; echo; echo "Please find the attached Excel file."; echo "--boundary"; echo "Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; name=\"yourfile.xlsx\""; echo "Content-Disposition: attachment; filename=\"yourfile.xlsx\""; echo "Content-Transfer-Encoding: base64"; echo; base64 /path/to/yourfile.xlsx; echo "--boundary--") | /usr/sbin/sendmail -t
+
+
+kubernetes.namespace_name:"prj-cpt-tmx-dev" AND 
+kubernetes.pod_name:/cpt-fusion-tmx-viewer-.*/ AND 
+message:/([0-9]+\.[0-9]+s)|([5-9][0-9]{2}\.[0-9]+ms)/
+kubernetes.namespace_name:"prj-cpt-tmx-dev" AND 
+kubernetes.pod_name:/cpt-fusion-tmx-viewer-.*/ AND 
+message:"GET"
