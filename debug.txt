@@ -1,0 +1,24 @@
+#!/bin/bash
+
+# Get all namespaces and pods with their containers
+echo "Checking for DEBUG logs across all namespaces, pods, and containers..."
+
+# Fetch pod, namespace, and container info
+kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{" "}{range .spec.containers[*]}{.name}{"\n"}{end}{end}' > pod_list.txt
+
+# Function to check logs for DEBUG keyword
+check_logs() {
+  local NAMESPACE=$1
+  local POD_NAME=$2
+  local CONTAINER_NAME=$3
+
+  # Check logs for DEBUG keyword
+  if kubectl logs -n "$NAMESPACE" "$POD_NAME" -c "$CONTAINER_NAME" 2>/dev/null | grep -iq "DEBUG"; then
+    echo "DEBUG logging is enabled in pod '$POD_NAME' (container '$CONTAINER_NAME') in namespace '$NAMESPACE'."
+  fi
+}
+
+export -f check_logs
+
+# Use parallel to check logs in parallel for all pods and containers
+cat pod_list.txt | xargs -n3 -P10 bash -c 'check_logs "$@"' _
