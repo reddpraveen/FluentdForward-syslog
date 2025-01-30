@@ -24,3 +24,68 @@ Additional Notes:
 
 Let me know if you need assistance setting up the queries in Grafana!
 
+
+To handle errors in the `token_command` and fall back to an alternative command if the first one fails, you can use a `try-except` block in Python. This allows you to attempt the first command and, if it raises an exception (indicating an error), execute the second command. Here's how you can modify the `prometheus_query` function to include this logic:
+
+```python
+import subprocess
+
+def prometheus_query(query_tr, nodetoverify):
+    # Define the token commands
+    if cluster_name == "arockxc":
+        token_command_1 = "oc create token prometheus-k8s -n openshift-monitoring"
+        token_command_2 = "oc sa get-token prometheus-k8s -n openshift-monitoring"
+    else:
+        token_command_1 = "oc sa get-token prometheus-k8s -n openshift-monitoring"
+        token_command_2 = "oc create token prometheus-k8s -n openshift-monitoring"
+
+    # Try the first token command
+    try:
+        token = subprocess.check_output(token_command_1.split()).decode('utf-8').strip()
+    except subprocess.CalledProcessError:
+        # If the first command fails, try the second command
+        try:
+            token = subprocess.check_output(token_command_2.split()).decode('utf-8').strip()
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to retrieve token: {e}")
+            return None
+
+    # Command to get the first pod name
+    try:
+        nod_command = "oc get pods -o name -n openshift-monitoring | head -1"
+        pod_name = subprocess.check_output(nod_command, shell=True).decode('utf-8').strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to retrieve pod name: {e}")
+        return None
+
+    # Continue with the rest of the function
+    # ...
+
+    return token, pod_name
+```
+
+### Explanation:
+
+1. **Token Commands**:
+   - Two token commands are defined based on the `cluster_name`.
+   - `token_command_1` is the primary command, and `token_command_2` is the fallback command.
+
+2. **Try-Except Block**:
+   - The `try` block attempts to execute `token_command_1`.
+   - If `token_command_1` fails (raises a `subprocess.CalledProcessError`), the `except` block catches the exception and attempts to execute `token_command_2`.
+
+3. **Error Handling**:
+   - If both commands fail, an error message is printed, and the function returns `None`.
+
+4. **Pod Name Retrieval**:
+   - The `nod_command` retrieves the name of the first pod in the `openshift-monitoring` namespace.
+   - This command is also wrapped in a `try-except` block to handle potential errors.
+
+5. **Return Values**:
+   - The function returns the token and pod name if successful.
+
+### Notes:
+- Ensure that the `cluster_name` variable is defined and correctly set before calling this function.
+- Adjust the commands and error handling as needed based on your specific requirements and environment.
+- This approach ensures that the script is robust and can handle failures gracefully by falling back to alternative commands.
+
