@@ -119,3 +119,38 @@ echo "Setting the default subscription to $SUBSCRIPTION_ID..."
 az account set --subscription "$SUBSCRIPTION_ID"
 
 echo "Azure login successful."
+
+
+#!/bin/bash
+
+# Variables
+NAMESPACE="kube-system"
+SECRET_NAME="azure-credentials"
+TARGET_POD="<target-pod-name>"
+TARGET_NAMESPACE="<target-namespace>"
+TARGET_CONTAINER="<target-container-name>"  # Optional, specify if needed
+
+# Retrieve Azure credentials from Kubernetes secret
+CLIENT_ID=$(oc get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.clientId}' | base64 --decode)
+CLIENT_SECRET=$(oc get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.clientSecret}' | base64 --decode)
+TENANT_ID=$(oc get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.tenantId}' | base64 --decode)
+SUBSCRIPTION_ID=$(oc get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.subscriptionId}' | base64 --decode)
+
+# Check if all required values are retrieved
+if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" || -z "$TENANT_ID" || -z "$SUBSCRIPTION_ID" ]]; then
+  echo "Error: Failed to retrieve Azure credentials from the secret."
+  exit 1
+fi
+
+# Generate the command to log in to Azure
+LOGIN_COMMAND="az login --service-principal --username $CLIENT_ID --password $CLIENT_SECRET --tenant $TENANT_ID && az account set --subscription $SUBSCRIPTION_ID"
+
+# Execute the command on the pod
+echo "Executing Azure login command on the target pod..."
+if [[ -z "$TARGET_CONTAINER" ]]; then
+  oc exec "$TARGET_POD" -n "$TARGET_NAMESPACE" -- bash -c "$LOGIN_COMMAND"
+else
+  oc exec "$TARGET_POD" -n "$TARGET_NAMESPACE" -c "$TARGET_CONTAINER" -- bash -c "$LOGIN_COMMAND"
+fi
+
+echo "Azure login completed on the pod."
