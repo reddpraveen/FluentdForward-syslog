@@ -89,3 +89,33 @@ def prometheus_query(query_tr, nodetoverify):
 - Adjust the commands and error handling as needed based on your specific requirements and environment.
 - This approach ensures that the script is robust and can handle failures gracefully by falling back to alternative commands.
 
+#!/bin/bash
+
+# Set variables
+NAMESPACE="kube-system"
+SECRET_NAME="azure-credentials"
+
+# Fetch secret data from Kubernetes
+CLIENT_ID=$(kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.clientId}' | base64 --decode)
+CLIENT_SECRET=$(kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.clientSecret}' | base64 --decode)
+TENANT_ID=$(kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.tenantId}' | base64 --decode)
+SUBSCRIPTION_ID=$(kubectl get secret "$SECRET_NAME" -n "$NAMESPACE" -o jsonpath='{.data.subscriptionId}' | base64 --decode)
+
+# Check if all required values are retrieved
+if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" || -z "$TENANT_ID" || -z "$SUBSCRIPTION_ID" ]]; then
+  echo "Error: Failed to retrieve Azure credentials from the secret."
+  exit 1
+fi
+
+# Login to Azure
+echo "Logging in to Azure..."
+az login --service-principal \
+         --username "$CLIENT_ID" \
+         --password "$CLIENT_SECRET" \
+         --tenant "$TENANT_ID"
+
+# Set the default subscription
+echo "Setting the default subscription to $SUBSCRIPTION_ID..."
+az account set --subscription "$SUBSCRIPTION_ID"
+
+echo "Azure login successful."
