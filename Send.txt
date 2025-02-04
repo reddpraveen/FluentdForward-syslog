@@ -154,3 +154,8 @@ else
 fi
 
 echo "Azure login completed on the pod."
+
+oc get pods --all-namespaces --field-selector=status.phase=Failed -o jsonpath='{range .items[?(@.status.reason=="Evicted")]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' | while read namespace pod; do
+  oc delete pod "$pod" -n "$namespace"
+done
+
