@@ -159,3 +159,141 @@ oc get pods --all-namespaces --field-selector=status.phase=Failed -o jsonpath='{
   oc delete pod "$pod" -n "$namespace"
 done
 
+Here's a script to generate a report and manage infrastructure pods in OpenShift. The script will check current resource allocation, verify node placement, and provide scaling recommendations:
+
+```bash
+#!/bin/bash
+
+# OpenShift Infrastructure Resource Report Script
+# Checks infra pod placement, resource utilization, and provides scaling recommendations
+
+# Configuration
+INFRA_NODE_LABEL="node-role.kubernetes.io/infra"
+INFRA_PROJECTS=("openshift-ingress" "openshift-monitoring" "openshift-logging" "openshift-dns")
+REPORT_FILE="infra_resource_report_$(date +%Y%m%d).txt"
+WARNING_THRESHOLD=80  # Percentage of resource usage to trigger warning
+
+# Initialize report
+echo "OpenShift Infrastructure Resource Report - $(date)" > $REPORT_FILE
+echo "======================================================" >> $REPORT_FILE
+
+# Function to check infra nodes
+check_infra_nodes() {
+    echo -e "\n[Infra Nodes Status]" >> $REPORT_FILE
+    oc get nodes -l $INFRA_NODE_LABEL -o json | jq -r '.items[] | .metadata.name + " " + .status.allocatable.cpu + " " + .status.allocatable.memory' >> $REPORT_FILE
+}
+
+# Function to check infra pods placement
+check_pod_placement() {
+    echo -e "\n[Infra Pods Status]" >> $REPORT_FILE
+    for project in "${INFRA_PROJECTS[@]}"; do
+        echo -e "\nProject: $project" >> $REPORT_FILE
+        oc get pods -n $project -o json | jq -r '.items[] | .metadata.name + " " + .spec.nodeName + " " + .spec.containers[0].resources.requests.cpu + " " + .spec.containers[0].resources.requests.memory' >> $REPORT_FILE
+    done
+}
+
+# Function to check resource utilization
+check_resource_utilization() {
+    echo -e "\n[Resource Utilization]" >> $REPORT_FILE
+    oc adm top pods --all-namespaces | grep -E "$(IFS=\|; echo "${INFRA_PROJECTS[*]}")" >> $REPORT_FILE
+}
+
+# Function to analyze scaling needs
+analyze_scaling() {
+    echo -e "\n[Scaling Recommendations]" >> $REPORT_FILE
+    nodes=($(oc get nodes -l $INFRA_NODE_LABEL -o jsonpath='{.items[*].metadata.name}'))
+    
+    for node in "${nodes[@]}"; do
+        node_cpu=$(oc get node $node -o jsonpath='{.status.allocatable.cpu}')
+        node_mem=$(oc get node $node -o jsonpath='{.status.allocatable.memory}')
+        
+        used_cpu=$(oc describe node $node | grep -A 5 "Allocated resources" | grep cpu | awk '{print $2}')
+        used_mem=$(oc describe node $node | grep -A 5 "Allocated resources" | grep memory | awk '{print $2}')
+        
+        # Calculate percentage usage
+        cpu_pct=$(( (${used_cpu//m/} * 100) / ${node_cpu//m/} ))
+        mem_pct=$(( (${used_mem//Ki/} * 100) / ${node_mem//Ki/} ))
+
+        echo "Node: $node" >> $REPORT_FILE
+        echo "CPU Usage: $cpu_pct% | Memory Usage: $mem_pct%" >> $REPORT_FILE
+        
+        if [ $cpu_pct -ge $WARNING_THRESHOLD ] || [ $mem_pct -ge $WARNING_THRESHOLD ]; then
+            echo "ACTION REQUIRED: Consider scaling up infra nodes" >> $REPORT_FILE
+        fi
+    done
+}
+
+# Function to check node selector configurations
+check_configurations() {
+    echo -e "\n[Configuration Checks]" >> $REPORT_FILE
+    for project in "${INFRA_PROJECTS[@]}"; do
+        echo -e "\nProject: $project" >> $REPORT_FILE
+        oc get deployments -n $project -o jsonpath='{range .items[*]}{.metadata.name}{"\tNode Selector: "}{.spec.template.spec.nodeSelector}{"\n"}{end}' >> $REPORT_FILE
+    done
+}
+
+# Main execution
+check_infra_nodes
+check_pod_placement
+check_resource_utilization
+analyze_scaling
+check_configurations
+
+# Final recommendations
+echo -e "\n[Next Steps]" >> $REPORT_FILE
+echo "1. Review pod placement to ensure all infrastructure components are on infra nodes" >> $REPORT_FILE
+echo "2. Check resource requests/limits against actual utilization" >> $REPORT_FILE
+echo "3. Scale up infra nodes if utilization exceeds $WARNING_THRESHOLD%" >> $REPORT_FILE
+echo "4. Verify nodeSelectors and tolerations in deployments" >> $REPORT_FILE
+
+echo "Report generated: $REPORT_FILE"
+```
+
+### Key Features:
+1. **Node Status Check**: Lists all infra nodes and their allocatable resources
+2. **Pod Placement Audit**: Verifies infrastructure pods are running on designated infra nodes
+3. **Resource Utilization**: Shows current CPU/memory usage of infrastructure pods
+4. **Auto-Scaling Analysis**: Identifies nodes approaching capacity limits
+5. **Configuration Validation**: Checks nodeSelector configurations in deployments
+
+### Usage:
+1. Save as `infra-resource-report.sh`
+2. Make executable: `chmod +x infra-resource-report.sh`
+3. Run with OpenShift CLI logged in: `./infra-resource-report.sh`
+
+### Sample Output Summary:
+```
+Node: infra-node-1
+CPU Usage: 85% | Memory Usage: 72%
+ACTION REQUIRED: Consider scaling up infra nodes
+
+Node: infra-node-2
+CPU Usage: 65% | Memory Usage: 58%
+
+[Next Steps]
+1. Review pod placement to ensure all infrastructure components are on infra nodes
+2. Check resource requests/limits against actual utilization
+3. Scale up infra nodes if utilization exceeds 80%
+4. Verify nodeSelectors and tolerations in deployments
+```
+
+### Scaling Recommendations:
+1. **Horizontal Scaling**:
+```bash
+# Add new infra node
+oc scale machineset/<infra-machine-set> --replicas=3 -n openshift-machine-api
+```
+
+2. **Vertical Scaling**:
+```bash
+# Edit machine set for larger instances
+oc edit machineset/<infra-machine-set> -n openshift-machine-api
+```
+
+3. **Pod Resource Adjustments**:
+```bash
+# Update resource requests/limits
+oc set resources deployment/<deployment-name> -n <project> --requests=cpu=500m,memory=1Gi
+```
+
+This script provides actionable insights while maintaining the isolation of infrastructure components. Adjust the `WARNING_THRESHOLD` and `INFRA_PROJECTS` array based on your cluster configuration.
