@@ -148,3 +148,11 @@ def critical_alert(alert):
     )
 
     return is_critical
+
+
+# Fetch log volume metrics from Loki (replace LOKI_URL with your Loki endpoint)  
+curl -s -G <LOKI_URL>/loki/api/v1/series \  
+  --data-urlencode 'match[]={log_type="application"}' \  
+  --data-urlencode 'match[]={log_type="infrastructure"}' \  
+  --data-urlencode 'match[]={log_type="audit"}' \  
+  | jq '.data[] | {log_type: .log_type, total_bytes: .total_bytes}'  
