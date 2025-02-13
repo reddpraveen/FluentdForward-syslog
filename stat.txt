@@ -156,3 +156,35 @@ curl -s -G <LOKI_URL>/loki/api/v1/series \
   --data-urlencode 'match[]={log_type="infrastructure"}' \  
   --data-urlencode 'match[]={log_type="audit"}' \  
   | jq '.data[] | {log_type: .log_type, total_bytes: .total_bytes}'  
+
+
+Method 1: Using oc exec to query LokiStack from the Loki gateway pod
+oc exec -n openshift-logging $(oc get pod -n openshift-logging -l app.kubernetes.io/name=lokistack-gateway -o jsonpath='{.items[0].metadata.name}') -- \
+curl -s -G http://localhost:3100/loki/api/v1/series \
+  --data-urlencode 'match[]={log_type="application"}' \
+  --data-urlencode 'match[]={log_type="infrastructure"}' \
+  --data-urlencode 'match[]={log_type="audit"}' \
+  | jq '.data[] | {log_type: .log_type, total_bytes: .total_bytes}'
+This command finds the lokistack-gateway pod, executes curl inside it, and extracts log volume metrics.
+Method 2: Using oc port-forward to expose LokiStack
+If you want to query LokiStack directly from your local machine, forward the Loki gateway port:
+
+oc port-forward -n openshift-logging service/lokistack-gateway 3100:3100 &
+Then, run:
+
+curl -s -G http://localhost:3100/loki/api/v1/series \
+  --data-urlencode 'match[]={log_type="application"}' \
+  --data-urlencode 'match[]={log_type="infrastructure"}' \
+  --data-urlencode 'match[]={log_type="audit"}' \
+  | jq '.data[] | {log_type: .log_type, total_bytes: .total_bytes}'
+Method 3: Directly Fetching Loki Route in OpenShift
+If you have an externally accessible route, you can fetch it dynamically:
+
+LOKI_URL=$(oc get route -n openshift-logging lokistack-gateway -o jsonpath='{.spec.host}')
+curl -s -G "https://${LOKI_URL}/loki/api/v1/series" --insecure \
+  --data-urlencode 'match[]={log_type="application"}' \
+  --data-urlencode 'match[]={log_type="infrastructure"}' \
+  --data-urlencode 'match[]={log_type="audit"}' \
+  | jq '.data[] | {log_type: .log_type, total_bytes: .total_bytes}'
+Replace --insecure with --cacert <ca.pem> if needed for secure requests.
+Let me know if you need further refinements! 🚀
