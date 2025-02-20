@@ -1,0 +1,116 @@
+Upgrading your OpenShift Logging and LokiStack from version 5.8 to 6.0 involves several critical steps, including transitioning from deprecated APIs to the new ClusterLogForwarder.observability.openshift.io API, updating RBAC configurations, and ensuring all components are correctly aligned. Below is a refined guide tailored to your current setup.
+
+Prerequisites:
+	•	Cluster Administrator Access: Ensure you have administrative privileges on your OpenShift cluster.
+	•	Backup Configurations: Before proceeding, back up existing logging configurations and resources.
+	•	Persistent Storage: Confirm access to supported object storage solutions (e.g., AWS S3, Google Cloud Storage, Azure Blob Storage, Swift, MinIO, OpenShift Data Foundation).
+
+Upgrade Steps:
+	1.	Update Operator Subscriptions:
+Modify the subscription channels for both the Loki and OpenShift Logging Operators to upgrade them to version 6.0.
+	•	Loki Operator:
+
+oc patch subscription loki-operator -n openshift-operators --type merge --patch '{"spec": {"channel": "stable-6.0"}}'
+
+
+	•	OpenShift Logging Operator:
+
+oc patch subscription cluster-logging -n openshift-logging --type merge --patch '{"spec": {"channel": "stable-6.0"}}'
+
+
+These commands update the subscription channels to stable-6.0, initiating the upgrade process.
+
+	2.	Transition to the New ClusterLogForwarder API:
+In Logging 6.0, the ClusterLogForwarder.logging.openshift.io API is deprecated. You need to migrate to the ClusterLogForwarder.observability.openshift.io API.
+	•	Export Existing Configuration:
+
+oc get clusterlogforwarder instance -n openshift-logging -o yaml > old-clf.yaml
+
+This command saves your current ClusterLogForwarder configuration for reference.
+
+	•	Create a New ClusterLogForwarder Resource:
+
+cat <<EOF | oc apply -f -
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: collector
+  inputs:
+    - name: application-logs
+      type: application
+    - name: infrastructure-logs
+      type: infrastructure
+    - name: audit-logs
+      type: audit
+  outputs:
+    - name: default-lokistack
+      type: lokiStack
+      lokiStack:
+        name: logging-loki
+        namespace: openshift-logging
+  pipelines:
+    - name: application-pipeline
+      inputRefs:
+        - application-logs
+      outputRefs:
+        - default-lokistack
+    - name: infrastructure-pipeline
+      inputRefs:
+        - infrastructure-logs
+      outputRefs:
+        - default-lokistack
+    - name: audit-pipeline
+      inputRefs:
+        - audit-logs
+      outputRefs:
+        - default-lokistack
+EOF
+
+This configuration aligns with the new API specifications, defining inputs, outputs, and pipelines accordingly.
+
+	3.	Update RBAC Configurations:
+Logging 6.0 introduces changes in service accounts and permissions. Ensure the collector service account has the necessary roles.
+	•	Create or Update the collector Service Account:
+
+oc create sa collector -n openshift-logging || echo "Service account 'collector' already exists."
+
+
+	•	Assign Roles to the collector Service Account:
+
+oc adm policy add-cluster-role-to-user cluster-logging-collector -z collector -n openshift-logging
+
+This command grants the collector service account the necessary permissions to collect logs across the cluster.
+
+	4.	Verify and Validate the Upgrade:
+	•	Check Operator Versions:
+
+oc get csv -n openshift-operators | grep loki-operator
+oc get csv -n openshift-logging | grep cluster-logging
+
+Ensure that both operators are updated to version 6.0.
+
+	•	Confirm Log Collection and Forwarding:
+Monitor the logs of the collector to ensure it’s functioning correctly:
+
+oc logs -l component=collector -n openshift-logging --tail=50
+
+Look for any errors or warnings that might indicate issues.
+
+	•	Validate Log Storage:
+Check the status of the LokiStack to ensure it’s operational:
+
+oc get lokistack logging-loki -n openshift-logging
+
+The output should indicate that the LokiStack is in a ready state.
+
+Additional Considerations:
+	•	Deprecation of Elasticsearch, Fluentd, and Kibana:
+As of Logging 5.8, Elasticsearch, Fluentd, and Kibana are deprecated and removed in Logging 6.0. Ensure that all components relying on these services are migrated to use Loki and the Vector collector.  ￼
+	•	Custom Configurations:
+Review any custom configurations or integrations to ensure compatibility with Logging 6.0. This includes custom log parsers, filters, or external log forwarding setups.
+
+By following these steps, you can successfully upgrade your OpenShift Logging and LokiStack from version 5.8 to 6.0, ensuring a smooth transition to the new APIs and configurations.
