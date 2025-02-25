@@ -191,3 +191,136 @@ Let me know if you’d like further guidance on configuring CLF or optimizing th
 
 
 This version adds more depth around Vector’s ability to handle high data rates, Fluentd’s buffering limitations, and the pros/cons of integrating Loki and Elasticsearch. Let me know if any other points should be added!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(Due to technical issues, the search service is temporarily unavailable.)
+
+**Adjusted Configuration for OpenShift 4.14 and Logging 5.9:**  
+In OpenShift Logging 5.9 (OCP 4.14), the `ClusterLogForwarder` (CLF) API remains stable, but ensure your configuration aligns with version-specific requirements.  
+
+---
+
+### **Step-by-Step Configuration**  
+**1. Define Outputs for Loki and Elasticsearch:**  
+Update the `ClusterLogForwarder` CR to include both Loki and Elasticsearch outputs:  
+```yaml
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  outputs:
+    # LokiStack Output
+    - name: loki-stack
+      type: loki
+      url: http://loki-stack-gateway-http.openshift-logging.svc:8080/api/logs/v1/application
+      secret:
+        name: loki-stack-credentials  # Optional: Use if Loki requires authentication
+
+    # Elasticsearch Output
+    - name: elasticsearch-fxmb
+      type: elasticsearch
+      url: https://elasticsearch-host:9200
+      secret:
+        name: elasticsearch-secret  # Must include username/password or API key
+      tls:
+        insecureSkipVerify: true  # Use only if Elasticsearch uses self-signed certs
+```
+
+**2. Create Pipelines to Route Logs:**  
+Use **label-based filtering** to isolate the `fxmb` namespace and send all other logs to Loki:  
+```yaml
+spec:
+  pipelines:
+    # Pipeline 1: Send ONLY "fxmb" logs to Elasticsearch
+    - name: fxmb-to-elastic
+      inputRefs: [application]  # Adjust to [infrastructure, audit] if needed
+      outputRefs: [elasticsearch-fxmb]
+      filter:
+        - type: include
+          matches:
+            - key: kubernetes.namespace_name
+              operator: equals
+              value: fxmb
+
+    # Pipeline 2: Send ALL OTHER logs to Loki
+    - name: non-fxmb-to-loki
+      inputRefs: [application]
+      outputRefs: [loki-stack]
+      filter:
+        - type: exclude
+          matches:
+            - key: kubernetes.namespace_name
+              operator: equals
+              value: fxmb
+```
+
+---
+
+### **Version-Specific Notes for 4.14/5.9:**  
+1. **Filter Syntax**:  
+   - Logging 5.9 uses `filter` (singular) instead of `filters` (plural).  
+   - Use `type: include` or `type: exclude` with `matches` to define rules.  
+
+2. **Loki Output URL**:  
+   - For LokiStack (v2.9+), use the structured URL format:  
+     `http://<loki-gateway-service>.<namespace>.svc:8080/api/logs/v1/<tenant>`  
+   - Ensure the `tenant` field matches your Loki configuration (default: `application`).  
+
+3. **Elasticsearch Security**:  
+   - If Elasticsearch uses certificates, replace `insecureSkipVerify: true` with a `caBundle` in the output secret.  
+
+4. **Collector Performance**:  
+   - **Fluentd (Default)**: Tune buffers for high throughput in Logging 5.9:  
+     ```yaml
+     outputs:
+       - name: elasticsearch-fxmb
+         type: elasticsearch
+         # Fluentd tuning parameters
+         tuning:
+           flushInterval: 5s
+           bufferChunkLimit: 8MB
+           bufferQueueLimit: 256
+     ```
+   - **Vector (Alternative)**: Switch to Vector for better performance by setting `.spec.collector.type: vector` in the `ClusterLogging` CR.  
+
+---
+
+### **Validation Steps:**  
+1. **Check CLF Status**:  
+   ```bash
+   oc get clusterlogforwarder instance -n openshift-logging -o yaml
+   ```
+2. **Verify Log Routing**:  
+   - **Loki**: Query logs in Grafana using `{kubernetes_namespace_name!="fxmb"}`.  
+   - **Elasticsearch**: Check Kibana for indices prefixed with `app-fxmb-*`.  
+3. **Monitor Collector Pods**:  
+   ```bash
+   oc logs -l component=collector -n openshift-logging --tail=1000
+   # Look for errors like "buffer overflow" or "failed to flush"
+   ```
+
+---
+
+### **Why This Works:**  
+- **Isolation by Namespace**: The `include`/`exclude` filters ensure `fxmb` logs are routed exclusively to Elasticsearch, while all others go to Loki.  
+- **Backward Compatibility**: The CLF configuration remains consistent with Logging 5.9/OCP 4.14 syntax.  
+- **Scalability**: Buffer tuning or Vector mitigates Fluentd’s limitations under high load.  
+
+**Final Answer:**  
+For OCP 4.14 and Logging 5.9, define separate outputs for Loki and Elasticsearch in the `ClusterLogForwarder`, then use `include`/`exclude` filters in pipelines to isolate `fxmb` logs. Tune Fluentd or switch to Vector if throughput is an issue. Validate using Grafana and Kibana.
+
