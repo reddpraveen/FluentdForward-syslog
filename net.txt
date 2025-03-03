@@ -1,0 +1,224 @@
+h1. OpenShift Network Observability CLI (oc netobserv) – Comprehensive Commands Reference (OCP 4.16 / NetObserv 1.7)
+
+The OpenShift Network Observability CLI (the oc netobserv plugin) is a lightweight tool for capturing and analyzing network traffic on demand ￼. It allows cluster administrators to collect network flows, perform packet capture, and even generate a live metrics dashboard without installing the full NetObserv operator stack. The CLI works by deploying a temporary eBPF-based agent (DaemonSet) on selected nodes and a collector pod to aggregate data ￼ ￼. This means you can quickly troubleshoot networking issues or monitor traffic in real-time using simple commands, and then remove all observability components when done. The following documentation organizes oc netobserv commands into logical categories (Flow Analysis, Packet Capture, Metrics Dashboard, Live Monitoring, Filtering, etc.), provides example usages with expected outputs, and outlines various use cases for effective network observability in OpenShift 4.16.
+
+h2. Flow Analysis – Capturing Enriched Network Flows
+
+The oc netobserv flows command captures network flow records from the cluster for analysis. This is useful for debugging connectivity, measuring traffic, and identifying anomalies in real-time. By default, running oc netobserv flows will deploy the necessary agents and start streaming flow data to a central collector. While the capture is running, your terminal displays a live updating table of the latest flows collected ￼. Each flow entry typically includes information such as source/destination IPs and ports, protocol, byte/packet counts, and other metadata. You can let it run for a specified duration or stop it manually once you have captured sufficient data.
+
+Example: Running a flows capture for TCP traffic on port 8080, with drop and RTT tracking enabled, could look like:
+
+{code:language=bash}
+$ oc netobserv flows –enable_pkt_drop –enable_rtt –protocol=TCP –port=8080
+{code}
+
+This will begin monitoring TCP port 8080 traffic cluster-wide, including any packet drops and round-trip time measurements. The CLI will display a live flow table in the terminal (updated continuously) and write all captured flow data to files under an output/flow directory on your local machine ￼. To stop capturing, press Ctrl+C in the terminal (for foreground captures). Once stopped, the CLI automatically writes out the results to two files on your machine:
+	•	Flow JSON file: output/flow/<TIMESTAMP>.json – containing an array of flow records in JSON format ￼. Each JSON object represents a flow with detailed fields. For example, an entry might look like:
+
+{code:language=json}
+{
+“SrcAddr”: “10.128.0.52”,
+“SrcPort”: 56575,
+“DstAddr”: “169.254.169.254”,
+“DstPort”: 53,
+“Proto”: 17,
+“Bytes”: 225,
+“Packets”: 1,
+“DnsLatencyMs”: 11,
+“DnsFlagsResponseCode”: “NoError”,
+“TimeFlowStartMs”: 1709741962111,
+“TimeFlowRttNs”: 121000,
+…
+}
+{code}
+
+(The above is a truncated example; a real flow record includes many fields such as source/destination MAC, interface, timestamps, etc. ￼ ￼).
+	•	Flow Database file: output/flow/<TIMESTAMP>.db – an SQLite database of the captured flows ￼. This allows advanced querying of flows. For instance, you could open this database with sqlite3 and run queries, e.g. to find DNS flows with latency > 10ms:
+{code:language=bash}
+$ sqlite3 output/flow/.db
+sqlite> SELECT DnsLatencyMs, DstAddr, DstPort, SrcAddr, SrcPort, Bytes, Packets
+FROM flow
+WHERE DnsLatencyMs > 10
+LIMIT 5;
+12|10.128.0.63|57856|172.30.0.10|53|284|1
+11|10.128.0.52|56575|169.254.169.254|53|225|1
+…
+{code}
+This query output (example) shows DNS response times (DnsLatencyMs) and related flow info for the first few matching flows ￼ ￼.
+
+During an active flows capture, you can also interactively filter what is displayed without stopping the capture (this does not affect what is recorded to the files; it only filters the live view). At the bottom of the terminal, a prompt live table filter: allows you to type in filter expressions. For example, entering \[SrcK8S_Zone:us-west-1b] and pressing Enter would restrict the live view to flows where the source node’s zone is “us-west-1b” ￼. (Multiple criteria can be matched using regex patterns.) You can also press PageUp/PageDown keys during the capture to toggle the level of contextual information shown in the table – cycling through options like None, Resource, Zone, Host, Owner, or All contextual metadata ￼. This changes whether flows are labeled with Kubernetes object names (pod/service), zone, node (host), owning workload, etc., to help analyze traffic at different abstraction levels.
+
+Use Cases: The flows capture is ideal for general network flow analysis. For example, you might use it to troubleshoot a microservice by capturing all flows to its service port, to check if requests are reaching it and responses are returning. By enabling additional eBPF features (see below), you can uncover issues like packet drops (e.g., due to NetworkPolicy or other network errors) and measure latency metrics. The JSON and DB outputs let you save and share the data or perform offline analysis. In summary, oc netobserv flows provides a quick snapshot of who is talking to whom in your cluster, with rich details for each connection.
+
+h3. Enriching Flow Captures with eBPF Features
+
+The Network Observability CLI supports several feature flags to enrich the flow data with additional telemetry. These correspond to optional eBPF modules that gather more information for each flow. You can enable any combination of these (or all at once) when running a flows capture (and similarly for a metrics capture). By default, all are disabled to minimize overhead ￼ ￼. Here are the feature options available:
+	•	--enable_dns: DNS Tracking – Capture DNS query/response events and measure DNS resolution latency for flows ￼. When enabled, flows that involve DNS (typically UDP to port 53) will include fields like DnsLatencyMs and DNS response codes ￼, helping identify slow DNS responses or failures.
+	•	--enable_pkt_drop: Packet Drop Monitoring – Detect and flag packet drops in flows ￼. With this on, if any packets in a flow were dropped (e.g., due to network policies or other issues), the flow record will indicate it. You can also combine this with the --drops filter (see Filtering below) to specifically capture only dropped traffic ￼.
+	•	--enable_rtt: Round-Trip Time Measurement – Measure network round-trip time for flows ￼. This adds an Rtt metric (in nanoseconds) for flows, which is useful for diagnosing latency between pods or services.
+	•	--enable_network_events: Network Events – Record connection-level events ￼. This can log events like TCP connection establishments or terminations, giving insight into connection churn and handshake issues.
+	•	--enable_pkt_translation: Packet Translation Info – Capture translated IPs (NAT) ￼. When enabled, if a flow goes through a Kubernetes service (ClusterIP) or other NAT, the flow record will be enriched to show the translated endpoint (e.g., the backend pod IP that actually served a request behind a service) ￼. This helps correlate service traffic to the exact pod.
+	•	--enable_udn_mapping: User-Defined Network mapping – Include NetworkAttachment (Multus) network info ￼. This option tags flows with the specific User Defined Network interface (if pods are using additional networks) so you can distinguish traffic on secondary networks from the default cluster network.
+	•	--enable_all: Enable All Features – Turns on all the above eBPF features in one go ￼. This is convenient for a comprehensive capture (equivalent to toggling each flag to true). Keep in mind enabling everything may produce more data and slightly higher overhead.
+
+When using these flags, ensure your cluster’s kernel supports the required eBPF hooks (in OCP 4.16 with NetObserv 1.7, these features are available as this is the supported environment). In practice, you might enable specific features depending on your troubleshooting needs. For example, to debug DNS issues you could run:
+{code:language=bash}
+$ oc netobserv flows –enable_dns –protocol=UDP –port=53
+{code}
+to focus on DNS traffic with latency metrics. Or to catch packet drops on a particular service, you might run flows with --enable_pkt_drop and appropriate filters.
+
+h2. Packet Capture – Deep Dive with PCAP
+
+While flow logs give high-level insight, sometimes you need to inspect the raw packets for detailed protocol analysis or troubleshooting (for example, to debug an application-layer issue or to capture a trace for an external tool). The oc netobserv packets command allows you to capture full packets and save them as a PCAP file. This is essentially a remote packet capture (like running tcpdump across your cluster nodes) targeted at specific traffic.
+
+Usage: Packet capture requires specifying a protocol and port as a filter – you must tell the CLI which traffic to capture (for example, “TCP port 80” or “UDP port 53”). This is to avoid capturing everything and overwhelming the system. You provide these filters via --protocol and --port options (or their short forms). For instance:
+
+{code:language=bash}
+$ oc netobserv packets –protocol=TCP –port=80
+{code}
+
+This command will deploy the packet-capture DaemonSet on the nodes and start capturing all TCP traffic on port 80. Just like flows, the CLI will show a live updating table in your terminal of the latest packets captured ￼ (each entry likely includes timestamp, source/dest, packet size, etc.). To stop capturing, press Ctrl+C when you’re done. While running, you can observe in real-time which packets are being captured (the table view auto-refreshes with new packets similar to how flows are shown).
+
+Once you stop (or when the capture duration ends), the output is saved to a PCAP file in the output/pcap/ directory. Specifically, it will create a file such as:
+output/pcap/<CAPTURE_TIMESTAMP>.pcap (or .pcapng) on your local machine ￼ ￼. This file contains the raw packets and can be opened with Wireshark or any packet analysis tool. For example, you can find the file and do:
+{code:language=bash}
+$ wireshark output/pcap/20231101-101500.pcap
+{code}
+to inspect the packet contents graphically (the CLI itself does not decode packet content beyond the live summary view).
+
+Because this is a targeted capture, you must specify both protocol and port for oc netobserv packets to work ￼. In the current version (NetObserv 1.7), more complex packet filtering (by IP, etc.) is not yet available, so you’ll typically capture a specific traffic stream (e.g., all packets for a given service port). Note also that the special eBPF features (DNS, RTT, drops, etc.) are not applicable in packet mode ￼ – this command is purely for raw packet capture, so those flags will be ignored if provided. The focus is on retrieving the full packets for offline analysis.
+
+Use Cases: Use packet capture when you need full packet-level visibility. For example, if a certain HTTP request is failing between two pods, you can capture TCP port 80 or 443 on those pods (or on the node they run) to get the actual HTTP payload and pinpoint issues (like TLS handshake problems, misbehaving clients, etc.). Another scenario is analyzing an unknown or custom protocol – capturing its packets and loading into Wireshark with the appropriate dissector. Since the CLI automatically aggregates packets from all nodes to one file, it simplifies what would otherwise require running tcpdump on multiple nodes. Just remember to use it sparingly on high-traffic ports, as the volume of data can be large. After capturing, the single PCAP file contains all packets that matched your criteria across the cluster ￼.
+
+h2. Network Metrics Dashboard – Live Traffic Metrics in OpenShift Console
+
+In addition to capturing flows and packets, NetObserv CLI can feed data into OpenShift’s monitoring stack to visualize network metrics. The oc netobserv metrics command sets up an on-demand metrics collection and generates a pre-built dashboard in the OpenShift web console. This feature leverages OpenShift’s Prometheus and dashboard capabilities to present an overview of network activity during the capture period.
+
+When you run oc netobserv metrics, the CLI will deploy the necessary components (including a ServiceMonitor for Prometheus) to collect flow metrics. Instead of printing flow records to your terminal, it will output a URL pointing to the OpenShift Console’s monitoring dashboard. For example, after starting a metrics capture you might see:
+
+{code:language=none}
+Dashboard URL: https:///monitoring/dashboards/netobserv-cli
+{code}
+
+Open the link provided in the terminal to view the “NetObserv / On-Demand” dashboard in your browser ￼. The dashboard (named NetObserv / On-Demand) contains multiple graphs showing network activity over the capture interval. These typically include metrics like total bytes/packets over time, top talkers, packet drop counts, DNS latency distribution, RTT statistics, etc., depending on which features you enabled. Each graph corresponds to a particular aspect of network observability.
+
+By default, any feature not enabled will result in an empty graph on the dashboard ￼. For instance, if you did not enable DNS tracking, the “DNS latency” panel will be blank. Therefore, when running oc netobserv metrics, you should include the relevant --enable_* flags to gather the metrics you care about (similar to the flows features above). You can also apply filters to metrics captures (protocol, port, etc.) to focus the metrics on specific traffic ￼. For example, to capture metrics for TCP traffic on port 49051 across the cluster, you could run:
+
+{code:language=bash}
+$ oc netobserv metrics –enable_dns –enable_rtt –protocol=TCP –port=49051
+{code}
+
+The CLI will respond with a URL to the dashboard. Clicking that URL will open the OpenShift console’s monitoring dashboards view and load the NetObserv / On-Demand dashboard automatically ￼ ￼. As traffic flows in the cluster, the graphs will update in near-real-time. You can use the console’s time range selector to view the metrics over the capture period. The metrics capture will run for a default duration (5 minutes by default) unless specified otherwise (via --max-time). You can end it early by pressing Ctrl+C in the CLI, which will stop the data collection.
+
+This on-demand metrics dashboard is a powerful way to get a high-level view of network performance and issues. It is especially useful for a short-term cluster-wide overview: for example, you might use it to observe overall traffic during a load test, to see if there are packet drops or high latencies happening, or to quickly visualize traffic patterns to/from a particular application (by filtering on its ports or IP). Since the dashboard is integrated into OpenShift’s monitoring UI, it provides a familiar interface (graphs and charts) without any manual setup ￼. Once you are done, you can simply close the dashboard. (Under the hood, the CLI will create the dashboard dynamically and remove it after use, ensuring no permanent changes to your cluster’s monitoring configuration.)
+
+h2. Live Monitoring & Background Captures
+
+Often, you may want to run a network capture for an extended period or in situations where you cannot keep a terminal open. The CLI supports a background mode that lets you start a capture and detach from it, then check results later. This is facilitated by the --background flag (available for flows and packets captures) and complementary commands oc netobserv follow, oc netobserv stop, and oc netobserv copy ￼. Together, these allow “headless” operation of the capture.
+
+Running a capture in background: To start, simply add --background=true (or just --background) to your flows or packets command. For example:
+{code:language=bash}
+$ oc netobserv flows –enable_all –node-selector=env=prod –background
+{code}
+This will initiate a flows capture on the cluster (in this case, enabling all features and restricting to nodes labeled env=prod) and then immediately return you to the shell prompt. You will not see the live flow table in this case – the capture is running in the cluster backend without an attached console. The CLI prints a message indicating the capture is running in background (and possibly an identifier for it). At this point, you can continue using your terminal for other tasks while the capture continues to collect data in the cluster.
+
+Monitoring progress: If you want to observe the capture in real-time, you can attach to it using oc netobserv follow. This command will connect to the running collector and stream the live logs to your terminal ￼. Essentially, it shows you the same table of flows/packets that you would have seen if you ran it in the foreground. For instance, after starting the above background capture, you can run:
+
+{code:language=bash}
+$ oc netobserv follow
+{code}
+
+to view the flows being captured as they occur. You can exit the follow (Ctrl+C) at any time; doing so will not stop the capture, it only detaches your view. The capture continues in the background until its duration completes or you manually stop it.
+
+Stopping a background capture: When you are ready to finalize the capture (or if you need to terminate it early), use oc netobserv stop. This command will halt the data collection by removing the agent DaemonSet from all nodes ￼. The collector pod will stop receiving new data. (Internally, stop essentially performs the same cleanup that would happen automatically if you had run in foreground and hit Ctrl+C.) After running oc netobserv stop, the capture is completed and no more data is being collected.
+
+Retrieving the captured data: After stopping a background capture, you’ll want to get the results (flows JSON/DB or PCAP file) onto your local machine. Use oc netobserv copy to download the generated files from the collector pod ￼. This command knows where the collector stored the output and will copy the files into your local output/ directory, just as if it had been a foreground run. For example:
+
+{code:language=bash}
+$ oc netobserv copy
+{code}
+
+Upon success, you should find the output/flow/<TIMESTAMP>.json and .db (for flows) or output/pcap/<TIMESTAMP>.pcap (for packets) files in your current directory, containing the data captured while running in background.
+
+Cleanup: Finally, you can remove the temporary NetObserv components from the cluster using oc netobserv cleanup. In fact, the CLI usually attempts to clean up automatically when a capture ends in the normal foreground mode ￼ ￼. However, in background mode or if the CLI was interrupted, you may need to run cleanup manually. Executing oc netobserv cleanup will delete any remaining NetObserv CLI pods (collector or agents) and associated resources from the cluster ￼. It’s a good practice to run this when you’re completely done, to ensure no stray pods are left consuming resources.
+
+For clarity, here’s a typical workflow for a background capture (live monitoring scenario):
+
+Start the capture with the --background flag (for flows or packets). The command will exit immediately while capture continues in cluster. ￼
+
+(Optional) use oc netobserv follow to attach to the running capture and watch live output ￼. You can do this multiple times or skip it.
+
+Stop the capture when done by running oc netobserv stop ￼.
+
+Copy the results to your local machine with oc netobserv copy ￼.
+
+Cleanup any remaining resources with oc netobserv cleanup (especially if not already removed by stop) ￼.
+
+This allows you to run long-running or unattended captures (for example, capturing flows overnight or during a critical time window) and still retrieve the data later. It’s essentially a manual mode of live monitoring: you leave the capture running as a “monitor” in the cluster, and you can peek at it or finalize it as needed.
+
+Use Cases: The background capture mode is useful when you suspect an intermittent network issue that requires continuous observation. For instance, if you want to monitor for any packet drops or latency spikes over a few hours, you can run a flows capture in background with --enable_pkt_drop and --enable_rtt, let it run, and periodically check via oc netobserv follow. If an incident occurs, you won’t miss it because the data is being collected. Another use is when capturing on a remote cluster – you can start a background capture and disconnect your client (even log out), then later come back to fetch the results. The follow command provides flexibility to check in without disrupting the capture.
+
+h2. Filtering and Targeted Captures
+
+Filtering is a crucial capability that allows you to target specific traffic and reduce noise in your captures. The Network Observability CLI provides a rich set of filter options to narrow down which flows or packets are collected. Most filtering options apply to flows and metrics captures (and many also to packets, except where noted). You can combine multiple filters in one command to precisely specify the traffic of interest. All filters are optional – if none are provided, a flows/metrics capture will collect all flows in the cluster (which could be a lot), and a packets capture will not start (since it requires at least protocol and port).
+
+Here is a summary of the filtering options available in oc netobserv (as of v1.7):
+	•	Protocol: --protocol=<Proto> – Filter by L4 protocol ￼ ￼. You can specify protocol name or number (e.g. TCP, UDP, ICMP). This ensures only flows/packets of that protocol are captured.
+	•	IP/CIDR: --cidr=<CIDR> – Filter by IP range ￼. Only flows where at least one endpoint is in the given subnet will be captured. For example, --cidr=10.128.0.0/14 could restrict to cluster internal pod network. There is also --peer_ip=<IP> and --peer_cidr=<CIDR> to specifically filter by the other endpoint’s address ￼. In practice, --cidr and --peer_cidr are used together to capture traffic between particular networks (one side vs the other), but you can often use just --cidr for simplicity.
+	•	Ports: You can filter by source or destination port using several options:
+	•	--port=<N> – filter for flows with either source or destination port = N ￼ (for packets capture, --port is interpreted as the port to capture).
+	•	--sport=<N> or --dport=<N> – filter specifically by source or destination port ￼ ￼.
+	•	You can also specify port ranges: --port_range=<start-end>, --sport_range=<start-end>, --dport_range=<start-end> to match any port in a range ￼ ￼.
+	•	For matching multiple discrete ports, there are dual-port options: --ports=<P1>,<P2> (any flow with either of two ports) ￼, likewise --sports= and --dports= for source/dest two-port filters ￼.
+These give a lot of flexibility in targeting specific services. For example, --dports=80,443 would capture web traffic on either port 80 or 443.
+	•	Direction: --direction=<Ingress|Egress> – Filter by traffic direction relative to the capture point ￼. “Ingress” could mean incoming to the node/interface, and “Egress” outgoing. This can be useful to focus on incoming vs outgoing flows. (If left unspecified, both directions are included.)
+	•	Action: --action=<Accept|Drop> – Filter by packet disposition ￼. By default, action=Accept, meaning only successfully forwarded flows are captured. If you set --action=Drop, you capture only dropped traffic (you should also enable drop tracking with --enable_pkt_drop for flows, otherwise drop data may not be collected). Alternatively, you can leave action as Accept and simply use the boolean --drops=true flag to isolate flows that had drops ￼. For instance, --drops=true ensures only flows where some packets were dropped are recorded ￼.
+	•	TCP Flags: --tcp_flags=<flag> – Filter flows by TCP flags observed ￼ ￼. You might use this to find, say, only SYN packets or only flows where the FIN flag was set. The value can be a TCP flag or flags combination (e.g. SYN, FIN,ACK, etc.). (Note: The exact syntax for multiple flags may be regex-based. This is an advanced filter used less frequently.)
+	•	ICMP Type/Code: --icmp_type=<N> and --icmp_code=<N> – When capturing ICMP traffic, you can filter by the ICMP message type and code ￼. For example, to capture only ICMP Echo Request (ping) you would use --protocol=ICMP --icmp_type=8 --icmp_code=0 (type 8, code 0).
+	•	Node Selector: --node-selector=<label-query> – This is slightly different: it restricts where the capture runs rather than which flows. Using this option, the CLI will only deploy the eBPF agent on nodes matching the given label selector ￼. Effectively, you capture traffic only on those nodes. This is useful if you know the workload of interest runs on certain nodes or you want to reduce scope. For example, --node-selector=kubernetes.io/hostname=node1 would target a specific node.
+	•	Regex (advanced): --regexes=<pattern> – A powerful filter that lets you provide a regex to match against any field of the flow record ￼. This is akin to a free-form search. For instance, you could filter by a pod name or namespace if those appear in the enriched flow fields, by using a regex like SrcK8S_Namespace:frontend or similar. This option requires knowing the JSON field names or labels used in flow records; it’s very flexible but usually used in interactive mode with the live filter prompt.
+	•	Interface: --interfaces=<if1,if2,...> – Specify one or more network interfaces to monitor on each node ￼ ￼. By default, the CLI chooses relevant interfaces (for example, the cluster node’s primary interface). If you have multiple network interfaces and only want to capture on certain ones (e.g., only the cluster’s default pod network interface vs others), you can list them. This ties in with the --enable_udn_mapping feature if dealing with multiple networks.
+	•	Subnet Enrichment: --get-subnets=true – Not a capture filter per se, but an option to fetch cluster subnet information for Machines (Nodes), Pods, and Services ￼. Enabling this will include data about cluster network CIDRs in the capture context, which the CLI can use to tag flows as internal or external. For example, flows might be annotated to indicate if a destination IP is outside the cluster networks. This is helpful to quickly separate internal cluster traffic from outside traffic in your analysis.
+
+You can mix and match these filters in a single command to refine your capture. For instance, suppose you want to capture only egress TCP traffic from a particular namespace to an external IP range, and you suspect some packets are being dropped. You might run:
+
+{code:language=bash}
+$ oc netobserv flows –protocol=TCP –direction=Egress –cidr=10.128.0.0/14 –peer_cidr=0.0.0.0/0 
+–enable_pkt_drop –drops=true –regexes=‘SrcK8S_Namespace:myapp’
+{code}
+
+This command (as an example) would capture flows that are Egress TCP from the pod network (10.128.0.0/14 in this cluster) going to anywhere (0.0.0.0/0), and further narrows to flows originating from pods in the “myapp” namespace (using the regex filter on source namespace), and only those flows where drops occurred (using --drops=true). It also enables the packet drop feature to ensure we log drop info. Such a precise filter can help pinpoint if pods in myapp are experiencing dropped outbound connections. Note: The order of flags doesn’t matter; the CLI will apply all filters collectively (logical AND). If no flows meet all criteria, you simply get no output.
+
+In practice, you’ll often use simpler combinations. A common approach is to at least specify --protocol and --port/--dport for the service or application you are interested in, and maybe --cidr or a regex to focus on a particular client or namespace. The filtering capabilities were significantly expanded in NetObserv 1.7, adding many of the options listed above ￼, so you have fine-grained control over what data to capture.
+
+Finally, remember that filtering can be done both via command-line flags (as above) and interactively during a live flows capture via the live table filter prompt ￼ (which effectively is similar to --regexes on the fly). Using both in combination can be very effective: you might start a broad capture with command-line filters, then use the live filter to drill down further in the view.
+
+h2. Auxiliary Commands and Usage Notes
+
+Besides the primary capture commands (flows, packets, metrics) and their options, the oc netobserv plugin provides additional utility commands to manage the capture lifecycle and get information:
+	•	oc netobserv follow – As described earlier, this attaches to a running background capture to stream the logs in real-time ￼. If no capture is in progress, this command will simply wait or do nothing. Use it only after starting a capture with --background.
+	•	oc netobserv stop – Stops an ongoing capture by removing the agent DaemonSet ￼ (and effectively signals the collector to finish). Use this for graceful termination of background captures. In foreground mode, you normally just Ctrl+C instead of using this command.
+	•	oc netobserv copy – Downloads the output files from the most recent capture’s collector pod to your local machine ￼. If you ran a capture in background or your session ended before files were retrieved, run this to get the data. It will place files in the same output/flow or output/pcap directories as usual, and by default will prompt or confirm before overwriting any existing files.
+	•	oc netobserv cleanup – Cleans up all Network Observability CLI components from the cluster ￼. This removes the collector pod, any remaining agent pods, and related resources. Normally, the CLI auto-cleans when a capture ends (especially in foreground mode) ￼. However, you should run this manually if something went wrong (e.g., a crash or connectivity issue) or after stopping a background capture, to ensure nothing is left running. It’s essentially a safety net to return the cluster to a clean state.
+	•	oc netobserv version – Prints the CLI’s version information ￼. This is useful to verify which version of the network-observability plugin you have. For OpenShift 4.16 with NetObserv 1.7, the version should correspond to 1.7.x. Running this might output something like: NetObserv CLI version: 1.7.0.
+	•	oc netobserv help – Shows general help for the CLI or, with a subcommand, help for that specific command ￼. For example, oc netobserv help flows would list all the options for the flows command with brief descriptions. This is a quick way to recall flag names or usage syntax without referring to external docs.
+
+These auxiliary commands make the CLI easier to use in various environments (especially follow, stop, copy for background usage, and cleanup to tidy up). Always ensure you clean up after a capture to free cluster resources – the CLI is meant for on-demand troubleshooting, not continuous running (for continuous monitoring, a full Observability stack would be more appropriate).
+
+h2. Examples of Effective Use Cases
+
+To summarize the capabilities, here are some common scenarios where oc netobserv can be utilized effectively in OpenShift, along with the commands or features to use:
+	•	Quick Connectivity Debugging: Suppose an application is not reachable. You can run oc netobserv flows with a filter on the service’s port to see if packets are arriving or being dropped. For instance, oc netobserv flows --protocol TCP --port 443 --enable_pkt_drop will show if any TLS traffic to your app is being dropped (perhaps by NetworkPolicy) or not reaching at all (no flows seen).
+	•	Monitoring Application Performance: Enable RTT and DNS features to measure network latency for an app. For example, oc netobserv flows --enable_rtt --enable_dns --cidr=<app_cidr> captures flows to/from your app and shows DNS lookup times and response times, helping identify if slowness is due to network/DNS delays ￼ ￼.
+	•	Detecting Packet Loss: If you suspect packet loss, use the --enable_pkt_drop feature and --drops filter. For example, to catch any drops cluster-wide over a period, run oc netobserv flows --enable_pkt_drop --drops=true --background and let it run. Then use oc netobserv follow to see if any flows with drops appear, or inspect the JSON for DropCount after stopping. This can uncover issues like misconfigured MTU or network congestion.
+	•	Deep Packet Inspection for an Incident: If an application experienced an incident at 3 PM, you can capture packets around that time for analysis. Schedule or run oc netobserv packets --protocol=<proto> --port=<port> just before 3 PM in background, stop after the incident, and open the PCAP in Wireshark. This provides full details at the packet level (e.g., to see resets, malformed packets, etc., which flows alone might not show).
+	•	Network Policy Auditing: By capturing flows with --action=Drop (or --drops) and appropriate selectors, you can identify traffic that is being denied by network policies. For instance, run a short capture during a deployment to see if any flows are dropped – if you see drops, you might need to adjust a NetworkPolicy.
+	•	Multi-Network (Multus) Traffic Debugging: If using multiple interfaces (Multus attachments), use --enable_udn_mapping and --interfaces to focus on one network at a time. You can capture flows on a secondary network interface to ensure that cross-network traffic is flowing as expected.
+	•	Capturing Metrics for Capacity Planning: Run oc netobserv metrics during peak hours (with --enable_all to gather everything). The dashboard will show overall throughput and top consumers. This can guide decisions on scaling or network provisioning by giving insight into bandwidth usage and where bottlenecks might be.
+	•	On-Demand Troubleshooting in Production: Because the CLI is lightweight and does not require a persistent installation, you can use it reactively. For example, if an issue arises in production, you can deploy the CLI captures on the fly (since it just uses oc commands under the hood ￼) to collect data, then remove it. This ad-hoc usage means zero overhead when not in use, which is important for production clusters.
+
+Each of these scenarios demonstrates the flexibility of oc netobserv in addressing specific network observability needs without permanent instrumentation. It’s a powerful toolkit for OpenShift administrators to have on hand for diagnosing network issues or performing ephemeral monitoring.
+
+h2. Confluence Import Formatting Note
+
+(The content above is structured with headings, bullet lists, and code blocks in a format suitable for Confluence. When importing into Confluence, the headings hierarchy (h1, h2, h3) will form the page table of contents. Bullet points (*) and numbered lists (#) are used for clarity. Command-line examples are in {code} blocks for proper monospaced formatting. Ensure that the Confluence editor is set to interpret wiki markup or markdown as needed when importing this content.)
