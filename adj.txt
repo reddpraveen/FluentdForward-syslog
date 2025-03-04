@@ -1,0 +1,101 @@
+import pandas as pd
+import subprocess
+
+# Input file with cluster details (Cluster_Name, API_Server, Token)
+INPUT_FILE = "clusters.csv"
+OUTPUT_EXCEL = "namespace_analysis.xlsx"
+OUTPUT_HTML = "namespace_analysis.html"
+
+# Namespaces to exclude
+EXCLUDED_NAMESPACES = ["default", "trident", "consul-ocp"]
+SYSTEM_NAMESPACE_PREFIXES = ["openshift-", "kube-"]
+
+# Function to check namespaces in a cluster
+def check_namespaces(cluster_name, api_server, token):
+    print(f"🔵 Checking cluster: {cluster_name} ({api_server})")
+
+    # Log in to the OpenShift cluster
+    login_cmd = f"oc login --server={api_server} --token={token} --insecure-skip-tls-verify=true"
+    login_result = subprocess.run(login_cmd, shell=True, capture_output=True, text=True)
+
+    if login_result.returncode != 0:
+        print(f"❌ Failed to log in to {cluster_name}")
+        return None, None
+
+    # Get Infra and Logging nodes
+    infra_nodes = subprocess.run("oc get nodes -l node-role.kubernetes.io/infra -o jsonpath='{.items[*].metadata.name}'",
+                                 shell=True, capture_output=True, text=True).stdout.strip().split()
+    logging_nodes = subprocess.run("oc get nodes -l node-role.kubernetes.io/logging -o jsonpath='{.items[*].metadata.name}'",
+                                   shell=True, capture_output=True, text=True).stdout.strip().split()
+
+    # Get all namespaces (excluding system namespaces)
+    namespaces_raw = subprocess.run("oc get namespaces --no-headers -o custom-columns=':metadata.name'",
+                                    shell=True, capture_output=True, text=True).stdout.strip().split()
+    namespaces = [ns for ns in namespaces_raw if not any(ns.startswith(prefix) for prefix in SYSTEM_NAMESPACE_PREFIXES) and ns not in EXCLUDED_NAMESPACES]
+
+    # Collect namespace data
+    namespace_data = []
+    unauthorized_data = []
+
+    for ns in namespaces:
+        # Get nodes where this namespace has running pods
+        ns_nodes = subprocess.run(f"oc get pods -n {ns} -o jsonpath='{{.items[*].spec.nodeName}}'",
+                                  shell=True, capture_output=True, text=True).stdout.strip().split()
+
+        # Determine the node type
+        node_type = "Other"
+        for node in ns_nodes:
+            if node in infra_nodes:
+                node_type = "Infra"
+            if node in logging_nodes:
+                node_type = "Logging"
+
+        # Get namespace labels
+        labels = subprocess.run(f"oc get namespace {ns} -o jsonpath='{{.metadata.labels}}'",
+                                shell=True, capture_output=True, text=True).stdout.strip()
+        labels = labels if labels else "No Labels"
+
+        # Get nodeSelector for the namespace
+        node_selector = subprocess.run(f"oc get namespace {ns} -o jsonpath='{{.metadata.annotations.openshift\\.io/node-selector}}'",
+                                       shell=True, capture_output=True, text=True).stdout.strip()
+        node_selector = node_selector if node_selector else "No NodeSelector"
+
+        # Store data
+        namespace_data.append([cluster_name, ns, node_type, labels, node_selector])
+
+        # If it's running on an Infra or Logging node but it's NOT supposed to, flag it
+        if node_type in ["Infra", "Logging"] and ns not in EXCLUDED_NAMESPACES:
+            unauthorized_data.append([cluster_name, ns, node_type, labels, node_selector])
+
+    return namespace_data, unauthorized_data
+
+# Read clusters from file
+df_clusters = pd.read_csv(INPUT_FILE)
+
+# Process each cluster
+all_data = []
+unauthorized_data = []
+for _, row in df_clusters.iterrows():
+    cluster_name = row["Cluster_Name"]
+    api_server = row["API_Server"]
+    token = row["Token"]
+
+    cluster_data, unauthorized_ns = check_namespaces(cluster_name, api_server, token)
+    if cluster_data:
+        all_data.extend(cluster_data)
+    if unauthorized_ns:
+        unauthorized_data.extend(unauthorized_ns)
+
+# Convert to DataFrames
+df_output = pd.DataFrame(all_data, columns=["Cluster", "Namespace", "Node Type", "Labels", "Node Selector"])
+df_unauthorized = pd.DataFrame(unauthorized_data, columns=["Cluster", "Namespace", "Node Type", "Labels", "Node Selector"])
+
+# Save to Excel (with multiple sheets)
+with pd.ExcelWriter(OUTPUT_EXCEL) as writer:
+    df_output.to_excel(writer, sheet_name="Namespace Analysis", index=False)
+    df_unauthorized.to_excel(writer, sheet_name="Unauthorized Namespaces", index=False)
+
+# Save to HTML
+df_output.to_html(OUTPUT_HTML, index=False)
+
+print(f"✅ Analysis complete! Data saved to {OUTPUT_EXCEL} and {OUTPUT_HTML}")
