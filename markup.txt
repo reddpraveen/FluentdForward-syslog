@@ -1,0 +1,163 @@
+h1. OpenShift Network Observability CLI (`oc netobserv`) - Commands Reference (OCP 4.16 / NetObserv 1.7)
+
+The OpenShift *Network Observability CLI* (`oc netobserv`) provides a command-line interface for capturing and analyzing network traffic in an OpenShift cluster. This guide covers:
+* *Installation* of `oc netobserv` CLI
+* *Command categories* for different use cases
+* *Expected output examples*
+* *Best practices for network observability in OpenShift*
+
+---
+
+h2. 1. Installing the NetObserv CLI (`oc netobserv`)
+
+h3. 1.1 Prerequisites
+Ensure you have:
+* OpenShift CLI (`oc`) installed
+* OpenShift Cluster v4.16+
+* NetObserv CLI Plugin (v1.7)
+
+h3. 1.2 Install the NetObserv CLI Plugin
+
+* Download the latest NetObserv CLI:
+{code:bash}
+curl -L -o oc-netobserv https://github.com/netobserv/network-observability-cli/releases/latest/download/oc-netobserv-linux-amd64
+{code}
+For macOS:
+{code:bash}
+curl -L -o oc-netobserv https://github.com/netobserv/network-observability-cli/releases/latest/download/oc-netobserv-darwin-amd64
+{code}
+
+* Make it executable and move it to `/usr/local/bin/`:
+{code:bash}
+chmod +x oc-netobserv
+sudo mv oc-netobserv /usr/local/bin/
+{code}
+
+* Verify installation:
+{code:bash}
+oc netobserv --help
+{code}
+
+---
+
+h2. 2. Command Categories and Usage
+
+h3. 2.1 Capturing Network Flows
+
+The `oc netobserv flows` command collects enriched network flow logs.
+
+* *Start a flow capture (all flows)*:
+{code:bash}
+oc netobserv flows
+{code}
+_Expected output:_
+{code}
++----------------+------------+------------+---------+---------+-------+
+|   Src IP      | Src Port  | Dst IP      | Dst Port | Proto | Bytes |
++----------------+------------+------------+---------+---------+-------+
+| 10.128.0.52  | 56575      | 169.254.1.1 | 53       | UDP   | 225   |
+| 10.130.1.20  | 443        | 10.200.1.50 | 12345    | TCP   | 3456  |
++----------------+------------+------------+---------+---------+-------+
+{code}
+
+* *Filter flows by namespace*:
+{code:bash}
+oc netobserv flows --namespace=my-namespace
+{code}
+
+* *Filter by protocol and port*:
+{code:bash}
+oc netobserv flows --protocol=TCP --port=8080
+{code}
+
+h3. 2.2 Live Monitoring (Background Capture)
+
+If you want to capture flows continuously in the background:
+{code:bash}
+oc netobserv flows --background
+{code}
+
+* To follow the live capture:
+{code:bash}
+oc netobserv follow
+{code}
+
+* To stop a background capture:
+{code:bash}
+oc netobserv stop
+{code}
+
+h3. 2.3 Packet Capture (PCAP)
+
+If full packets need to be captured for analysis with tools like Wireshark:
+
+* Start a packet capture:
+{code:bash}
+oc netobserv packets --protocol=TCP --port=443
+{code}
+
+* Stop the capture and copy the file:
+{code:bash}
+oc netobserv copy
+{code}
+
+* Open in Wireshark:
+{code:bash}
+wireshark output/pcap/<TIMESTAMP>.pcap
+{code}
+
+h3. 2.4 Metrics Dashboard Integration
+
+To generate network observability dashboards inside OpenShift:
+
+* Start a metrics capture:
+{code:bash}
+oc netobserv metrics
+{code}
+
+The CLI will provide a dashboard link:
+{code}
+Dashboard URL: https://<cluster-console>/monitoring/dashboards/netobserv-cli
+{code}
+
+h3. 2.5 Cleanup and Debugging
+
+After completing captures, cleanup the NetObserv resources:
+{code:bash}
+oc netobserv cleanup
+{code}
+
+Check CLI version:
+{code:bash}
+oc netobserv version
+{code}
+
+---
+
+h2. 3. Use Cases and Examples
+
+| Use Case | Command |
+|----------|---------|
+| *Capture all network flows for a specific namespace* | `oc netobserv flows --namespace=my-namespace` |
+| *Monitor only TCP traffic on port 443* | `oc netobserv flows --protocol=TCP --port=443` |
+| *Find all dropped packets* | `oc netobserv flows --enable_pkt_drop --drops=true` |
+| *Perform packet capture for a specific service* | `oc netobserv packets --protocol=UDP --port=53` |
+| *Live monitor network flows in background* | `oc netobserv flows --background` |
+| *View live traffic via OpenShift dashboard* | `oc netobserv metrics` |
+
+---
+
+h2. 4. Best Practices
+
+* Use `--enable_pkt_drop` when troubleshooting connectivity issues.
+* Combine `--protocol` and `--port` filters to narrow down specific traffic.
+* Store PCAP files for further analysis using `wireshark`.
+* Regularly run `oc netobserv cleanup` to avoid resource consumption.
+
+---
+
+h2. 5. Conclusion
+
+The `oc netobserv` CLI provides a lightweight and powerful toolset for on-demand network observability in OpenShift. It is especially useful for troubleshooting, live monitoring, and forensic packet analysis.
+
+_Import this Confluence page into your enterprise documentation to ensure your team has a quick reference for all key `oc netobserv` commands._
