@@ -207,3 +207,11 @@ done
 
 echo "✅ Done checking cluster: $CLUSTER_URL"
 echo "🎯 All checks completed!"
+
+
+NAMESPACES=$(oc get namespaces --no-headers -o custom-columns=":metadata.name" | grep -Ev "^(openshift-|kube-|default|upr|lilr|trident)$")
+
+# If openshift-gitops exists, add it back to the list
+if oc get namespace openshift-gitops &>/dev/null; then
+    NAMESPACES+=" openshift-gitops"
+fi
