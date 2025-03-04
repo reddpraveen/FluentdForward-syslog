@@ -1,0 +1,174 @@
+h1. Filtering Logs by Metadata and Content in OpenShift Logging
+
+h2. Overview
+OpenShift logging generates a large volume of logs from different applications and system components. To manage and optimize log storage and processing, administrators can filter logs using:
+
+* *Metadata-based filtering* – Select or exclude logs based on Kubernetes labels, namespace, or annotations.
+* *Content-based filtering* – Remove or modify logs based on their message content.
+
+This guide explains how to configure log filtering using the *ClusterLogForwarder (CLF)* in OpenShift.
+
+---
+
+h2. 1. Filtering Logs by Metadata
+
+You can filter logs in the *ClusterLogForwarder* CR by using the `input` selector. This allows you to include or exclude log streams based on metadata such as *namespace*, *pod labels*, or *annotations*.
+
+h3. 1.1 Prerequisites
+
+* OpenShift Cluster v4.14+.
+* OpenShift Logging Operator must be installed and configured.
+* Ensure that the *Vector collector* is set up in your logging deployment.
+
+h3. 1.2 Example: Filtering Logs by Namespace
+
+To exclude logs from a specific namespace (e.g., `test-namespace`):
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  inputs:
+    - name: exclude-test-namespace
+      application:
+        namespaces:
+          - "!test-namespace"  # Excludes logs from test-namespace
+  pipelines:
+    - name: logs-to-loki
+      inputRefs:
+        - exclude-test-namespace
+      outputRefs:
+        - default
+{code}
+
+h3. 1.3 Example: Filtering Logs by Pod Labels
+
+To collect logs only from pods with a specific label (`app=myapp`):
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  inputs:
+    - name: app-logs
+      application:
+        selector:
+          matchLabels:
+            app: myapp
+  pipelines:
+    - name: myapp-logs
+      inputRefs:
+        - app-logs
+      outputRefs:
+        - default
+{code}
+
+h3. 1.4 Example: Filtering Logs by Annotations
+
+To filter logs based on annotations (e.g., `logging: enabled`):
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  inputs:
+    - name: annotated-logs
+      application:
+        selector:
+          matchExpressions:
+            - key: logging
+              operator: In
+              values:
+                - "enabled"
+  pipelines:
+    - name: filtered-logs
+      inputRefs:
+        - annotated-logs
+      outputRefs:
+        - default
+{code}
+
+---
+
+h2. 2. Filtering Logs by Content
+
+Filtering by content helps reduce log volume by excluding unnecessary logs based on their message content.
+
+h3. 2.1 Prerequisites
+
+* Ensure OpenShift Logging is set up with the *Vector collector*.
+* You must use OpenShift Logging v4.14 or later to enable content filtering.
+
+h3. 2.2 Example: Removing Unwanted Log Messages
+
+To exclude logs containing specific keywords (e.g., `DEBUG` messages):
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  pipelines:
+    - name: filter-debug
+      inputRefs:
+        - application
+      outputRefs:
+        - default
+      filters:
+        - type: drop
+          match:
+            - field: message
+              expr: 'contains(value, "DEBUG")'
+{code}
+
+h3. 2.3 Example: Modifying Log Records
+
+You can modify logs by rewriting their message content. For example, replacing sensitive information:
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  pipelines:
+    - name: mask-sensitive-data
+      inputRefs:
+        - application
+      outputRefs:
+        - default
+      filters:
+        - type: modify
+          actions:
+            - field: message
+              expr: 'replace(value, "password=.*", "password=***")'
+{code}
+
+---
+
+h2. 3. Best Practices for Efficient Log Filtering
+
+* Use *metadata filtering* when possible, as it is more efficient than content filtering.
+* Avoid over-filtering to prevent losing important logs.
+* Regularly review filtering configurations to ensure compliance with audit and security policies.
+* Test filtering rules in a non-production environment before applying them in production.
+
+---
+
+h2. 4. Conclusion
+
+Using metadata-based and content-based filtering in OpenShift Logging helps optimize log collection, storage, and analysis. By configuring `ClusterLogForwarder`, administrators can ensure relevant logs are retained while reducing unnecessary log volume.
+
+For more details, refer to the official OpenShift documentation on *Filtering Logs by Metadata and Content*.
