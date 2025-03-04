@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Get list of Infra and Logging nodes
+INFRA_NODES=$(oc get nodes -l node-role.kubernetes.io/infra -o jsonpath='{.items[*].metadata.name}')
+LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging -o jsonpath='{.items[*].metadata.name}')
+
+# Define system namespaces to exclude
+EXCLUDED_NAMESPACES="openshift|kube|default"
+
+# Get all namespaces excluding system namespaces
+NAMESPACES=$(oc get namespaces --no-headers -o custom-columns=":metadata.name" | grep -Ev "^($EXCLUDED_NAMESPACES)")
+
+echo -e "Namespace | Node Type | Labels | NodeSelector"
+
+# Loop through each namespace
+for ns in $NAMESPACES; do
+    # Get the list of nodes running pods in this namespace
+    NS_NODES=$(oc get pods -n "$ns" -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)
+
+    # Determine if the namespace is running on infra/logging nodes
+    NODE_TYPE="Other"
+    for node in $NS_NODES; do
+        if echo "$INFRA_NODES" | grep -q "$node"; then
+            NODE_TYPE="Infra"
+        fi
+        if echo "$LOGGING_NODES" | grep -q "$node"; then
+            NODE_TYPE="Logging"
+        fi
+    done
+
+    # Get namespace labels
+    LABELS=$(oc get namespace "$ns" --no-headers -o jsonpath='{.metadata.labels}' 2>/dev/null)
+    [ -z "$LABELS" ] && LABELS="No Labels"
+
+    # Get nodeSelector for the namespace
+    NODE_SELECTOR=$(oc get namespace "$ns" -o jsonpath='{.metadata.annotations.openshift\.io/node-selector}' 2>/dev/null)
+    [ -z "$NODE_SELECTOR" ] && NODE_SELECTOR="No NodeSelector"
+
+    echo -e "$ns | $NODE_TYPE | $LABELS | $NODE_SELECTOR"
+done
+
+# Find unauthorized namespaces running on infra/logging nodes
+echo -e "\nUnauthorized Namespaces running on Infra/Logging Nodes:"
+for node in $INFRA_NODES $LOGGING_NODES; do
+    UNAUTHORIZED_NS=$(oc get pods --all-namespaces --field-selector spec.nodeName="$node" -o jsonpath='{.items[*].metadata.namespace}' | tr ' ' '\n' | sort -u | grep -Ev "^($EXCLUDED_NAMESPACES)")
+    if [ ! -z "$UNAUTHORIZED_NS" ]; then
+        echo -e "Node: $node -> $UNAUTHORIZED_NS"
+    fi
+done
