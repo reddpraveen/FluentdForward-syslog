@@ -132,3 +132,78 @@ done
 echo "✅ Done checking cluster: $CLUSTER_URL"
 echo "🎯 All checks completed!"
 
+
+
+#!/bin/bash
+
+# Check if the user is logged in
+if ! oc whoami &>/dev/null; then
+    echo "❌ Not logged into OpenShift. Please run 'oc login' and try again."
+    exit 1
+fi
+
+# Get the currently logged-in cluster
+CLUSTER_URL=$(oc whoami --show-server)
+echo -e "\n🔵 Checking OpenShift cluster: $CLUSTER_URL"
+
+# Define namespaces to exclude from standard analysis (except for unauthorized access checks)
+EXCLUDED_NAMESPACES="openshift|kube|default|trident|consul-ocp"
+
+# Get list of Infra and Logging nodes
+INFRA_NODES=$(oc get nodes -l node-role.kubernetes.io/infra -o jsonpath='{.items[*].metadata.name}')
+LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging -o jsonpath='{.items[*].metadata.name}')
+
+# Get all namespaces, excluding system and excluded namespaces for standard analysis
+NAMESPACES=$(oc get namespaces --no-headers -o custom-columns=":metadata.name" | grep -Ev "^($EXCLUDED_NAMESPACES)" || true)
+
+echo -e "Namespace | Node Type | Labels | NodeSelector"
+
+for ns in $NAMESPACES; do
+    # Get list of nodes running pods in this namespace
+    NS_NODES=$(oc get pods -n "$ns" -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)
+
+    # Determine node type
+    NODE_TYPE="Other"
+    for node in $NS_NODES; do
+        if echo "$INFRA_NODES" | grep -q "$node"; then NODE_TYPE="Infra"; fi
+        if echo "$LOGGING_NODES" | grep -q "$node"; then NODE_TYPE="Logging"; fi
+    done
+
+    # Get namespace labels
+    LABELS=$(oc get namespace "$ns" --no-headers -o jsonpath='{.metadata.labels}' 2>/dev/null)
+    [ -z "$LABELS" ] && LABELS="No Labels"
+
+    # Get nodeSelector for the namespace
+    NODE_SELECTOR=$(oc get namespace "$ns" -o jsonpath='{.metadata.annotations.openshift\.io/node-selector}' 2>/dev/null)
+    [ -z "$NODE_SELECTOR" ] && NODE_SELECTOR="No NodeSelector"
+
+    echo -e "$ns | $NODE_TYPE | $LABELS | $NODE_SELECTOR"
+done
+
+# Explicitly check if openshift-gitops is running on Infra/Logging nodes
+echo -e "\n🔍 Checking if openshift-gitops is running on Infra/Logging Nodes:"
+GITOPS_NODES=$(oc get pods -n openshift-gitops -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)
+
+for node in $GITOPS_NODES; do
+    if echo "$INFRA_NODES" | grep -q "$node" || echo "$LOGGING_NODES" | grep -q "$node"; then
+        echo -e "⚠️ openshift-gitops is running on Infra/Logging node: $node"
+    fi
+done
+
+# Check unauthorized usage of Infra/Logging nodes by excluded namespaces
+echo -e "\n🔍 Checking for unauthorized namespaces (system and excluded) running on Infra/Logging Nodes:"
+ALL_NAMESPACES=$(oc get namespaces --no-headers -o custom-columns=":metadata.name")
+
+for ns in $ALL_NAMESPACES; do
+    if [[ "$ns" =~ ^($EXCLUDED_NAMESPACES)$ ]]; then
+        NS_NODES=$(oc get pods -n "$ns" -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)
+        for node in $NS_NODES; do
+            if echo "$INFRA_NODES" | grep -q "$node" || echo "$LOGGING_NODES" | grep -q "$node"; then
+                echo -e "⚠️ Unauthorized namespace ($ns) is running on Infra/Logging node: $node"
+            fi
+        done
+    fi
+done
+
+echo "✅ Done checking cluster: $CLUSTER_URL"
+echo "🎯 All checks completed!"
