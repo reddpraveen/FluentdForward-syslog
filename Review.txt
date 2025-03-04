@@ -48,3 +48,77 @@ for node in $INFRA_NODES $LOGGING_NODES; do
     fi
 done
 (echo "Subject: Namespace Analysis Report"; echo "To: recipient@example.com"; echo "MIME-Version: 1.0"; echo "Content-Type: multipart/mixed; boundary=\"boundary\""; echo; echo "--boundary"; echo "Content-Type: text/plain"; echo; echo "Please find the attached namespace analysis reports."; echo "--boundary"; echo "Content-Type: application/octet-stream; name=\"namespace_analysis.xlsx\""; echo "Content-Disposition: attachment; filename=\"namespace_analysis.xlsx\""; echo "Content-Transfer-Encoding: base64"; echo; base64 namespace_analysis.xlsx; echo "--boundary--") | sendmail -t
+
+
+#!/bin/bash
+
+# File containing OpenShift API server hostnames (one per line)
+CLUSTER_HOSTS_FILE="clusters.txt"
+
+# Prompt for token (secure input)
+read -sp "Enter OpenShift Token: " TOKEN
+echo ""
+
+# Define namespaces to exclude
+EXCLUDED_NAMESPACES="openshift|kube|default|trident|consul-ocp"
+
+# Function to check namespaces in a given cluster
+check_namespaces() {
+    echo -e "\n🔵 Checking cluster: $1"
+    
+    # Log in to the cluster
+    oc login --server="$1" --token="$TOKEN" --insecure-skip-tls-verify=true > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "❌ Failed to log in to $1"
+        return
+    fi
+
+    # Get list of Infra and Logging nodes
+    INFRA_NODES=$(oc get nodes -l node-role.kubernetes.io/infra -o jsonpath='{.items[*].metadata.name}')
+    LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging -o jsonpath='{.items[*].metadata.name}')
+
+    # Get all namespaces excluding system and excluded namespaces
+    NAMESPACES=$(oc get namespaces --no-headers -o custom-columns=":metadata.name" | grep -Ev "^($EXCLUDED_NAMESPACES)")
+
+    echo -e "Namespace | Node Type | Labels | NodeSelector"
+
+    for ns in $NAMESPACES; do
+        # Get list of nodes running pods in this namespace
+        NS_NODES=$(oc get pods -n "$ns" -o jsonpath='{.items[*].spec.nodeName}' | tr ' ' '\n' | sort -u)
+
+        # Determine node type
+        NODE_TYPE="Other"
+        for node in $NS_NODES; do
+            if echo "$INFRA_NODES" | grep -q "$node"; then NODE_TYPE="Infra"; fi
+            if echo "$LOGGING_NODES" | grep -q "$node"; then NODE_TYPE="Logging"; fi
+        done
+
+        # Get namespace labels
+        LABELS=$(oc get namespace "$ns" --no-headers -o jsonpath='{.metadata.labels}' 2>/dev/null)
+        [ -z "$LABELS" ] && LABELS="No Labels"
+
+        # Get nodeSelector for the namespace
+        NODE_SELECTOR=$(oc get namespace "$ns" -o jsonpath='{.metadata.annotations.openshift\.io/node-selector}' 2>/dev/null)
+        [ -z "$NODE_SELECTOR" ] && NODE_SELECTOR="No NodeSelector"
+
+        echo -e "$ns | $NODE_TYPE | $LABELS | $NODE_SELECTOR"
+    done
+
+    # Find unauthorized namespaces running on infra/logging nodes
+    echo -e "\n🔍 Unauthorized Namespaces running on Infra/Logging Nodes:"
+    for node in $INFRA_NODES $LOGGING_NODES; do
+        UNAUTHORIZED_NS=$(oc get pods --all-namespaces --field-selector spec.nodeName="$node" -o jsonpath='{.items[*].metadata.namespace}' | tr ' ' '\n' | sort -u | grep -Ev "^($EXCLUDED_NAMESPACES)")
+        if [ ! -z "$UNAUTHORIZED_NS" ]; then
+            echo -e "⚠️ Node: $node -> Unauthorized Namespaces: $UNAUTHORIZED_NS"
+        fi
+    done
+
+    echo "✅ Done checking cluster: $1"
+}
+
+# Read cluster hosts from file and run check for each
+while read -r CLUSTER_HOST; do
+    check_namespaces "$CLUSTER_HOST"
+done < "$CLUSTER_HOSTS_FILE"
+
+echo "🎯 All clusters checked!"
