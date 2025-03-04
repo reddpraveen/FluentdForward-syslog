@@ -1,0 +1,141 @@
+h1. OpenShift Network Observability CLI (oc netobserv) – Comprehensive Commands Reference
+
+The OpenShift Network Observability CLI provides a lightweight tool for capturing and analyzing network traffic on demand. It enables administrators to collect network flows, perform packet capture, and generate real-time traffic metrics without requiring a full Observability stack. The CLI works by deploying temporary agents and collectors, allowing quick troubleshooting and analysis.
+
+This documentation categorizes commands into logical sections, providing usage examples with expected outputs.
+
+h2. Flow Analysis – Capturing Enriched Network Flows
+
+The oc netobserv flows command captures network flow records for analysis, aiding in connectivity debugging, traffic measurement, and anomaly detection. Running oc netobserv flows deploys the necessary agents and starts streaming flow data.
+
+Example: Capturing TCP traffic on port 8080 with packet drop and RTT tracking:
+
+{code:bash}
+oc netobserv flows --enable_pkt_drop --enable_rtt --protocol=TCP --port=8080
+{code}
+
+Captured flow data is stored in:
+
+* JSON format: *output/flow/<TIMESTAMP>.json*
+* SQLite database: *output/flow/<TIMESTAMP>.db*
+
+Example of querying DNS latency from the database:
+
+{code:bash}
+sqlite3 output/flow/<TIMESTAMP>.db
+sqlite> SELECT DnsLatencyMs, DstAddr, DstPort, SrcAddr, SrcPort FROM flow WHERE DnsLatencyMs > 10 LIMIT 5;
+{code}
+
+h3. Enriching Flow Captures with eBPF Features
+
+Additional telemetry can be enabled for flow captures:
+
+* --enable_dns: Capture DNS queries and measure resolution latency.
+* --enable_pkt_drop: Detect and log dropped packets.
+* --enable_rtt: Measure round-trip time for network latency analysis.
+* --enable_network_events: Record TCP connection events.
+* --enable_pkt_translation: Capture NAT-translated IPs.
+* --enable_udn_mapping: Identify traffic from Multus networks.
+* --enable_all: Enable all features at once.
+
+Example: Capturing DNS traffic with latency metrics:
+
+{code:bash}
+oc netobserv flows --enable_dns --protocol=UDP --port=53
+{code}
+
+h2. Packet Capture – Deep Dive with PCAP
+
+Packet capture allows inspecting raw network traffic for detailed analysis.
+
+Example: Capturing TCP port 80 traffic:
+
+{code:bash}
+oc netobserv packets --protocol=TCP --port=80
+{code}
+
+Captured packets are stored in *output/pcap/<TIMESTAMP>.pcap*, which can be analyzed using Wireshark:
+
+{code:bash}
+wireshark output/pcap/<TIMESTAMP>.pcap
+{code}
+
+h2. Network Metrics Dashboard
+
+The oc netobserv metrics command generates a real-time dashboard in OpenShift’s web console.
+
+Example:
+
+{code:bash}
+oc netobserv metrics --enable_dns --enable_rtt --protocol=TCP --port=49051
+{code}
+
+The command provides a URL to the OpenShift monitoring dashboard displaying network activity.
+
+h2. Live Monitoring & Background Captures
+
+Network captures can be run in the background for long-term monitoring.
+
+Example workflow:
+
+# Start a background capture:
+{code:bash}
+oc netobserv flows --enable_all --background
+{code}
+
+# Attach to the running capture:
+{code:bash}
+oc netobserv follow
+{code}
+
+# Stop the capture:
+{code:bash}
+oc netobserv stop
+{code}
+
+# Retrieve captured data:
+{code:bash}
+oc netobserv copy
+{code}
+
+# Cleanup resources:
+{code:bash}
+oc netobserv cleanup
+{code}
+
+h2. Filtering and Targeted Captures
+
+Filtering allows capturing only specific traffic patterns.
+
+Examples:
+
+* Capturing TCP flows on port 443:
+{code:bash}
+oc netobserv flows --protocol=TCP --port=443
+{code}
+
+* Capturing DNS flows with high latency:
+{code:bash}
+oc netobserv flows --enable_dns --cidr=10.128.0.0/14 --peer_cidr=0.0.0.0/0 --enable_pkt_drop --drops=true
+{code}
+
+h2. Auxiliary Commands
+
+Additional commands for managing captures:
+
+* *oc netobserv follow* – Attach to a running capture.
+* *oc netobserv stop* – Stop an ongoing capture.
+* *oc netobserv copy* – Retrieve captured files.
+* *oc netobserv cleanup* – Remove temporary NetObserv components.
+* *oc netobserv version* – Display CLI version.
+* *oc netobserv help* – Show help for commands.
+
+h2. Use Cases
+
+Examples of how to apply oc netobserv:
+
+* **Troubleshooting connectivity:** Monitor dropped packets using `--enable_pkt_drop`.
+* **Analyzing application performance:** Enable `--enable_rtt` and `--enable_dns` for latency insights.
+* **Capturing packets for incident investigation:** Use packet capture to analyze specific traffic patterns.
+* **Auditing network policies:** Capture and analyze dropped traffic for policy validation.
+* **Monitoring traffic trends:** Use the metrics dashboard for real-time insights.
