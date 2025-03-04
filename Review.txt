@@ -47,3 +47,4 @@ for node in $INFRA_NODES $LOGGING_NODES; do
         echo -e "Node: $node -> $UNAUTHORIZED_NS"
     fi
 done
+(echo "Subject: Namespace Analysis Report"; echo "To: recipient@example.com"; echo "MIME-Version: 1.0"; echo "Content-Type: multipart/mixed; boundary=\"boundary\""; echo; echo "--boundary"; echo "Content-Type: text/plain"; echo; echo "Please find the attached namespace analysis reports."; echo "--boundary"; echo "Content-Type: application/octet-stream; name=\"namespace_analysis.xlsx\""; echo "Content-Disposition: attachment; filename=\"namespace_analysis.xlsx\""; echo "Content-Transfer-Encoding: base64"; echo; base64 namespace_analysis.xlsx; echo "--boundary--") | sendmail -t
