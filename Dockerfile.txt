@@ -1,0 +1,30 @@
+FROM registry.access.redhat.com/ubi8/nodejs-16:latest
+
+# Create app directory
+WORKDIR /app
+
+# Set user for installing dependencies
+USER 0
+
+# Install app dependencies
+COPY package*.json ./
+RUN npm install
+
+# Copy app source code
+COPY . .
+
+# Create public directory for frontend files
+RUN mkdir -p public
+
+# Copy frontend files
+COPY public/ public/
+
+# Change ownership to non-root user
+RUN chown -R 1001:0 /app
+USER 1001
+
+# Expose port
+EXPOSE 8080
+
+# Start the application
+CMD ["node", "app.js"]
