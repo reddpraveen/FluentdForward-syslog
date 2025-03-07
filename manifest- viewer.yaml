@@ -1,0 +1,140 @@
+# Namespace for the application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-manifest-viewer
+---
+# Service Account for accessing the OpenShift API
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: manifest-viewer-sa
+  namespace: openshift-manifest-viewer
+---
+# Cluster Role with minimal permissions to read resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manifest-viewer-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["route.openshift.io"]
+  resources: ["routes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["project.openshift.io"]
+  resources: ["projects"]
+  verbs: ["get", "list", "watch"]
+---
+# Bind the role to the service account
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: manifest-viewer-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: manifest-viewer-sa
+  namespace: openshift-manifest-viewer
+roleRef:
+  kind: ClusterRole
+  name: manifest-viewer-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ConfigMap for the application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: manifest-viewer-config
+  namespace: openshift-manifest-viewer
+data:
+  config.json: |
+    {
+      "defaultNamespace": "default",
+      "refreshInterval": 30,
+      "hideSystemNamespaces": true,
+      "hiddenFields": ["managedFields", "status.conditions", "metadata.annotations.kubectl.kubernetes.io"]
+    }
+---
+# Deployment for the backend API and frontend UI
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: manifest-viewer
+  namespace: openshift-manifest-viewer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: manifest-viewer
+  template:
+    metadata:
+      labels:
+        app: manifest-viewer
+    spec:
+      serviceAccountName: manifest-viewer-sa
+      containers:
+      - name: backend
+        image: registry.access.redhat.com/ubi8/nodejs-16:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: KUBERNETES_SERVICE_HOST
+          value: "kubernetes.default.svc"
+        - name: KUBERNETES_SERVICE_PORT
+          value: "443"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: sa-token
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: manifest-viewer-config
+      - name: sa-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+              audience: kubernetes.default.svc
+---
+# Service to expose the application
+apiVersion: v1
+kind: Service
+metadata:
+  name: manifest-viewer-service
+  namespace: openshift-manifest-viewer
+spec:
+  selector:
+    app: manifest-viewer
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP
+---
+# Route to access the application
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: manifest-viewer-route
+  namespace: openshift-manifest-viewer
+spec:
+  to:
+    kind: Service
+    name: manifest-viewer-service
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
