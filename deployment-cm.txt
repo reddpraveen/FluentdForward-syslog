@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-manifest-viewer
+  namespace: your-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-manifest-viewer
+  template:
+    metadata:
+      labels:
+        app: openshift-manifest-viewer
+    spec:
+      containers:
+      - name: manifest-viewer
+        image: node:16-alpine
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: API_URL
+          value: "https://kubernetes.default.svc"
+        - name: VIEWS_CONFIG
+          valueFrom:
+            configMapKeyRef:
+              name: manifest-viewer-views
+              key: views.json
+        volumeMounts:
+        - name: app-config
+          mountPath: /app
+        command: ["sh", "-c"]
+        args:
+        - |
+          cd /app
+          npm init -y
+          npm install express axios
+          node app.js
+      volumes:
+      - name: app-config
+        configMap:
+          name: manifest-viewer-config
