@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: manifest-viewer-views
+  namespace: your-namespace
+data:
+  views.json: |
+    [
+      {
+        "id": "namespaces-with-labels",
+        "name": "Namespaces with Labels",
+        "resource": "namespaces",
+        "namespace": "",
+        "columns": [
+          {
+            "key": "name",
+            "label": "Namespace",
+            "path": "metadata.name"
+          },
+          {
+            "key": "phase",
+            "label": "Status",
+            "path": "status.phase"
+          },
+          {
+            "key": "labels",
+            "label": "Labels",
+            "path": "metadata.labels",
+            "type": "labels"
+          }
+        ]
+      },
+      {
+        "id": "running-pods",
+        "name": "Running Pods",
+        "resource": "pods",
+        "namespace": "",
+        "filters": [
+          {
+            "path": "status.phase",
+            "operator": "equals",
+            "value": "Running"
+          }
+        ],
+        "columns": [
+          {
+            "key": "name",
+            "label": "Pod Name",
+            "path": "metadata.name"
+          },
+          {
+            "key": "namespace",
+            "label": "Namespace",
+            "path": "metadata.namespace"
+          },
+          {
+            "key": "node",
+            "label": "Node",
+            "path": "spec.nodeName"
+          },
+          {
+            "key": "containers",
+            "label": "Containers",
+            "path": "spec.containers.length"
+          }
+        ]
+      }
+    ]
