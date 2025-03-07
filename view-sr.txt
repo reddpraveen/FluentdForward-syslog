@@ -22,3 +22,12 @@ spec:
     name: openshift-manifest-viewer
   port:
     targetPort: 8080
+
+
+
+
+# Apply all configurations
+oc apply -f manifest-viewer-config.yaml
+oc apply -f manifest-viewer-views.yaml
+oc apply -f manifest-viewer-deployment.yaml
+oc apply -f manifest-viewer-service-route.yaml
