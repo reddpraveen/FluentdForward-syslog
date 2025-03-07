@@ -1,0 +1,625 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: manifest-viewer-config
+  namespace: your-namespace
+data:
+  app.js: |
+    const express = require('express');
+    const path = require('path');
+    const axios = require('axios');
+    const app = express();
+    const port = process.env.PORT || 8080;
+    
+    // Read configuration from environment variables
+    const apiUrl = process.env.API_URL || 'https://kubernetes.default.svc';
+    
+    // Middleware to parse JSON
+    app.use(express.json());
+    app.use(express.static(path.join(__dirname, 'public')));
+    
+    // API proxy endpoint
+    app.post('/api/proxy', async (req, res) => {
+      try {
+        const { endpoint, method, data } = req.body;
+        const token = req.headers.authorization?.split(' ')[1] || '';
+        
+        if (!token) {
+          return res.status(401).json({ error: 'No token provided' });
+        }
+        
+        const response = await axios({
+          method: method || 'GET',
+          url: `${apiUrl}${endpoint}`,
+          data: data || {},
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+        });
+        
+        res.json(response.data);
+      } catch (error) {
+        console.error('API request error:', error.message);
+        res.status(error.response?.status || 500).json({
+          error: error.message,
+          details: error.response?.data || {}
+        });
+      }
+    });
+    
+    // View definitions endpoint - fetch from ConfigMap
+    app.get('/api/views', (req, res) => {
+      try {
+        const viewsConfig = JSON.parse(process.env.VIEWS_CONFIG || '[]');
+        res.json(viewsConfig);
+      } catch (error) {
+        console.error('Error parsing views config:', error);
+        res.status(500).json({ error: 'Failed to load view definitions' });
+      }
+    });
+    
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    });
+    
+    app.listen(port, () => {
+      console.log(`OpenShift Manifest Viewer running on port ${port}`);
+    });
+
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>OpenShift Manifest Viewer</title>
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/css/bootstrap.min.css" rel="stylesheet">
+      <link href="styles.css" rel="stylesheet">
+    </head>
+    <body>
+      <div class="container-fluid">
+        <div class="row">
+          <nav class="col-md-3 col-lg-2 d-md-block bg-light sidebar">
+            <div class="position-sticky pt-3">
+              <div class="mb-4 p-3">
+                <h5>OpenShift Manifest Viewer</h5>
+                <div id="login-form">
+                  <div class="mb-3">
+                    <label for="api-url" class="form-label">API URL</label>
+                    <input type="text" class="form-control" id="api-url">
+                  </div>
+                  <div class="mb-3">
+                    <label for="token" class="form-label">Token</label>
+                    <textarea class="form-control" id="token" rows="3"></textarea>
+                  </div>
+                  <button id="login-btn" class="btn btn-primary">Connect</button>
+                </div>
+              </div>
+              <div id="resource-nav" class="d-none">
+                <h6 class="sidebar-heading px-3 mt-4 mb-1 text-muted">Resources</h6>
+                <ul class="nav flex-column">
+                  <li class="nav-item">
+                    <a class="nav-link" href="#" data-resource="namespaces">Namespaces</a>
+                  </li>
+                  <li class="nav-item">
+                    <a class="nav-link" href="#" data-resource="pods">Pods</a>
+                  </li>
+                </ul>
+                <h6 class="sidebar-heading px-3 mt-4 mb-1 text-muted">Custom Views</h6>
+                <ul class="nav flex-column" id="custom-views">
+                  <!-- Custom views will be loaded here -->
+                </ul>
+              </div>
+            </div>
+          </nav>
+    
+          <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4">
+            <div id="content">
+              <div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+                <h1 class="h2">Dashboard</h1>
+              </div>
+              <div id="welcome-message">
+                <p>Welcome to OpenShift Manifest Viewer</p>
+                <p>Enter your API URL and token to get started.</p>
+              </div>
+              <div id="resources-container" class="d-none">
+                <div class="row mb-3">
+                  <div class="col">
+                    <select id="namespace-selector" class="form-select d-none">
+                      <option value="">All Namespaces</option>
+                    </select>
+                  </div>
+                  <div class="col-auto">
+                    <input type="text" id="search-filter" class="form-control" placeholder="Filter...">
+                  </div>
+                </div>
+                <div class="table-responsive">
+                  <table class="table table-striped table-sm">
+                    <thead id="resource-table-header">
+                      <!-- Headers will be generated dynamically -->
+                    </thead>
+                    <tbody id="resource-table-body">
+                      <!-- Content will be generated dynamically -->
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+      </div>
+      <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.3/dist/js/bootstrap.bundle.min.js"></script>
+      <script src="app.js"></script>
+    </body>
+    </html>
+
+  styles.css: |
+    body {
+      font-size: .875rem;
+    }
+    
+    .sidebar {
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 100;
+      padding: 48px 0 0;
+      box-shadow: inset -1px 0 0 rgba(0, 0, 0, .1);
+    }
+    
+    .sidebar-heading {
+      font-size: .75rem;
+      text-transform: uppercase;
+    }
+    
+    .sidebar .nav-link {
+      font-weight: 500;
+      color: #333;
+    }
+    
+    .sidebar .nav-link.active {
+      color: #2470dc;
+    }
+    
+    @media (max-width: 768px) {
+      .sidebar {
+        position: static;
+        padding-top: 1.5rem;
+      }
+    }
+
+  app.js: |
+    // Client-side JavaScript
+    document.addEventListener('DOMContentLoaded', function() {
+      // DOM Elements
+      const loginBtn = document.getElementById('login-btn');
+      const apiUrlInput = document.getElementById('api-url');
+      const tokenInput = document.getElementById('token');
+      const loginForm = document.getElementById('login-form');
+      const resourceNav = document.getElementById('resource-nav');
+      const welcomeMessage = document.getElementById('welcome-message');
+      const resourcesContainer = document.getElementById('resources-container');
+      const namespaceSelector = document.getElementById('namespace-selector');
+      const resourceTableHeader = document.getElementById('resource-table-header');
+      const resourceTableBody = document.getElementById('resource-table-body');
+      const customViewsContainer = document.getElementById('custom-views');
+      const searchFilter = document.getElementById('search-filter');
+      
+      // State management
+      let currentToken = '';
+      let currentResource = '';
+      let currentNamespace = '';
+      let currentData = [];
+      
+      // Initialize with values from localStorage
+      apiUrlInput.value = localStorage.getItem('apiUrl') || '';
+      
+      // Login handler
+      loginBtn.addEventListener('click', async function() {
+        const apiUrl = apiUrlInput.value.trim();
+        const token = tokenInput.value.trim();
+        
+        if (!apiUrl || !token) {
+          alert('Please enter API URL and token');
+          return;
+        }
+        
+        try {
+          // Verify the token works by fetching namespaces
+          const response = await fetch('/api/proxy', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+              endpoint: '/api/v1/namespaces'
+            })
+          });
+          
+          if (!response.ok) {
+            throw new Error('Authentication failed');
+          }
+          
+          // Save to localStorage
+          localStorage.setItem('apiUrl', apiUrl);
+          currentToken = token;
+          
+          // Show the resources panel
+          loginForm.classList.add('d-none');
+          resourceNav.classList.remove('d-none');
+          welcomeMessage.classList.add('d-none');
+          resourcesContainer.classList.remove('d-none');
+          
+          // Load custom views
+          loadCustomViews();
+          
+          // Load namespaces by default
+          loadResource('namespaces');
+        } catch (error) {
+          alert(`Login failed: ${error.message}`);
+        }
+      });
+      
+      // Load custom views
+      async function loadCustomViews() {
+        try {
+          const response = await fetch('/api/views');
+          const views = await response.json();
+          
+          customViewsContainer.innerHTML = '';
+          views.forEach(view => {
+            const li = document.createElement('li');
+            li.className = 'nav-item';
+            
+            const a = document.createElement('a');
+            a.className = 'nav-link';
+            a.href = '#';
+            a.textContent = view.name;
+            a.dataset.viewId = view.id;
+            
+            a.addEventListener('click', () => loadCustomView(view));
+            
+            li.appendChild(a);
+            customViewsContainer.appendChild(li);
+          });
+        } catch (error) {
+          console.error('Failed to load custom views:', error);
+        }
+      }
+      
+      // Load a custom view
+      function loadCustomView(view) {
+        currentResource = 'custom';
+        
+        // Set table headers
+        const headerRow = document.createElement('tr');
+        view.columns.forEach(column => {
+          const th = document.createElement('th');
+          th.textContent = column.label;
+          headerRow.appendChild(th);
+        });
+        resourceTableHeader.innerHTML = '';
+        resourceTableHeader.appendChild(headerRow);
+        
+        // Fetch data for the custom view
+        fetchResourceData(view.resource, view.namespace)
+          .then(data => {
+            // Process data according to view configuration
+            const processedData = processViewData(data, view);
+            renderTableData(processedData, view.columns);
+          })
+          .catch(error => {
+            console.error(`Error loading custom view: ${error}`);
+            resourceTableBody.innerHTML = `<tr><td colspan="${view.columns.length}">Error loading data: ${error.message}</td></tr>`;
+          });
+      }
+      
+      // Process data for custom view
+      function processViewData(data, view) {
+        const items = data.items || [];
+        
+        // Filter items based on view configuration
+        let filteredItems = items;
+        if (view.filters && view.filters.length > 0) {
+          filteredItems = items.filter(item => {
+            return view.filters.every(filter => {
+              const value = getNestedValue(item, filter.path);
+              if (filter.operator === 'equals') {
+                return value === filter.value;
+              } else if (filter.operator === 'contains') {
+                return value && value.includes(filter.value);
+              } else if (filter.operator === 'exists') {
+                return value !== undefined && value !== null;
+              }
+              return true;
+            });
+          });
+        }
+        
+        // Transform items based on view configuration
+        return filteredItems.map(item => {
+          const result = {};
+          view.columns.forEach(column => {
+            result[column.key] = getNestedValue(item, column.path);
+          });
+          return result;
+        });
+      }
+      
+      // Helper to get nested object values
+      function getNestedValue(obj, path) {
+        const parts = path.split('.');
+        let value = obj;
+        
+        for (const part of parts) {
+          if (value === null || value === undefined) {
+            return undefined;
+          }
+          value = value[part];
+        }
+        
+        return value;
+      }
+      
+      // Load a resource
+      function loadResource(resourceType, namespace = '') {
+        currentResource = resourceType;
+        currentNamespace = namespace;
+        
+        // Determine the endpoint
+        let endpoint = '';
+        if (resourceType === 'namespaces') {
+          endpoint = '/api/v1/namespaces';
+          namespaceSelector.classList.add('d-none');
+        } else {
+          endpoint = namespace 
+            ? `/api/v1/namespaces/${namespace}/${resourceType}`
+            : `/api/v1/${resourceType}`;
+          namespaceSelector.classList.remove('d-none');
+        }
+        
+        // Fetch namespaces for selector if needed
+        if (resourceType !== 'namespaces' && namespaceSelector.children.length <= 1) {
+          fetchResourceData('namespaces')
+            .then(data => {
+              populateNamespaceSelector(data.items);
+            })
+            .catch(error => {
+              console.error(`Error loading namespaces: ${error}`);
+            });
+        }
+        
+        // Set up table headers based on resource type
+        setupTableHeaders(resourceType);
+        
+        // Fetch and display the resource data
+        fetchResourceData(resourceType, namespace)
+          .then(data => {
+            renderResourceData(data, resourceType);
+          })
+          .catch(error => {
+            console.error(`Error loading ${resourceType}: ${error}`);
+            resourceTableBody.innerHTML = `<tr><td colspan="4">Error loading data: ${error.message}</td></tr>`;
+          });
+      }
+      
+      // Fetch resource data from the API
+      async function fetchResourceData(resourceType, namespace = '') {
+        let endpoint = '';
+        
+        if (resourceType === 'namespaces') {
+          endpoint = '/api/v1/namespaces';
+        } else if (namespace) {
+          endpoint = `/api/v1/namespaces/${namespace}/${resourceType}`;
+        } else {
+          endpoint = `/api/v1/${resourceType}`;
+        }
+        
+        const response = await fetch('/api/proxy', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${currentToken}`
+          },
+          body: JSON.stringify({ endpoint })
+        });
+        
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.message || `Failed to fetch ${resourceType}`);
+        }
+        
+        return response.json();
+      }
+      
+      // Set up table headers
+      function setupTableHeaders(resourceType) {
+        let headers = [];
+        
+        switch (resourceType) {
+          case 'namespaces':
+            headers = ['Name', 'Status', 'Age', 'Labels'];
+            break;
+          case 'pods':
+            headers = ['Name', 'Namespace', 'Status', 'Age'];
+            break;
+          default:
+            headers = ['Name', 'Namespace', 'Age', 'Labels'];
+        }
+        
+        const headerRow = document.createElement('tr');
+        headers.forEach(header => {
+          const th = document.createElement('th');
+          th.textContent = header;
+          headerRow.appendChild(th);
+        });
+        
+        resourceTableHeader.innerHTML = '';
+        resourceTableHeader.appendChild(headerRow);
+      }
+      
+      // Render resource data in the table
+      function renderResourceData(data, resourceType) {
+        const items = data.items || [];
+        currentData = items;
+        
+        // Apply search filter
+        const searchText = searchFilter.value.toLowerCase();
+        const filteredItems = searchText 
+          ? items.filter(item => JSON.stringify(item).toLowerCase().includes(searchText))
+          : items;
+        
+        if (filteredItems.length === 0) {
+          resourceTableBody.innerHTML = `<tr><td colspan="4">No ${resourceType} found</td></tr>`;
+          return;
+        }
+        
+        resourceTableBody.innerHTML = '';
+        
+        filteredItems.forEach(item => {
+          const row = document.createElement('tr');
+          
+          if (resourceType === 'namespaces') {
+            // Name
+            const nameCell = document.createElement('td');
+            nameCell.textContent = item.metadata.name;
+            row.appendChild(nameCell);
+            
+            // Status
+            const statusCell = document.createElement('td');
+            statusCell.textContent = item.status?.phase || 'Unknown';
+            row.appendChild(statusCell);
+            
+            // Age
+            const ageCell = document.createElement('td');
+            ageCell.textContent = calculateAge(item.metadata.creationTimestamp);
+            row.appendChild(ageCell);
+            
+            // Labels
+            const labelsCell = document.createElement('td');
+            labelsCell.textContent = formatLabels(item.metadata.labels);
+            row.appendChild(labelsCell);
+          } else if (resourceType === 'pods') {
+            // Name
+            const nameCell = document.createElement('td');
+            nameCell.textContent = item.metadata.name;
+            row.appendChild(nameCell);
+            
+            // Namespace
+            const namespaceCell = document.createElement('td');
+            namespaceCell.textContent = item.metadata.namespace;
+            row.appendChild(namespaceCell);
+            
+            // Status
+            const statusCell = document.createElement('td');
+            statusCell.textContent = item.status?.phase || 'Unknown';
+            row.appendChild(statusCell);
+            
+            // Age
+            const ageCell = document.createElement('td');
+            ageCell.textContent = calculateAge(item.metadata.creationTimestamp);
+            row.appendChild(ageCell);
+          }
+          
+          resourceTableBody.appendChild(row);
+        });
+      }
+      
+      // Render table data for custom views
+      function renderTableData(data, columns) {
+        if (data.length === 0) {
+          resourceTableBody.innerHTML = `<tr><td colspan="${columns.length}">No data found</td></tr>`;
+          return;
+        }
+        
+        resourceTableBody.innerHTML = '';
+        
+        data.forEach(item => {
+          const row = document.createElement('tr');
+          
+          columns.forEach(column => {
+            const cell = document.createElement('td');
+            if (column.type === 'labels' && typeof item[column.key] === 'object') {
+              cell.textContent = formatLabels(item[column.key]);
+            } else {
+              cell.textContent = item[column.key] || '';
+            }
+            row.appendChild(cell);
+          });
+          
+          resourceTableBody.appendChild(row);
+        });
+      }
+      
+      // Format labels as a string
+      function formatLabels(labels) {
+        if (!labels) return '';
+        return Object.entries(labels)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(', ');
+      }
+      
+      // Calculate age from timestamp
+      function calculateAge(timestamp) {
+        if (!timestamp) return '';
+        
+        const created = new Date(timestamp);
+        const now = new Date();
+        const diffMs = now - created;
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        
+        if (diffDays > 0) {
+          return `${diffDays}d`;
+        }
+        
+        const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+        if (diffHours > 0) {
+          return `${diffHours}h`;
+        }
+        
+        const diffMinutes = Math.floor(diffMs / (1000 * 60));
+        return `${diffMinutes}m`;
+      }
+      
+      // Populate namespace selector
+      function populateNamespaceSelector(namespaces) {
+        namespaceSelector.innerHTML = '<option value="">All Namespaces</option>';
+        
+        namespaces.forEach(namespace => {
+          const option = document.createElement('option');
+          option.value = namespace.metadata.name;
+          option.textContent = namespace.metadata.name;
+          namespaceSelector.appendChild(option);
+        });
+        
+        namespaceSelector.addEventListener('change', function() {
+          loadResource(currentResource, this.value);
+        });
+      }
+      
+      // Resource navigation click handlers
+      document.querySelectorAll('[data-resource]').forEach(link => {
+        link.addEventListener('click', function(e) {
+          e.preventDefault();
+          const resourceType = this.dataset.resource;
+          loadResource(resourceType);
+        });
+      });
+      
+      // Search filter handler
+      searchFilter.addEventListener('input', function() {
+        if (currentResource === 'custom') {
+          // Reapply the custom view
+          const viewLink = document.querySelector(`[data-view-id]`);
+          if (viewLink) {
+            viewLink.click();
+          }
+        } else {
+          // Rerender the standard resource
+          renderResourceData({ items: currentData }, currentResource);
+        }
+      });
+    });
