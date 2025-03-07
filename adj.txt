@@ -99,3 +99,10 @@ with pd.ExcelWriter(OUTPUT_EXCEL) as writer:
 df_output.to_html(OUTPUT_HTML, index=False)
 
 print(f"✅ Analysis complete! Data saved to {OUTPUT_EXCEL} and {OUTPUT_HTML}")
+
+
+
+
+TOKEN=$(kubectl get secret -n openshift-manifest-viewer $(kubectl get sa manifest-viewer-sa -n openshift-manifest-viewer -o jsonpath='{.secrets[0].name}') -o jsonpath='{.data.token}' | base64 -d)
+
+curl -s --header "Authorization: Bearer $TOKEN" --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt "https://kubernetes.default.svc/api/v1/namespaces"
