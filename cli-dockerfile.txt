@@ -1,0 +1,17 @@
+✅ Step 2: Create a Custom Container with az + oc
+
+Since the Azure CLI container does not include oc, we will build a custom image with both tools.
+
+1️⃣ Create a Dockerfile
+Save this as Dockerfile:
+
+FROM mcr.microsoft.com/azure-cli:latest
+
+# Install OpenShift CLI (oc)
+RUN curl -L https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz | tar -xz \
+    && mv oc /usr/local/bin/ && chmod +x /usr/local/bin/oc
+
+ENTRYPOINT [ "/bin/bash" ]
+2️⃣ Build & Push the Image
+docker build -t myregistry.azurecr.io/azure-cli-oc:latest .
+docker push myregistry.azurecr.io/azure-cli-oc:latest
