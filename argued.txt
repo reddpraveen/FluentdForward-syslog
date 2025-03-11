@@ -1,0 +1,155 @@
+4. Define Example Manifests for Lifecycle Policy
+
+We will use Crossplane to define Azure Storage Account and lifecycle policy.
+
+Create an Azure Provider in ArgoCD
+Install Crossplane:
+kubectl apply -f https://raw.githubusercontent.com/crossplane/crossplane/master/docs/install-crossplane.yaml
+Install the Azure Provider:
+kubectl apply -f - <<EOF
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: crossplane-provider-azure
+spec:
+  package: xpkg.upbound.io/upbound/provider-azure
+EOF
+Storage Account Container (logs-container.yaml)
+Define a container inside an existing Azure Storage Account:
+
+apiVersion: storage.azure.upbound.io/v1beta1
+kind: Container
+metadata:
+  name: logs-container
+  namespace: openshift-gitops
+spec:
+  forProvider:
+    storageAccountName: <STORAGE_ACCOUNT_NAME>
+    resourceGroupName: <RESOURCE_GROUP>
+    containerAccessType: private
+  providerConfigRef:
+    name: azure-config
+Lifecycle Policy (lifecycle-policy.yaml)
+Define a 90-day auto-delete policy for blobs inside the logs container:
+
+apiVersion: storage.azure.upbound.io/v1beta1
+kind: ManagementPolicy
+metadata:
+  name: logs-lifecycle-policy
+  namespace: openshift-gitops
+spec:
+  forProvider:
+    storageAccountName: <STORAGE_ACCOUNT_NAME>
+    resourceGroupName: <RESOURCE_GROUP>
+    rules:
+      - name: DeleteBlobsAfter90Days
+        enabled: true
+        type: Lifecycle
+        definition:
+          actions:
+            delete:
+              daysAfterModificationGreaterThan: 90
+          filters:
+            blobTypes:
+              - blockBlob
+  providerConfigRef:
+    name: azure-config
+Kustomization.yaml
+Combine all configurations:
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - resource-group1/logs-container.yaml
+  - resource-group1/lifecycle-policy.yaml
+  - resource-group2/logs-container.yaml
+  - resource-group2/lifecycle-policy.yaml
+5. Configure ArgoCD to Apply the Policies
+
+Define an ArgoCD Application to sync the GitOps repository.
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: azure-storage-gitops
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<your-org>/azure-gitops.git
+    targetRevision: main
+    path: storage
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-gitops
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+Apply the Application to ArgoCD
+oc apply -f storage-app.yaml
+This will trigger ArgoCD to deploy Azure storage configurations.
+
+
+
+
+
+
+
+1. Define the Lifecycle Management Policy
+Create a manifest to only apply the lifecycle policy to the existing container:
+
+apiVersion: storage.azure.upbound.io/v1beta1
+kind: ManagementPolicy
+metadata:
+  name: log-storage-lifecycle-policy
+  namespace: openshift-gitops
+spec:
+  forProvider:
+    storageAccountName: <STORAGE_ACCOUNT_NAME>  # Existing storage account
+    resourceGroupName: <RESOURCE_GROUP>        # Existing resource group
+    rules:
+      - name: DeleteBlobsAfter90Days
+        enabled: true
+        type: Lifecycle
+        definition:
+          actions:
+            delete:
+              daysAfterModificationGreaterThan: 90
+          filters:
+            blobTypes:
+              - blockBlob
+            prefixMatch:
+              - log-storage  # Apply to the existing 'log-storage' container
+  providerConfigRef:
+    name: azure-config  # Ensure this references the correct Azure credentials
+2. Deploy the Lifecycle Policy Using ArgoCD
+Add the lifecycle policy YAML file (log-storage-lifecycle-policy.yaml) to your GitOps repo under the appropriate directory:
+azure-gitops/
+├── storage/
+│   ├── resource-group1/
+│   │   ├── log-storage-lifecycle-policy.yaml  # Only defining the policy, not the container
+│   ├── kustomization.yaml
+Modify the kustomization.yaml to include the new policy:
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - resource-group1/log-storage-lifecycle-policy.yaml
+Push the changes to your Git repo and let ArgoCD sync.
+Manually trigger sync (optional):
+argocd app sync azure-storage-gitops
+3. Verify the Lifecycle Policy is Applied
+
+Once the policy is deployed, confirm it in Azure:
+
+Using Azure CLI
+az storage account management-policy show \
+    --account-name <STORAGE_ACCOUNT_NAME> \
+    --resource-group <RESOURCE_GROUP>
+Using Azure Portal
+Navigate to Storage Accounts in Azure.
+Select the Storage Account where log-storage exists.
+Go to Data management → Lifecycle Management.
+You should see the DeleteBlobsAfter90Days policy applied.
