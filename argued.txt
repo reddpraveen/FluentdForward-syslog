@@ -1,3 +1,6 @@
+
+
+
 4. Define Example Manifests for Lifecycle Policy
 
 We will use Crossplane to define Azure Storage Account and lifecycle policy.
