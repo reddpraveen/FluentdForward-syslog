@@ -371,3 +371,347 @@ EOF
 oc apply -f create-logs-container-job.yaml
 
 echo "Setup complete. Verify the resources in OpenShift and Azure."
+
+
+
+
+
+
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: azure-lifecycle-policy
+  namespace: openshift-gitops
+spec:
+  schedule: "0 0 * * *"  # Runs every day at midnight
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: azure-lifecycle-sa
+          containers:
+          - name: azure-cli
+            image: mcr.microsoft.com/azure-cli
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -e  # Exit on failure
+
+              echo "Fetching list of clusters..."
+              CLUSTERS=$(oc get secrets -n openshift-gitops -l cluster-credential=true -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n')
+
+              for CLUSTER_SECRET in $CLUSTERS; do
+                CLUSTER_NAME=$(echo "$CLUSTER_SECRET" | sed 's/^cluster-//')
+
+                echo "Processing cluster: $CLUSTER_NAME"
+
+                # Fetch OpenShift login credentials
+                API_URL=$(oc get secret $CLUSTER_SECRET -n openshift-gitops -o jsonpath='{.data.api-url}' | base64 -d)
+                TOKEN=$(oc get secret $CLUSTER_SECRET -n openshift-gitops -o jsonpath='{.data.token}' | base64 -d)
+
+                if [ -z "$API_URL" ] || [ -z "$TOKEN" ]; then
+                  echo "Missing API URL or token for cluster $CLUSTER_NAME, skipping..."
+                  continue
+                fi
+
+                # Login to OpenShift cluster
+                echo "Logging into OpenShift Cluster: $CLUSTER_NAME..."
+                oc login --token="$TOKEN" --server="$API_URL" --insecure-skip-tls-verify=true
+
+                if [ $? -ne 0 ]; then
+                  echo "Failed to log into OpenShift Cluster: $CLUSTER_NAME, skipping..."
+                  continue
+                fi
+
+                # Fetch correct Azure credentials for this cluster
+                AZURE_TENANT_ID=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_tenant_id}' | base64 -d)
+                AZURE_CLIENT_ID=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_client_id}' | base64 -d)
+                AZURE_CLIENT_SECRET=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_client_secret}' | base64 -d)
+
+                if [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ]; then
+                  echo "Missing Azure credentials for cluster $CLUSTER_NAME, skipping..."
+                  continue
+                fi
+
+                # Login to Azure using cluster-specific credentials
+                echo "Logging into Azure for Cluster: $CLUSTER_NAME..."
+                az login --service-principal \
+                  --username "$AZURE_CLIENT_ID" \
+                  --password "$AZURE_CLIENT_SECRET" \
+                  --tenant "$AZURE_TENANT_ID"
+
+                if [ $? -ne 0 ]; then
+                  echo "Azure login failed for Cluster: $CLUSTER_NAME, skipping..."
+                  continue
+                fi
+
+                # Create lifecycle policy JSON
+                cat > policy.json << 'EOFPOLICY'
+                {
+                  "rules": [
+                    {
+                      "name": "delete-old-blobs",
+                      "enabled": true,
+                      "type": "Lifecycle",
+                      "definition": {
+                        "filters": {
+                          "blobTypes": ["blockBlob"],
+                          "prefixMatch": ["logs/"]
+                        },
+                        "actions": {
+                          "baseBlob": {
+                            "delete": {
+                              "daysAfterModificationGreaterThan": 90
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+                EOFPOLICY
+
+                # Discover storage accounts in this cluster
+                echo "Discovering storage accounts for Cluster: $CLUSTER_NAME..."
+                STORAGE_ACCOUNTS=$(az storage account list --query "[?tags.RequiresLifecyclePolicy=='true' || starts_with(name,'prod')].[name,resourceGroup]" -o tsv)
+
+                if [ -z "$STORAGE_ACCOUNTS" ]; then
+                  echo "No storage accounts found in Cluster: $CLUSTER_NAME"
+                  continue
+                fi
+
+                # Apply policies in parallel
+                echo "$STORAGE_ACCOUNTS" | while read -r ACCOUNT_INFO; do
+                  (
+                    ACCOUNT_NAME=$(echo "$ACCOUNT_INFO" | awk '{print $1}')
+                    RESOURCE_GROUP=$(echo "$ACCOUNT_INFO" | awk '{print $2}')
+                    echo "Applying lifecycle policy to $ACCOUNT_NAME in $RESOURCE_GROUP..."
+
+                    az storage account management-policy create \
+                      --account-name "$ACCOUNT_NAME" \
+                      --resource-group "$RESOURCE_GROUP" \
+                      --policy policy.json
+
+                    if [ $? -eq 0 ]; then
+                      echo "Successfully applied policy to $ACCOUNT_NAME"
+                    else
+                      echo "Failed to apply policy to $ACCOUNT_NAME"
+                    fi
+                  ) &
+                done
+
+                wait  # Wait for all background jobs to complete
+              done
+
+              echo "Policy application completed for all clusters."
+          restartPolicy: Never
+
+
+
+
+
+
+====================================================================================
+🚀 Step-by-Step Guide: OpenShift Job for Azure Lifecycle Policy with oc & az
+
+This guide ensures that: ✅ The OpenShift CLI (oc) is installed dynamically inside the Azure CLI container.
+✅ The Job automatically logs into OpenShift & Azure per cluster.
+✅ The Azure Storage lifecycle policy is applied across clusters.
+✅ The Job auto-deletes after execution.
+
+Step 1: Create a ServiceAccount with Required Permissions
+
+The Job needs access to:
+
+Read OpenShift cluster secrets (to retrieve API URLs & tokens).
+Apply Azure storage lifecycle policies.
+Save this as azure-lifecycle-sa.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azure-lifecycle-sa
+  namespace: openshift-gitops
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: azure-lifecycle-role
+  namespace: openshift-gitops
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: azure-lifecycle-rolebinding
+  namespace: openshift-gitops
+subjects:
+  - kind: ServiceAccount
+    name: azure-lifecycle-sa
+    namespace: openshift-gitops
+roleRef:
+  kind: Role
+  name: azure-lifecycle-role
+  apiGroup: rbac.authorization.k8s.io
+Apply the ServiceAccount
+oc apply -f azure-lifecycle-sa.yaml
+Step 2: Deploy the One-Time OpenShift Job
+
+This Job will:
+
+Detect OpenShift clusters dynamically.
+Install oc inside the Azure CLI container (since oc is not pre-installed).
+Extract Azure credentials per cluster.
+Apply lifecycle policies to Azure storage accounts.
+Automatically delete itself after execution.
+Save this as azure-lifecycle-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azure-lifecycle-apply
+  namespace: openshift-gitops
+spec:
+  ttlSecondsAfterFinished: 600  # Deletes the job 10 minutes after completion
+  template:
+    spec:
+      serviceAccountName: azure-lifecycle-sa
+      restartPolicy: Never
+      containers:
+      - name: azure-cli
+        image: mcr.microsoft.com/azure-cli
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e  # Exit on error
+
+          # Install OpenShift CLI dynamically
+          echo "Installing OpenShift CLI..."
+          curl -L https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz | tar -xz
+          mv oc /usr/local/bin/ && chmod +x /usr/local/bin/oc
+
+          # Verify oc CLI installation
+          oc version || { echo "oc CLI installation failed!"; exit 1; }
+
+          echo "Fetching list of clusters..."
+          CLUSTERS=$(oc get secrets -n openshift-gitops -l cluster-credential=true -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n')
+
+          for CLUSTER_SECRET in $CLUSTERS; do
+            CLUSTER_NAME=$(echo "$CLUSTER_SECRET" | sed 's/^cluster-//')
+
+            echo "Processing cluster: $CLUSTER_NAME"
+
+            # Fetch OpenShift login credentials
+            API_URL=$(oc get secret $CLUSTER_SECRET -n openshift-gitops -o jsonpath='{.data.api-url}' | base64 -d)
+            TOKEN=$(oc get secret $CLUSTER_SECRET -n openshift-gitops -o jsonpath='{.data.token}' | base64 -d)
+
+            if [[ -z "$API_URL" || -z "$TOKEN" ]]; then
+              echo "Missing API URL or token for cluster $CLUSTER_NAME, skipping..."
+              continue
+            fi
+
+            # Login to OpenShift cluster
+            echo "Logging into OpenShift Cluster: $CLUSTER_NAME..."
+            oc login --token="$TOKEN" --server="$API_URL" --insecure-skip-tls-verify=true
+
+            if [[ $? -ne 0 ]]; then
+              echo "Failed to log into OpenShift Cluster: $CLUSTER_NAME, skipping..."
+              continue
+            fi
+
+            # Fetch Azure credentials for this cluster
+            AZURE_TENANT_ID=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_tenant_id}' | base64 -d)
+            AZURE_CLIENT_ID=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_client_id}' | base64 -d)
+            AZURE_CLIENT_SECRET=$(oc get secret azure-credentials-$CLUSTER_NAME -n openshift-gitops -o jsonpath='{.data.azure_client_secret}' | base64 -d)
+
+            if [[ -z "$AZURE_TENANT_ID" || -z "$AZURE_CLIENT_ID" || -z "$AZURE_CLIENT_SECRET" ]]; then
+              echo "Missing Azure credentials for cluster $CLUSTER_NAME, skipping..."
+              continue
+            fi
+
+            # Login to Azure
+            echo "Logging into Azure for Cluster: $CLUSTER_NAME..."
+            az login --service-principal \
+              --username "$AZURE_CLIENT_ID" \
+              --password "$AZURE_CLIENT_SECRET" \
+              --tenant "$AZURE_TENANT_ID"
+
+            if [[ $? -ne 0 ]]; then
+              echo "Azure login failed for Cluster: $CLUSTER_NAME, skipping..."
+              continue
+            fi
+
+            # Create lifecycle policy JSON
+            cat > policy.json << 'EOFPOLICY'
+            {
+              "rules": [
+                {
+                  "name": "delete-old-blobs",
+                  "enabled": true,
+                  "type": "Lifecycle",
+                  "definition": {
+                    "filters": {
+                      "blobTypes": ["blockBlob"],
+                      "prefixMatch": ["logs/"]
+                    },
+                    "actions": {
+                      "baseBlob": {
+                        "delete": {
+                          "daysAfterModificationGreaterThan": 90
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+            EOFPOLICY
+
+            # Discover storage accounts in this cluster
+            echo "Discovering storage accounts for Cluster: $CLUSTER_NAME..."
+            STORAGE_ACCOUNTS=$(az storage account list --query "[?tags.RequiresLifecyclePolicy=='true' || starts_with(name,'prod')].[name,resourceGroup]" -o tsv)
+
+            if [[ -z "$STORAGE_ACCOUNTS" ]]; then
+              echo "No storage accounts found in Cluster: $CLUSTER_NAME"
+              continue
+            fi
+
+            # Apply policies in parallel
+            echo "$STORAGE_ACCOUNTS" | while read -r ACCOUNT_INFO; do
+              (
+                ACCOUNT_NAME=$(echo "$ACCOUNT_INFO" | awk '{print $1}')
+                RESOURCE_GROUP=$(echo "$ACCOUNT_INFO" | awk '{print $2}')
+                echo "Applying lifecycle policy to $ACCOUNT_NAME in $RESOURCE_GROUP..."
+
+                az storage account management-policy create \
+                  --account-name "$ACCOUNT_NAME" \
+                  --resource-group "$RESOURCE_GROUP" \
+                  --policy policy.json
+
+                if [[ $? -eq 0 ]]; then
+                  echo "Successfully applied policy to $ACCOUNT_NAME"
+                else
+                  echo "Failed to apply policy to $ACCOUNT_NAME"
+                fi
+              ) &
+            done
+
+            wait  # Wait for all background jobs to complete
+          done
+
+          echo "Policy application completed for all clusters."
+Step 3: Deploy the One-Time Job
+
+Run:
+
+oc apply -f azure-lifecycle-job.yaml
+Step 4: Monitor Execution
+
+Check Job Status
+oc get jobs -n openshift-gitops
+View Logs from the Job
+oc logs -l job-name=azure-lifecycle-apply -n openshift-gitops
+
+
