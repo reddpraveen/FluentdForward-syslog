@@ -153,3 +153,221 @@ Navigate to Storage Accounts in Azure.
 Select the Storage Account where log-storage exists.
 Go to Data management → Lifecycle Management.
 You should see the DeleteBlobsAfter90Days policy applied.
+
+
+
+
+#!/bin/bash
+
+# Azure Storage Account Lifecycle Policy Management with ArgoCD
+
+# Step 1: Create Azure Service Principal
+echo "Creating Azure Service Principal..."
+az login
+
+# Create service principal with Contributor role
+az ad sp create-for-rbac \
+ --name "argocd-azure-mgmt" \
+ --role "Contributor" \
+ --scopes /subscriptions/<subscription-id>
+
+# Step 2: Store credentials in OpenShift secret
+echo "Creating secret in OpenShift..."
+cat << EOF > azure-credentials-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+ name: azure-credentials
+ namespace: openshift-gitops
+type: Opaque
+stringData:
+ AZURE_TENANT_ID: "<tenant-id>"
+ AZURE_CLIENT_ID: "<client-id>"
+ AZURE_CLIENT_SECRET: "<client-secret>"
+ AZURE_SUBSCRIPTION_ID: "<subscription-id>"
+EOF
+
+oc apply -f azure-credentials-secret.yaml
+
+# Step 3: Install Azure Service Operator
+echo "Installing Azure Service Operator..."
+cat << EOF > azure-operator.yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+ name: azure-service-operator
+ namespace: openshift-operators
+spec:
+ channel: alpha
+ installPlanApproval: Automatic
+ name: azure-service-operator
+ source: community-operators
+ sourceNamespace: openshift-marketplace
+EOF
+
+oc apply -f azure-operator.yaml
+
+# Step 4: Configure Azure Service Operator
+echo "Configuring Azure Service Operator..."
+cat << EOF > azure-config.yaml
+apiVersion: azure.microsoft.com/v1alpha1
+kind: AzureConfig
+metadata:
+ name: aso-config
+ namespace: openshift-operators
+spec:
+ location: eastus
+ resourceGroup: aso-resources
+ credentials:
+   secretRef:
+     name: azure-credentials
+     namespace: openshift-gitops
+EOF
+
+oc apply -f azure-config.yaml
+
+# Step 5: Create GitOps repository structure
+echo "Creating GitOps repository structure..."
+mkdir -p azure-gitops-repo/base
+mkdir -p azure-gitops-repo/overlays/resource-group-1
+mkdir -p azure-gitops-repo/overlays/resource-group-2
+mkdir -p azure-gitops-repo/overlays/resource-group-3
+
+# Step 6: Create base lifecycle policy
+cat << EOF > azure-gitops-repo/base/storage-lifecycle-policy.yaml
+apiVersion: azure.microsoft.com/v1alpha1
+kind: StorageAccount
+metadata:
+ name: storage-account-template
+spec:
+ location: eastus
+ resourceGroup: placeholder
+ sku:
+   name: Standard_LRS
+ kind: StorageV2
+ properties:
+   accessTier: Hot
+   supportsHttpsTrafficOnly: true
+   isHnsEnabled: false
+ managementPolicies:
+   rules:
+   - name: delete-old-blobs
+     enabled: true
+     type: Lifecycle
+     definition:
+       filters:
+         blobTypes:
+         - blockBlob
+         prefixMatch:
+         - logs/
+       actions:
+         baseBlob:
+           delete:
+             daysAfterModificationGreaterThan: 90
+EOF
+
+# Step 7: Create base kustomization file
+cat << EOF > azure-gitops-repo/base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- storage-lifecycle-policy.yaml
+EOF
+
+# Step 8: Create overlays for each resource group
+for rg in 1 2 3; do
+ cat << EOF > azure-gitops-repo/overlays/resource-group-$rg/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../../base
+patchesStrategicMerge:
+- storage-account-patch.yaml
+EOF
+
+ cat << EOF > azure-gitops-repo/overlays/resource-group-$rg/storage-account-patch.yaml
+apiVersion: azure.microsoft.com/v1alpha1
+kind: StorageAccount
+metadata:
+ name: storage-account-rg$rg
+spec:
+ resourceGroup: resource-group-$rg
+EOF
+done
+
+# Step 9: Create ArgoCD applications
+echo "Creating ArgoCD applications..."
+for rg in 1 2 3; do
+ cat << EOF > azure-storage-rg$rg-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+ name: azure-storage-rg$rg
+ namespace: openshift-gitops
+spec:
+ project: default
+ source:
+   repoURL: https://github.com/yourusername/azure-gitops-repo.git
+   targetRevision: HEAD
+   path: overlays/resource-group-$rg
+ destination:
+   server: https://kubernetes.default.svc
+   namespace: openshift-gitops
+ syncPolicy:
+   automated:
+     prune: true
+     selfHeal: true
+ ignoreDifferences:
+ - group: azure.microsoft.com
+   kind: StorageAccount
+   jsonPointers:
+   - /status
+EOF
+
+ oc apply -f azure-storage-rg$rg-app.yaml
+done
+
+# Step 10: Create container management job
+echo "Creating container management job..."
+cat << EOF > create-logs-container-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+ name: create-logs-container
+ namespace: openshift-gitops
+spec:
+ template:
+   spec:
+     containers:
+     - name: azure-cli
+       image: mcr.microsoft.com/azure-cli
+       command: ["/bin/bash", "-c"]
+       args:
+       - |
+         for rg in 1 2 3; do
+           az login --service-principal -u \$AZURE_CLIENT_ID -p \$AZURE_CLIENT_SECRET --tenant \$AZURE_TENANT_ID
+           az storage container create --name logs --account-name storage-account-rg\$rg --resource-group resource-group-\$rg
+         done
+       env:
+       - name: AZURE_CLIENT_ID
+         valueFrom:
+           secretKeyRef:
+             name: azure-credentials
+             key: AZURE_CLIENT_ID
+       - name: AZURE_CLIENT_SECRET
+         valueFrom:
+           secretKeyRef:
+             name: azure-credentials
+             key: AZURE_CLIENT_SECRET
+       - name: AZURE_TENANT_ID
+         valueFrom:
+           secretKeyRef:
+             name: azure-credentials
+             key: AZURE_TENANT_ID
+     restartPolicy: Never
+ backoffLimit: 4
+EOF
+
+oc apply -f create-logs-container-job.yaml
+
+echo "Setup complete. Verify the resources in OpenShift and Azure."
