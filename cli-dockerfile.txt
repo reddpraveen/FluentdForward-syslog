@@ -15,3 +15,21 @@ ENTRYPOINT [ "/bin/bash" ]
 2️⃣ Build & Push the Image
 docker build -t myregistry.azurecr.io/azure-cli-oc:latest .
 docker push myregistry.azurecr.io/azure-cli-oc:latest
+
+
+FROM mcr.microsoft.com/azure-cli:latest
+
+# Install required tools
+RUN apt-get update && apt-get install -y curl tar jq unzip
+
+# Install OpenShift CLI (oc)
+RUN curl -L -o oc.tar.gz https://mirror.openshift.com/pub/openshift-v4/clients/oc/latest/linux/oc.tar.gz && \
+    tar -xzf oc.tar.gz && \
+    mv oc /usr/local/bin/ && chmod +x /usr/local/bin/oc && \
+    rm -rf oc.tar.gz
+
+# Verify installation
+RUN oc version && az --version
+
+# Default shell
+ENTRYPOINT [ "/bin/bash" ]
