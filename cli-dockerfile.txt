@@ -33,3 +33,152 @@ RUN oc version && az --version
 
 # Default shell
 ENTRYPOINT [ "/bin/bash" ]
+
+Deployment Steps for One-Time Job Execution via ArgoCD
+We'll use the CaaS-redhat-operators namespace instead of creating a new namespace.
+
+✅ Step 1: Define ServiceAccount & Role-Based Access
+
+Since you provided a ServiceAccount (SA) and Role/RoleBinding, we will use it in the same namespace (CaaS-redhat-operators).
+
+ServiceAccount & RBAC (azure-lifecycle-sa-rbac.yaml)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azure-lifecycle-sa
+  namespace: CaaS-redhat-operators
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: azure-lifecycle-role
+  namespace: CaaS-redhat-operators
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: azure-lifecycle-rolebinding
+  namespace: CaaS-redhat-operators
+subjects:
+  - kind: ServiceAccount
+    name: azure-lifecycle-sa
+    namespace: CaaS-redhat-operators
+roleRef:
+  kind: Role
+  name: azure-lifecycle-role
+  apiGroup: rbac.authorization.k8s.io
+✅ Step 2: Define the Job for One-Time Execution
+
+This applies lifecycle policies in Azure.
+Runs only once and deletes itself (ttlSecondsAfterFinished: 600).
+Uses the argocd.argoproj.io/secret-type=cluster label to match clusters.
+Job YAML (lifecycle-apply-job.yaml)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lifecycle-apply
+  namespace: CaaS-redhat-operators
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+spec:
+  ttlSecondsAfterFinished: 600  # Deletes job after 10 minutes
+  template:
+    spec:
+      serviceAccountName: azure-lifecycle-sa
+      restartPolicy: Never
+      containers:
+        - name: lifecycle-container
+          image: artifactory.xxxx.devops.com/local-docker-OCPLABS-certified-releases/ocp4-azure-oc-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "Logging into OpenShift..."
+              oc login --token=$SA_TOKEN --server=$API_URL --insecure-skip-tls-verify=true
+
+              echo "Logging into Azure..."
+              az login --service-principal --username "$AZURE_CLIENT_ID" --password "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --output json
+
+              echo "Applying lifecycle policy..."
+              POLICY_JSON='{
+                "rules": [{
+                  "enabled": true,
+                  "name": "LokiLifecycle",
+                  "type": "Lifecycle",
+                  "definition": {
+                    "filters": [{"blobTypes": ["blockBlob"], "prefixMatch": ["loki-storage"]}],
+                    "actions": {
+                      "tierToCool": {"daysAfterLastAccessTimeGreaterThan": 15},
+                      "tierToArchive": {"daysAfterModificationGreaterThan": 25},
+                      "delete": {"daysAfterModificationGreaterThan": 30}
+                    }
+                  }
+                }]
+              }'
+
+              echo "$POLICY_JSON" > /tmp/policy.json
+
+              STORAGE_ACCOUNTS=$(az storage account list --query "[?tags.requiresLifecyclePolicy=='true'].{name:name, resourceGroup:resourceGroup}" -o tsv)
+              for ACCOUNT_INFO in $STORAGE_ACCOUNTS; do
+                STORAGE_ACCOUNT=$(echo "$ACCOUNT_INFO" | awk '{print $1}')
+                RESOURCE_GROUP=$(echo "$ACCOUNT_INFO" | awk '{print $2}')
+                az storage account management-policy create --account-name $STORAGE_ACCOUNT --resource-group $RESOURCE_GROUP --policy @/tmp/policy.json
+              done
+✅ Step 3: Define ArgoCD Application
+
+This ensures:
+
+One-time execution (selfHeal: false).
+Prunes itself after execution (prune: true).
+Ignores status changes (so ArgoCD does not keep trying to sync the Job).
+ArgoCD Application (argo-lifecycle-policy.yaml)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: lifecycle-policy
+  namespace: openshift-gitops
+spec:
+  project: caas-redhat-operators
+  destination:
+    namespace: CaaS-redhat-operators
+    server: https://kubernetes.default.svc
+  source:
+    repoURL: "https://your-git-repo.git"
+    targetRevision: main
+    path: lifecycle-policy
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: false  # Runs only once
+    syncOptions:
+      - ApplyOutOfSyncOnly=true  # Runs when out of sync
+  ignoreDifferences:
+    - group: batch
+      kind: Job
+      jsonPointers:
+        - /status
+  info:
+    - name: "Purpose"
+      value: "One-time execution of lifecycle policy"
+✅ Step 4: Deploy the Configuration
+
+Run these commands in OpenShift:
+
+Step 4.1: Apply ServiceAccount & RBAC
+oc apply -f azure-lifecycle-sa-rbac.yaml -n CaaS-redhat-operators
+Step 4.2: Apply ArgoCD Application
+oc apply -f argo-lifecycle-policy.yaml -n openshift-gitops
+Step 4.3: Verify in ArgoCD UI
+Open ArgoCD Web UI (oc get routes -n openshift-gitops).
+Check that lifecycle-policy is Healthy & Synced.
+Step 4.4: Confirm Job Execution
+oc get pods -n CaaS-redhat-operators
+After completion, the Job will automatically delete itself.
+
+
+
