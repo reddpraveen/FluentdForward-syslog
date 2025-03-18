@@ -1,0 +1,146 @@
+Step-by-Step Guide to Create Files and Deploy
+
+Step 1: Create Vector Deployment Configuration
+
+Create a file named vector-deployment.yaml:
+
+bash
+cat <<EOF > vector-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vector
+  namespace: logging
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vector
+  template:
+    metadata:
+      labels:
+        app: vector
+    spec:
+      containers:
+        - name: vector
+          image: timberio/vector:latest
+          ports:
+            - containerPort: 9000
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector/vector.toml
+              subPath: vector.toml
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+EOF
+Step 2: Create Vector Configuration
+
+Create a file named vector-config.yaml:
+
+bash
+cat <<EOF > vector-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: logging
+data:
+  vector.toml: |
+    [sources.kubernetes_logs]
+      type = "kubernetes_logs"
+      exclude_paths_glob_patterns = ["/var/log/pods/*/*/*.log"]
+      include_paths_glob_patterns = ["/var/log/pods/**/*.log"]
+    
+    [sinks.prometheus]
+      type = "prometheus_exporter"
+      address = "0.0.0.0:9000"
+      default_namespace = "vector"
+      inputs = ["kubernetes_logs"]
+EOF
+Step 3: Create Prometheus Configuration
+
+Create a file named prometheus-config.yaml:
+
+bash
+cat <<EOF > prometheus-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+      - job_name: 'vector'
+        static_configs:
+          - targets: ['vector.logging.svc.cluster.local:9000']
+EOF
+Step 4: Deploy Vector and Prometheus
+
+Apply the configurations using the following commands:
+
+bash
+# Create the logging namespace if it doesn't exist
+oc create namespace logging
+
+# Apply the Vector deployment and configuration
+oc apply -f vector-deployment.yaml
+oc apply -f vector-config.yaml
+
+# Create the monitoring namespace if it doesn't exist
+oc create namespace monitoring
+
+# Apply the Prometheus configuration
+oc apply -f prometheus-config.yaml
+Step 5: Create a Script to Analyze Vector Log Rate
+
+Create a file named analyze_vector_log_rate.py:
+
+bash
+cat <<EOF > analyze_vector_log_rate.py
+import requests
+from datetime import datetime, timedelta
+import time
+
+PROMETHEUS_URL = "http://prometheus.monitoring.svc.cluster.local:9090"
+QUERY = 'rate(vector_processed_events_total[1m])'
+
+def get_log_rate():
+    response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": QUERY})
+    result = response.json()["data"]["result"]
+    if result:
+        return float(result[0]["value"][1])
+    return 0.0
+
+def analyze_log_rate(interval_minutes):
+    while True:
+        log_rate = get_log_rate()
+        log_rate_per_second = log_rate
+
+        print(f"Log rate for the last {interval_minutes} minutes: {log_rate_per_second:.2f} events/second")
+
+        time.sleep(interval_minutes * 60)
+
+if __name__ == "__main__":
+    interval_minutes = 1  # Check log rate every 1 minute
+    analyze_log_rate(interval_minutes)
+EOF
+Step 6: Run the Analysis Script
+
+Ensure that the script has access to the Prometheus metrics endpoint. Execute the script to start monitoring the log processing rate:
+
+bash
+python analyze_vector_log_rate.py
+Summary
+
+Create Vector Deployment Configuration: vector-deployment.yaml
+Create Vector Configuration: vector-config.yaml
+Create Prometheus Configuration: prometheus-config.yaml
+Deploy Vector and Prometheus: Apply the configurations using oc apply
+Create Analysis Script: analyze_vector_log_rate.py
+Run the Analysis Script: Execute the script to monitor log processing rate
