@@ -1,0 +1,188 @@
+h1. Upgrade Guide: OpenShift Logging 6 with LokiStack
+
+h2. Summary
+
+After completing the following steps:
+* Red Hat OpenShift Logging Operator and Loki Operator will be running in version 6.
+* Configuration files will be updated to align with RHOL 6.
+
+h2. Prerequisites
+
+* Red Hat OpenShift Logging Operator v5.9 is installed.
+* Loki Operator v5.9 (provided by Red Hat) is installed.
+* Vector must be defined as the Log Collector.  
+  If not, refer to: [How to migrate Fluentd to Vector in OpenShift Logging 5.5+|https://access.redhat.com/articles/6964433]
+* Loki must be defined as the Log Storage.  
+  If not, refer to: [Migrating from Elasticsearch to Loki|https://access.redhat.com/articles/6991791]
+
+h2. Current Stack
+
+The current assumed stack is a fully managed OpenShift Logging stack using Vector and Loki, including collection, forwarding, and storage.
+
+_This may vary depending on resources, nodes, tolerations, nodeSelectors, collector type, or backend storage._  
+Refer to: [Configure tolerations, nodeSelector & resources|https://docs.openshift.com/container-platform/4.16/observability/logging/logging-6.0/log6x-configuring-collector.html]
+
+h3. ClusterLogging Custom Resource
+
+{code:yaml}
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogging
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  collection:
+    type: vector
+  logStore:
+    lokistack:
+      name: <Name_of_LokiStack>
+    type: lokistack
+  managementState: Managed
+{code}
+
+h3. LokiStack Custom Resource
+
+{code:yaml}
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: <Name_of_LokiStack>
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  size: 1x.extra-small
+  storage:
+    schemas:
+    - effectiveDate: "2024-06-01"
+      version: v13
+    secret:
+      name: logging-loki-s3
+      type: s3
+  storageClassName: gp3-csi
+  tenants:
+    mode: openshift-logging
+{code}
+
+h2. Upgrade Steps
+
+h3. Step 1: Install Cluster Observability Operator
+
+Follow the official documentation:  
+[Installing the Cluster Observability Operator|https://docs.openshift.com/container-platform/latest/observability/logging/logging-6.0/log6x-installing-observability.html]
+
+h3. Step 2: Create and Manage the Service Account
+
+Create the Service Account:
+{code:bash}
+oc -n openshift-logging create serviceaccount collector
+{code}
+
+Bind the Cluster Role to the Service Account:
+{code:bash}
+oc -n openshift-logging adm policy add-cluster-role-to-user logging-collector-logs-writer -z collector
+{code}
+
+Add additional roles:
+{code:bash}
+oc -n openshift-logging adm policy add-cluster-role-to-user collect-application-logs -z collector
+oc -n openshift-logging adm policy add-cluster-role-to-user collect-audit-logs -z collector
+oc -n openshift-logging adm policy add-cluster-role-to-user collect-infrastructure-logs -z collector
+{code}
+
+h3. Step 3: Deploy the UIPlugin
+
+{code:yaml}
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: logging
+spec:
+  type: Logging
+  logging:
+    lokiStack:
+      name: <Name_of_LokiStack>
+{code}
+
+Apply it:
+{code:bash}
+oc create -f <above_file>.yaml
+{code}
+
+Alternatively:
+{code:bash}
+cat << EOF | oc create -f -
+<insert YAML from above>
+EOF
+{code}
+
+h3. Step 4: Update the Red Hat Logging Operator from 5.9 to 6
+
+Follow the guide:  
+[Updating the Red Hat OpenShift Logging Operator|https://docs.openshift.com/container-platform/4.16/observability/logging/logging-6.0/log6x-upgrading-to-6.html]
+
+Change Subscription Update Channel to:
+{code}
+stable-6.0
+{code}
+
+h3. Step 5: Update the Loki Operator from 5.9 to 6
+
+Follow the guide:  
+[Updating the Loki Operator|https://docs.openshift.com/container-platform/4.16/observability/logging/logging-6.0/log6x-upgrading-to-6.html]
+
+Change Subscription Update Channel to:
+{code}
+stable-6.0
+{code}
+
+h3. Step 6: Delete ClusterLogging and Deploy ClusterLogForwarder
+
+Delete the ClusterLogging instance:
+{code:bash}
+oc delete clusterlogging <CR name> -n <namespace>
+{code}
+
+Check no collector pods are running:
+{code:bash}
+oc get pods -l component=collector -n <namespace>
+{code}
+
+Deploy ClusterLogForwarder:
+{code:yaml}
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: collector
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: collector
+  outputs:
+  - name: default-lokistack
+    type: lokiStack
+    lokiStack:
+      target:
+        name: <Name_of_LokiStack>
+        namespace: openshift-logging
+      authentication:
+        token:
+          from: serviceAccount
+    tls:
+      ca:
+        key: service-ca.crt
+        configMapName: openshift-service-ca.crt
+  pipelines:
+  - name: default-logstore
+    inputRefs:
+    - application
+    - infrastructure
+    outputRefs:
+    - default-lokistack
+{code}
+
+Apply it:
+{code:bash}
+cat << EOF | oc create -f -
+<insert YAML from above>
+EOF
+{code}
