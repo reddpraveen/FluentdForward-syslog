@@ -100,3 +100,56 @@ def copy_all_objects():
                 print(f"Failed to copy {key}: {e}")
 
 copy_all_objects()
+
+
+#!/bin/bash
+
+set -euo pipefail
+
+# ==== CONFIGURE THESE VARIABLES ====
+SOURCE_SECRET="logging-loki-odf"
+TARGET_SECRET="logging-loki-rgw"
+SOURCE_BUCKET="loki-noobaa-bucket"
+TARGET_BUCKET="loki-rgw-bucket"
+MC_BIN="/usr/local/bin/mc"  # Path to mc binary
+
+# ==== Step 1: Extract credentials from OpenShift ====
+echo "Extracting source credentials..."
+SOURCE_ACCESS_KEY=$(oc get secret $SOURCE_SECRET -n openshift-logging -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+SOURCE_SECRET_KEY=$(oc get secret $SOURCE_SECRET -n openshift-logging -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+
+echo "Extracting target credentials..."
+TARGET_ACCESS_KEY=$(oc get secret $TARGET_SECRET -n openshift-logging -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+TARGET_SECRET_KEY=$(oc get secret $TARGET_SECRET -n openshift-logging -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+
+# ==== Step 2: Get S3 routes ====
+echo "Getting NooBaa and RGW routes..."
+NOOBAA_HOST=$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
+RGW_HOST=$(oc get route rgw -n openshift-storage -o jsonpath='{.spec.host}')
+
+NOOBAA_ENDPOINT="https://${NOOBAA_HOST}"
+RGW_ENDPOINT="https://${RGW_HOST}"
+
+# ==== Step 3: Install mc if not present ====
+if ! command -v $MC_BIN &> /dev/null; then
+  echo "Installing mc (MinIO Client)..."
+  curl -s https://dl.min.io/client/mc/release/linux-amd64/mc -o mc
+  chmod +x mc
+  sudo mv mc $MC_BIN
+fi
+
+# ==== Step 4: Set aliases in mc ====
+echo "Setting mc aliases..."
+mc alias set noobaa "$NOOBAA_ENDPOINT" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" --insecure
+mc alias set rgw "$RGW_ENDPOINT" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" --insecure
+
+# ==== Step 5: (Optional) Clear target bucket ====
+echo "WARNING: Clearing all contents from target bucket $TARGET_BUCKET"
+mc rm --recursive --force rgw/$TARGET_BUCKET
+
+# ==== Step 6: Mirror data ====
+echo "Mirroring data from NooBaa to RGW..."
+mc mirror --overwrite --preserve --insecure noobaa/$SOURCE_BUCKET rgw/$TARGET_BUCKET
+
+echo "Mirror complete. Now update Loki secret and restart pods."
+
