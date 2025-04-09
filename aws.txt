@@ -1,6 +1,10 @@
 import boto3
 from botocore.config import Config
+import warnings
+import urllib3
 
+# Suppress InsecureRequestWarning from urllib3
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 # Configurations
 SOURCE_BUCKET = 'source-bucket-name'
 TARGET_BUCKET = 'target-bucket-name'
@@ -44,7 +48,11 @@ copy_one_object()
 
 import boto3
 from botocore.config import Config
+import warnings
+import urllib3
 
+# Suppress InsecureRequestWarning from urllib3
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 # Configuration
 SOURCE_BUCKET = 'source-bucket-name'
 TARGET_BUCKET = 'target-bucket-name'
