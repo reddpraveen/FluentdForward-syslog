@@ -153,3 +153,136 @@ mc mirror --overwrite --preserve --insecure noobaa/$SOURCE_BUCKET rgw/$TARGET_BU
 
 echo "Mirror complete. Now update Loki secret and restart pods."
 
+-------------
+
+# ----------------------------
+# 1. ConfigMap for mc mirror script
+# ----------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mc-mirror-script
+  namespace: openshift-logging
+data:
+  mirror.sh: |
+    #!/bin/sh
+    set -e
+
+    SOURCE_ACCESS_KEY=$(cat /secrets/source/AWS_ACCESS_KEY_ID)
+    SOURCE_SECRET_KEY=$(cat /secrets/source/AWS_SECRET_ACCESS_KEY)
+    TARGET_ACCESS_KEY=$(cat /secrets/target/AWS_ACCESS_KEY_ID)
+    TARGET_SECRET_KEY=$(cat /secrets/target/AWS_SECRET_ACCESS_KEY)
+
+    echo "Setting mc aliases..."
+    mc alias set noobaa https://s3.openshift-storage.svc:443 "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" --insecure
+    mc alias set rgw https://rgw.openshift-storage.svc:443 "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" --insecure
+
+    echo "Starting mirror..."
+    mc mirror --overwrite --preserve --insecure noobaa/loki-noobaa-bucket rgw/loki-rgw-bucket
+    echo "Mirror complete."
+
+---
+# ----------------------------
+# 2. Job using minio/mc
+# ----------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mc-mirror
+  namespace: openshift-logging
+spec:
+  template:
+    spec:
+      containers:
+      - name: mc
+        image: minio/mc:RELEASE.2024-03-30T16-33-04Z
+        command: ["/bin/sh", "/scripts/mirror.sh"]
+        volumeMounts:
+        - name: script-volume
+          mountPath: /scripts
+        - name: source-secret
+          mountPath: /secrets/source
+        - name: target-secret
+          mountPath: /secrets/target
+      restartPolicy: Never
+      volumes:
+      - name: script-volume
+        configMap:
+          name: mc-mirror-script
+      - name: source-secret
+        secret:
+          secretName: logging-loki-odf
+      - name: target-secret
+        secret:
+          secretName: logging-loki-rgw
+  backoffLimit: 0
+
+---
+# ----------------------------
+# 3. ConfigMap for rclone config
+# ----------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rclone-config
+  namespace: openshift-logging
+data:
+  rclone.conf: |
+    [noobaa]
+    type = s3
+    provider = Minio
+    access_key_id = ${NOOBAA_ACCESS_KEY}
+    secret_access_key = ${NOOBAA_SECRET_KEY}
+    endpoint = https://s3.openshift-storage.svc:443
+    insecure_skip_verify = true
+
+    [rgw]
+    type = s3
+    provider = Ceph
+    access_key_id = ${RGW_ACCESS_KEY}
+    secret_access_key = ${RGW_SECRET_KEY}
+    endpoint = https://rgw.openshift-storage.svc:443
+    insecure_skip_verify = true
+
+---
+# ----------------------------
+# 4. Job using rclone
+# ----------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rclone-mirror
+  namespace: openshift-logging
+spec:
+  template:
+    spec:
+      containers:
+      - name: rclone
+        image: rclone/rclone:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          export NOOBAA_ACCESS_KEY=$(cat /secrets/source/AWS_ACCESS_KEY_ID) && \
+          export NOOBAA_SECRET_KEY=$(cat /secrets/source/AWS_SECRET_ACCESS_KEY) && \
+          export RGW_ACCESS_KEY=$(cat /secrets/target/AWS_ACCESS_KEY_ID) && \
+          export RGW_SECRET_KEY=$(cat /secrets/target/AWS_SECRET_ACCESS_KEY) && \
+          rclone copy noobaa:loki-noobaa-bucket rgw:loki-rgw-bucket --config /etc/rclone/rclone.conf --progress --s3-no-check-bucket
+        volumeMounts:
+        - name: rclone-config
+          mountPath: /etc/rclone
+        - name: source-secret
+          mountPath: /secrets/source
+        - name: target-secret
+          mountPath: /secrets/target
+      restartPolicy: Never
+      volumes:
+      - name: rclone-config
+        configMap:
+          name: rclone-config
+      - name: source-secret
+        secret:
+          secretName: logging-loki-odf
+      - name: target-secret
+        secret:
+          secretName: logging-loki-rgw
+  backoffLimit: 0
