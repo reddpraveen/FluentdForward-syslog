@@ -1,3 +1,9 @@
+
+curl -O https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2023-12-01T00-00-00Z
+mv mc.RELEASE.2023-12-01T00-00-00Z mc
+chmod +x mc
+sudo mv mc /usr/local/bin/
+
 import boto3
 from botocore.config import Config
 import warnings
