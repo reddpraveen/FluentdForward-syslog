@@ -1,3 +1,211 @@
+#!/bin/bash
+
+# 1. Create the bucket replication configuration with existing secrets
+cat <<'EOF' > bucket-replication-large.yaml
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: BucketReplication
+metadata:
+  name: mcg-to-rgw-replication
+  namespace: openshift-storage
+spec:
+  source:
+    bucketName: mcg-source
+    provider:
+      type: mcg
+      mcg:
+        bucketClass: noobaa-default-bucket-class
+        secret:
+          name: logging-loki-odf
+          namespace: openshift-logging
+  destination:
+    bucketName: rgw-destination
+    provider:
+      type: rgw
+      rgw:
+        storageClassName: ocs-storagecluster-ceph-rgw
+        secret:
+          name: logging-loki-rgw
+          namespace: openshift-logging
+  rules:
+    - prefix: ""
+      enabled: true
+      syncDeletes: true
+      priority: high
+  scheduling:
+    replicationTime:
+      time: 15m
+    metrics:
+      syncTime: 15m
+  performance:
+    maxConcurrentRequests: 100
+    maxBandwidthUtilization: "50Mi"
+  resources:
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+EOF
+
+# 2. Create verification script to check secrets and buckets
+cat <<'EOF' > verify-setup.sh
+#!/bin/bash
+
+echo "=== Verifying Configuration Setup ==="
+
+echo -e "\n1. Checking Source Secret (logging-loki-odf)..."
+oc get secret logging-loki-odf -n openshift-logging &> /dev/null
+if [ $? -eq 0 ]; then
+    echo "✓ Source secret exists"
+else
+    echo "✗ Source secret not found"
+fi
+
+echo -e "\n2. Checking Target Secret (logging-loki-rgw)..."
+oc get secret logging-loki-rgw -n openshift-logging &> /dev/null
+if [ $? -eq 0 ]; then
+    echo "✓ Target secret exists"
+else
+    echo "✗ Target secret not found"
+fi
+
+echo -e "\n3. Checking NooBaa System Status..."
+oc get noobaa -n openshift-storage -o jsonpath='{.status.phase}'
+
+echo -e "\n4. Checking RGW Status..."
+oc get cephobjectstore -n openshift-storage
+
+echo "=== Verification Complete ==="
+EOF
+
+# 3. Create monitoring script
+cat <<'EOF' > monitor-replication.sh
+#!/bin/bash
+
+while true; do
+    clear
+    echo "=== Replication Status Check $(date) ==="
+    
+    echo -e "\n1. Replication Health Status:"
+    oc get bucketreplication mcg-to-rgw-replication -n openshift-storage -o jsonpath='{.status.health}'
+    
+    echo -e "\n\n2. Data Transfer Progress:"
+    oc get bucketreplication mcg-to-rgw-replication -n openshift-storage -o jsonpath='{.status.metrics.bytesTransferred}'
+    
+    echo -e "\n\n3. Recent Events:"
+    oc get events -n openshift-storage --field-selector reason=BucketReplication --sort-by='.lastTimestamp' | tail -n 5
+    
+    echo -e "\n\n4. Pod Resource Usage:"
+    oc adm top pod -n openshift-storage | grep -E 'noobaa|rgw'
+    
+    echo -e "\n----------------------------------------"
+    sleep 300  # Update every 5 minutes
+done
+EOF
+
+# 4. Create recovery script
+cat <<'EOF' > replication-recovery.sh
+#!/bin/bash
+
+check_health() {
+    oc get bucketreplication mcg-to-rgw-replication -n openshift-storage -o jsonpath='{.status.health}'
+}
+
+restart_replication() {
+    echo "$(date): Attempting replication restart..."
+    oc patch bucketreplication mcg-to-rgw-replication -n openshift-storage --type=merge \
+        -p '{"spec":{"rules":[{"enabled":false}]}}'
+    sleep 10
+    oc patch bucketreplication mcg-to-rgw-replication -n openshift-storage --type=merge \
+        -p '{"spec":{"rules":[{"enabled":true}]}}'
+    echo "Replication restarted. Monitoring health..."
+}
+
+while true; do
+    health=$(check_health)
+    if [[ "$health" != "Healthy" ]]; then
+        echo "$(date): Unhealthy replication detected"
+        restart_replication
+    fi
+    sleep 600
+done
+EOF
+
+# Make scripts executable
+chmod +x verify-setup.sh monitor-replication.sh replication-recovery.sh
+
+# Create README with instructions
+cat <<'EOF' > README.md
+ODF 4.14 Large Data Replication Guide
+====================================
+
+Prerequisites:
+-------------
+- Existing secrets in openshift-logging namespace:
+  - logging-loki-odf (source)
+  - logging-loki-rgw (target)
+- Existing buckets configured
+
+Setup Steps:
+-----------
+1. Verify configuration:
+   ./verify-setup.sh
+
+2. Start replication:
+   oc apply -f bucket-replication-large.yaml
+
+Monitoring:
+----------
+1. Monitor replication:
+   ./monitor-replication.sh
+
+2. Auto-recovery (optional):
+   ./replication-recovery.sh
+
+Useful Commands:
+--------------
+1. Check replication status:
+   oc get bucketreplication mcg-to-rgw-replication -n openshift-storage
+
+2. View replication metrics:
+   oc get bucketreplication mcg-to-rgw-replication -n openshift-storage -o jsonpath='{.status.metrics}'
+
+3. Check for errors:
+   oc get events -n openshift-storage --field-selector reason=BucketReplication
+
+Control Commands:
+---------------
+1. Pause replication:
+   oc patch bucketreplication mcg-to-rgw-replication -n openshift-storage --type=merge \
+     -p '{"spec":{"rules":[{"enabled":false}]}}'
+
+2. Resume replication:
+   oc patch bucketreplication mcg-to-rgw-replication -n openshift-storage --type=merge \
+     -p '{"spec":{"rules":[{"enabled":true}]}}'
+
+Notes:
+-----
+- Using existing secrets from openshift-logging namespace
+- Expected completion time for 125GB: 2-4 hours under normal conditions
+- Monitor storage capacity regularly
+- Check system resources during replication
+EOF
+
+echo "All configuration files and scripts have been created."
+echo "Please read README.md for detailed instructions."
+
+
+
+
+
+
+
+
+
+
+
+=======================================================================
 # Save this as odf-bucket-replication.sh
 
 #!/bin/bash
