@@ -1,0 +1,167 @@
+# Save this as odf-bucket-replication.sh
+
+#!/bin/bash
+# ODF 4.14 Bucket Replication Setup Guide
+# This script contains commands for setting up bucket replication between MCG and RGW
+
+# Step 1: Verify Environment
+echo "Checking ODF version and status..."
+oc get csv -n openshift-storage | grep ocs-operator
+oc get storagecluster -n openshift-storage
+oc get pods -n openshift-storage | grep -E 'noobaa|rgw'
+
+# Step 2: Create source bucket (MCG)
+cat <<'EOF' > mcg-source-bucket.yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: mcg-source-bucket
+  namespace: openshift-storage
+spec:
+  generateBucketName: mcg-source
+  storageClassName: noobaa.noobaa.io
+  additionalConfig:
+    bucketclass: noobaa-default-bucket-class
+EOF
+
+# Step 3: Create destination bucket (RGW)
+cat <<'EOF' > rgw-destination-bucket.yaml
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: rgw-destination-bucket
+  namespace: openshift-storage
+spec:
+  generateBucketName: rgw-destination
+  storageClassName: ocs-storagecluster-ceph-rgw
+EOF
+
+# Step 4: Create bucket replication policy
+cat <<'EOF' > bucket-replication.yaml
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: BucketReplication
+metadata:
+  name: mcg-to-rgw-replication
+  namespace: openshift-storage
+spec:
+  source:
+    bucketName: mcg-source
+    provider:
+      type: mcg
+      mcg:
+        bucketClass: noobaa-default-bucket-class
+  destination:
+    bucketName: rgw-destination
+    provider:
+      type: rgw
+      rgw:
+        storageClassName: ocs-storagecluster-ceph-rgw
+  rules:
+    - prefix: ""
+      enabled: true
+      syncDeletes: true
+  scheduling:
+    replicationTime:
+      time: 15m
+    metrics:
+      syncTime: 15m
+EOF
+
+# Optional: Create secure bucket class
+cat <<'EOF' > secure-bucket-class.yaml
+apiVersion: noobaa.io/v1alpha1
+kind: BucketClass
+metadata:
+  name: secure-bucket-class
+  namespace: openshift-storage
+spec:
+  placementPolicy:
+    tiers:
+    - placement: "Spread"
+      backingStores:
+      - noobaa-default-backing-store
+  encryption:
+    enable: true
+EOF
+
+# Save these commands as verify-commands.sh
+cat <<'EOF' > verify-commands.sh
+#!/bin/bash
+
+# Apply configurations
+echo "Applying configurations..."
+oc apply -f mcg-source-bucket.yaml
+oc apply -f rgw-destination-bucket.yaml
+oc apply -f bucket-replication.yaml
+
+# Verify setup
+echo "Verifying bucket claims..."
+oc get objectbucketclaim -n openshift-storage
+
+echo "Checking replication status..."
+oc get bucketreplication -n openshift-storage
+
+echo "Getting detailed replication status..."
+oc describe bucketreplication mcg-to-rgw-replication -n openshift-storage
+
+# Get access credentials
+echo "Getting MCG source bucket credentials..."
+echo "AWS_ACCESS_KEY_ID:"
+oc get secret mcg-source-bucket -n openshift-storage -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d
+echo
+echo "AWS_SECRET_ACCESS_KEY:"
+oc get secret mcg-source-bucket -n openshift-storage -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d
+echo
+
+echo "Getting RGW destination bucket credentials..."
+echo "AWS_ACCESS_KEY_ID:"
+oc get secret rgw-destination-bucket -n openshift-storage -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d
+echo
+echo "AWS_SECRET_ACCESS_KEY:"
+oc get secret rgw-destination-bucket -n openshift-storage -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d
+echo
+
+# Get endpoints
+echo "Getting MCG endpoint..."
+oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}'
+echo
+
+echo "Getting RGW endpoint..."
+oc get route s3-rgw -n openshift-storage -o jsonpath='{.spec.host}'
+echo
+EOF
+
+# Save monitoring commands as monitor-replication.sh
+cat <<'EOF' > monitor-replication.sh
+#!/bin/bash
+
+echo "Checking MCG operator logs..."
+oc logs -n openshift-storage deployment/noobaa-operator
+
+echo "Checking RGW logs..."
+oc logs -n openshift-storage deployment/ocs-storagecluster-cephrgw
+
+echo "Getting replication events..."
+oc get events -n openshift-storage --field-selector reason=BucketReplication
+
+echo "Checking NooBaa system status..."
+oc get noobaa -n openshift-storage -o yaml
+
+echo "Checking replication metrics..."
+oc get bucketreplication mcg-to-rgw-replication -o jsonpath='{.status.metrics}' -n openshift-storage
+EOF
+
+# Save cleanup commands as cleanup.sh
+cat <<'EOF' > cleanup.sh
+#!/bin/bash
+
+echo "Deleting replication..."
+oc delete bucketreplication mcg-to-rgw-replication -n openshift-storage
+
+echo "Deleting bucket claims..."
+oc delete objectbucketclaim mcg-source-bucket -n openshift-storage
+oc delete objectbucketclaim rgw-destination-bucket -n openshift-storage
+EOF
+
+# Make scripts executable
+chmod +x verify-commands.sh monitor-replication.sh cleanup.sh
