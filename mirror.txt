@@ -1,4 +1,83 @@
 #!/bin/bash
+# Script to mirror OpenShift Loki object buckets using Rclone
+# Preserves all metadata and structure needed for Loki
+
+# Step 1: Extract Secret Information from OpenShift
+echo "Extracting bucket details from OpenShift secrets..."
+SRC_BUCKET=$(oc get secret logging-loki-odf -n openshift-logging -o jsonpath='{.data.bucket}' | base64 -d)
+SRC_ACCESS_KEY=$(oc get secret logging-loki-odf -n openshift-logging -o jsonpath='{.data.access_key_id}' | base64 -d)
+SRC_SECRET_KEY=$(oc get secret logging-loki-odf -n openshift-logging -o jsonpath='{.data.access_key_secret}' | base64 -d)
+SRC_ENDPOINT=$(oc get secret logging-loki-odf -n openshift-logging -o jsonpath='{.data.endpoint}' | base64 -d)
+
+DST_BUCKET=$(oc get secret logging-loki-rgw -n openshift-logging -o jsonpath='{.data.bucket}' | base64 -d)
+DST_ACCESS_KEY=$(oc get secret logging-loki-rgw -n openshift-logging -o jsonpath='{.data.access_key_id}' | base64 -d)
+DST_SECRET_KEY=$(oc get secret logging-loki-rgw -n openshift-logging -o jsonpath='{.data.access_key_secret}' | base64 -d)
+DST_ENDPOINT=$(oc get secret logging-loki-rgw -n openshift-logging -o jsonpath='{.data.endpoint}' | base64 -d)
+
+# Verify the information was extracted
+echo "Source Bucket: $SRC_BUCKET at $SRC_ENDPOINT"
+echo "Target Bucket: $DST_BUCKET at $DST_ENDPOINT"
+
+# Step 2: Create Rclone Configuration
+echo "Creating temporary Rclone configuration..."
+cat > rclone_loki.conf << EOF
+[source]
+type = s3
+provider = Other
+env_auth = false
+access_key_id = $SRC_ACCESS_KEY
+secret_access_key = $SRC_SECRET_KEY
+endpoint = $SRC_ENDPOINT
+acl = private
+
+[target]
+type = s3
+provider = Other
+env_auth = false
+access_key_id = $DST_ACCESS_KEY
+secret_access_key = $DST_SECRET_KEY
+endpoint = $DST_ENDPOINT
+acl = private
+EOF
+
+# Step 3: Run Rclone with Background Process
+echo "Starting Rclone sync in background with progress monitoring..."
+nohup rclone sync source:$SRC_BUCKET target:$DST_BUCKET \
+  --config=rclone_loki.conf \
+  --transfers=16 \
+  --checkers=32 \
+  --s3-chunk-size=16M \
+  --s3-upload-concurrency=8 \
+  --metadata \
+  --fast-list \
+  --progress \
+  --stats=30s \
+  --stats-file-name-length=0 > rclone_sync.log 2>&1 &
+
+# Save the PID to check status later
+echo $! > rclone_pid.txt
+echo "Sync started with PID $(cat rclone_pid.txt)"
+echo "View progress with: tail -f rclone_sync.log"
+
+# Step 4: Instructions for monitoring
+echo ""
+echo "===================== MONITORING COMMANDS ====================="
+echo "To watch progress in real-time:"
+echo "  tail -f rclone_sync.log"
+echo ""
+echo "To check if process is still running:"
+echo "  ps -p \$(cat rclone_pid.txt)"
+echo ""
+echo "To verify sync completion (run after sync finishes):"
+echo "  SOURCE_COUNT=\$(rclone size source:\$SRC_BUCKET --config=rclone_loki.conf | grep 'Total objects' | awk '{print \$3}')"
+echo "  TARGET_COUNT=\$(rclone size target:\$DST_BUCKET --config=rclone_loki.conf | grep 'Total objects' | awk '{print \$3}')"
+echo "  echo \"Source objects: \$SOURCE_COUNT\""
+echo "  echo \"Target objects: \$TARGET_COUNT\""
+echo "=============================================================="
+
+-----------------------------
+
+#!/bin/bash
 
 # 1. Create the bucket replication configuration with existing secrets
 cat <<'EOF' > bucket-replication-large.yaml
