@@ -1,0 +1,225 @@
+# Define a Kubernetes Job resource for migrating Loki data
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Name of the migration job
+  name: loki-bucket-migration
+  # Namespace where the job will run (must match LokiStack namespace)
+  namespace: openshift-logging
+spec:
+  template:
+    spec:
+      containers:
+      # Container that will perform the migration
+      - name: loki-migrator
+        # Using Red Hat's official Loki image for OpenShift
+        image: registry.redhat.io/openshift-logging/loki-rhel9:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Extract S3 credentials from mounted secrets
+          # Source credentials (from existing Loki bucket)
+          export SOURCE_ACCESS_KEY=$(cat /secrets/source/AWS_ACCESS_KEY_ID)
+          export SOURCE_SECRET_KEY=$(cat /secrets/source/AWS_SECRET_ACCESS_KEY)
+          # Target credentials (from new RGW bucket)
+          export TARGET_ACCESS_KEY=$(cat /secrets/target/AWS_ACCESS_KEY_ID)
+          export TARGET_SECRET_KEY=$(cat /secrets/target/AWS_SECRET_ACCESS_KEY)
+          
+          # Get bucket names from mounted secrets
+          SOURCE_BUCKET=$(cat /secrets/source/bucket)
+          TARGET_BUCKET=$(cat /secrets/target/bucket)
+          
+          # Create Loki configuration for source bucket
+          # This config enables Loki to read from the source S3 bucket
+          cat > /tmp/loki-config.yaml << EOF
+          # Disable authentication for local instance
+          auth_enabled: false
+          
+          # Configure HTTP server
+          server:
+            http_listen_port: 3100
+          
+          # Common configuration for Loki
+          common:
+            # Base path for all Loki files
+            path_prefix: /tmp/loki
+            storage:
+              filesystem:
+                # Directories for chunks and rules
+                chunks_directory: /tmp/loki/chunks
+                rules_directory: /tmp/loki/rules
+            # Single replica for migration
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          
+          # Schema configuration for data storage
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                # Use boltdb-shipper for index storage
+                store: boltdb-shipper
+                object_store: s3
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+          
+          # Storage configuration for source bucket
+          storage_config:
+            boltdb_shipper:
+              # Directories for active index and cache
+              active_index_directory: /tmp/loki/boltdb-shipper-active
+              cache_location: /tmp/loki/boltdb-shipper-cache
+              cache_ttl: 24h
+              shared_store: s3
+            aws:
+              # Configure S3 endpoint for source bucket
+              s3: s3://${SOURCE_ACCESS_KEY}:${SOURCE_SECRET_KEY}@s3.openshift-storage.svc:443/${SOURCE_BUCKET}
+              insecure: true
+              http_config:
+                insecure_skip_verify: true
+          
+          # Compactor configuration for data management
+          compactor:
+            working_directory: /tmp/loki/compactor
+            shared_store: s3
+            compaction_interval: 5m
+            retention_enabled: true
+            retention_delete_delay: 2h
+            retention_delete_worker_count: 150
+            retention_period: 744h
+          
+          # Data retention limits
+          limits_config:
+            retention_period: 744h
+          EOF
+          
+          # Create Loki configuration for target bucket
+          # Similar configuration but pointing to the new RGW bucket
+          cat > /tmp/loki-target-config.yaml << EOF
+          auth_enabled: false
+          
+          server:
+            http_listen_port: 3101  # Different port to avoid conflicts
+          
+          common:
+            path_prefix: /tmp/loki-target
+            storage:
+              filesystem:
+                chunks_directory: /tmp/loki-target/chunks
+                rules_directory: /tmp/loki-target/rules
+            replication_factor: 1
+            ring:
+              kvstore:
+                store: inmemory
+          
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: boltdb-shipper
+                object_store: s3
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+          
+          storage_config:
+            boltdb_shipper:
+              active_index_directory: /tmp/loki-target/boltdb-shipper-active
+              cache_location: /tmp/loki-target/boltdb-shipper-cache
+              cache_ttl: 24h
+              shared_store: s3
+            aws:
+              # Configure S3 endpoint for target RGW bucket
+              s3: s3://${TARGET_ACCESS_KEY}:${TARGET_SECRET_KEY}@rgw.openshift-storage.svc:443/${TARGET_BUCKET}
+              insecure: true
+              http_config:
+                insecure_skip_verify: true
+          
+          compactor:
+            working_directory: /tmp/loki-target/compactor
+            shared_store: s3
+            compaction_interval: 5m
+            retention_enabled: true
+            retention_delete_delay: 2h
+            retention_delete_worker_count: 150
+            retention_period: 744h
+          
+          limits_config:
+            retention_period: 744h
+          EOF
+          
+          # Create necessary directories for source Loki
+          mkdir -p /tmp/loki/chunks /tmp/loki/rules /tmp/loki/boltdb-shipper-active /tmp/loki/boltdb-shipper-cache /tmp/loki/compactor
+          # Start source Loki instance in background
+          loki -config.file=/tmp/loki-config.yaml &
+          SOURCE_PID=$!
+          
+          # Create necessary directories for target Loki
+          mkdir -p /tmp/loki-target/chunks /tmp/loki-target/rules /tmp/loki-target/boltdb-shipper-active /tmp/loki-target/boltdb-shipper-cache /tmp/loki-target/compactor
+          # Start target Loki instance in background
+          loki -config.file=/tmp/loki-target-config.yaml &
+          TARGET_PID=$!
+          
+          # Wait for both Loki instances to initialize
+          sleep 30
+          
+          # Begin data migration process
+          echo "Starting data migration..."
+          
+          # Get list of all tenants from source Loki
+          TENANTS=$(curl -s http://localhost:3100/loki/api/v1/tenants)
+          
+          # Migrate data for each tenant
+          for TENANT in $TENANTS; do
+            echo "Migrating tenant: $TENANT"
+            
+            # Get time range of data for the tenant
+            TIME_RANGE=$(curl -s "http://localhost:3100/loki/api/v1/labels?start=0&end=$(date +%s)000" -H "X-Scope-OrgID: $TENANT")
+            
+            # Stream data from source to target using Loki's query API
+            curl -s "http://localhost:3100/loki/api/v1/query_range" \
+              -H "X-Scope-OrgID: $TENANT" \
+              -G --data-urlencode "query={}" \
+              --data-urlencode "start=0" \
+              --data-urlencode "end=$(date +%s)000" \
+              --data-urlencode "limit=1000000" | \
+            # Process each log entry
+            jq -c '.data.result[].values[]' | \
+            while read -r line; do
+              # Extract timestamp and log content
+              TIMESTAMP=$(echo $line | jq -r '.[0]')
+              LOG=$(echo $line | jq -r '.[1]')
+              
+              # Push each log entry to target Loki
+              curl -s -X POST "http://localhost:3101/loki/api/v1/push" \
+                -H "Content-Type: application/json" \
+                -H "X-Scope-OrgID: $TENANT" \
+                -d "{\"streams\":[{\"stream\":{\"tenant\":\"$TENANT\"},\"values\":[[\"$TIMESTAMP\",\"$LOG\"]]}]}"
+            done
+          done
+          
+          echo "Migration completed"
+          
+          # Cleanup: Stop both Loki instances
+          kill $SOURCE_PID $TARGET_PID
+        # Mount source and target secrets for accessing S3 credentials
+        volumeMounts:
+        - name: source-secret
+          mountPath: /secrets/source
+        - name: target-secret
+          mountPath: /secrets/target
+      # Job should not restart on failure
+      restartPolicy: Never
+      # Define volumes for accessing secrets
+      volumes:
+      - name: source-secret
+        secret:
+          secretName: logging-loki-odf  # Secret containing source bucket credentials
+      - name: target-secret
+        secret:
+          secretName: loki-rgw-bucket  # Secret containing target bucket credentials
+  # Prevent job from retrying on failure
+  backoffLimit: 0 

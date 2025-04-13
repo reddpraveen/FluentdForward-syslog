@@ -1,0 +1,116 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loki-bucket-mirror
+  namespace: openshift-logging
+spec:
+  template:
+    spec:
+      containers:
+      - name: bucket-mirror
+        # Using Red Hat's MinIO client image
+        image: registry.redhat.io/openshift4/ose-minio-client:latest
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # Install MinIO client if not already available
+          if ! command -v mc &> /dev/null; then
+            echo "Installing MinIO client..."
+            curl https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+            chmod +x /usr/local/bin/mc
+          fi
+          
+          # Step 1: Get source bucket credentials (NooBaa MCG)
+          echo "Step 1: Getting source bucket credentials (NooBaa MCG)..."
+          SOURCE_ACCESS_KEY=$(cat /secrets/source/AWS_ACCESS_KEY_ID)
+          SOURCE_SECRET_KEY=$(cat /secrets/source/AWS_SECRET_ACCESS_KEY)
+          SOURCE_BUCKET=$(cat /secrets/source/bucket)
+          
+          # Step 2: Get target bucket credentials (RGW)
+          echo "Step 2: Setting up target bucket credentials (RGW)..."
+          TARGET_ACCESS_KEY=$(cat /secrets/target/AWS_ACCESS_KEY_ID)
+          TARGET_SECRET_KEY=$(cat /secrets/target/AWS_SECRET_ACCESS_KEY)
+          TARGET_BUCKET=$(cat /secrets/target/bucket)
+          
+          # Step 3: Configure MinIO client
+          echo "Step 3: Configuring MinIO client..."
+          # Set up source alias (NooBaa MCG)
+          mc alias set source "https://s3.openshift-storage.svc:443" "$SOURCE_ACCESS_KEY" "$SOURCE_SECRET_KEY" --insecure
+          # Set up target alias (RGW)
+          mc alias set target "https://rgw.openshift-storage.svc:443" "$TARGET_ACCESS_KEY" "$TARGET_SECRET_KEY" --insecure
+          
+          # Step 4: Create target bucket if it doesn't exist
+          echo "Step 4: Creating target bucket if it doesn't exist..."
+          mc mb target/$TARGET_BUCKET || true
+          
+          # Step 5: Mirror objects from source to target
+          echo "Step 5: Mirroring objects from source to target..."
+          echo "This may take a while depending on the amount of data..."
+          
+          # Mirror all objects with metadata
+          mc mirror --preserve source/$SOURCE_BUCKET target/$TARGET_BUCKET
+          
+          # Step 6: Verify the mirroring
+          echo "Step 6: Verifying the mirroring..."
+          SOURCE_COUNT=$(mc ls source/$SOURCE_BUCKET | wc -l)
+          TARGET_COUNT=$(mc ls target/$TARGET_BUCKET | wc -l)
+          
+          echo "Source bucket object count: $SOURCE_COUNT"
+          echo "Target bucket object count: $TARGET_COUNT"
+          
+          if [ "$SOURCE_COUNT" -eq "$TARGET_COUNT" ]; then
+            echo "Mirroring completed successfully. Object counts match."
+          else
+            echo "Warning: Object counts don't match. Some objects may not have been mirrored."
+            echo "Source count: $SOURCE_COUNT, Target count: $TARGET_COUNT"
+            exit 1
+          fi
+          
+          # Step 7: Check for Loki-specific metadata
+          echo "Step 7: Checking for Loki-specific metadata..."
+          echo "Checking for index files..."
+          INDEX_COUNT=$(mc ls source/$SOURCE_BUCKET | grep -c "index_" || true)
+          echo "Found $INDEX_COUNT index files in source bucket"
+          
+          echo "Checking for chunk files..."
+          CHUNK_COUNT=$(mc ls source/$SOURCE_BUCKET | grep -c "chunks/" || true)
+          echo "Found $CHUNK_COUNT chunk files in source bucket"
+          
+          # Step 8: Update LokiStack configuration
+          echo "Step 8: Updating LokiStack configuration..."
+          
+          # Update LokiStack configuration to use the target bucket
+          oc patch lokistack instance -n openshift-logging --type=merge -p "{
+            \"spec\": {
+              \"storage\": {
+                \"secret\": {
+                  \"name\": \"logging-loki-rgw\"
+                }
+              }
+            }
+          }"
+          
+          # Restart Loki pods
+          echo "Restarting Loki pods..."
+          oc rollout restart deployment -l app.kubernetes.io/name=loki -n openshift-logging
+          
+          echo "Mirroring process completed successfully."
+        volumeMounts:
+        - name: source-secret
+          mountPath: /secrets/source
+        - name: target-secret
+          mountPath: /secrets/target
+        - name: kubeconfig
+          mountPath: /root/.kube
+      restartPolicy: Never
+      volumes:
+      - name: source-secret
+        secret:
+          secretName: logging-loki-odf  # NooBaa MCG bucket secret
+      - name: target-secret
+        secret:
+          secretName: logging-loki-rgw  # RGW bucket secret
+      - name: kubeconfig
+        secret:
+          secretName: bucket-mirror-kubeconfig
+  backoffLimit: 0 
