@@ -1,0 +1,17 @@
+# Use the official OpenShift client image as base
+FROM registry.redhat.io/openshift4/ose-cli:latest
+
+# Install curl for downloading MinIO client
+USER root
+RUN microdnf install -y curl && \
+    microdnf clean all
+
+# Download and install MinIO client
+RUN curl https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc && \
+    chmod +x /usr/local/bin/mc
+
+# Switch back to non-root user
+USER 1001
+
+# Set the default command
+ENTRYPOINT ["/usr/local/bin/mc"] 

@@ -8,18 +8,11 @@ spec:
     spec:
       containers:
       - name: bucket-mirror
-        # Using Red Hat's MinIO client image
-        image: registry.redhat.io/openshift4/ose-minio-client:latest
+        # Using our custom MinIO client image
+        image: ${REGISTRY}/minio-client:latest
         command: ["/bin/sh", "-c"]
         args:
         - |
-          # Install MinIO client if not already available
-          if ! command -v mc &> /dev/null; then
-            echo "Installing MinIO client..."
-            curl https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-            chmod +x /usr/local/bin/mc
-          fi
-          
           # Step 1: Get source bucket credentials (NooBaa MCG)
           echo "Step 1: Getting source bucket credentials (NooBaa MCG)..."
           SOURCE_ACCESS_KEY=$(cat /secrets/source/AWS_ACCESS_KEY_ID)
