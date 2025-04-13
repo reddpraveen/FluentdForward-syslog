@@ -10,6 +10,9 @@ spec:
       - name: bucket-mirror
         # Using our custom MinIO client image
         image: ${REGISTRY}/minio-client:latest
+        env:
+        - name: MC_CONFIG_DIR
+          value: "/home/1001/.mc"
         command: ["/bin/sh", "-c"]
         args:
         - |
@@ -95,6 +98,8 @@ spec:
           mountPath: /secrets/target
         - name: kubeconfig
           mountPath: /root/.kube
+        - name: mc-config
+          mountPath: /home/1001/.mc
       restartPolicy: Never
       volumes:
       - name: source-secret
@@ -106,4 +111,6 @@ spec:
       - name: kubeconfig
         secret:
           secretName: bucket-mirror-kubeconfig
+      - name: mc-config
+        emptyDir: {}
   backoffLimit: 0 
