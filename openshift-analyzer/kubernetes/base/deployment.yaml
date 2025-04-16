@@ -17,11 +17,11 @@ spec:
       serviceAccountName: openshift-analyzer
       containers:
       - name: backend
-        image: registry.access.redhat.com/ubi9/python-311:latest
+        image: image-registry.openshift-image-registry.svc:5000/openshift-analyzer-ns/openshift-analyzer-backend:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
-          name: http
+          name: http-backend
         env:
         - name: CONFIG_PATH
           value: /app/config/config.yaml
@@ -78,6 +78,35 @@ spec:
         workingDir: /app
         command: ["python"]
         args: ["main.py"]
+      
+      - name: frontend
+        image: image-registry.openshift-image-registry.svc:5000/openshift-analyzer-ns/openshift-analyzer-frontend:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http-frontend
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+      
       volumes:
       - name: config-volume
         configMap:

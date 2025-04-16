@@ -1,0 +1,72 @@
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: openshift-analyzer-backend
+  labels:
+    app: openshift-analyzer
+    component: backend
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: openshift-analyzer-backend:latest
+  source:
+    git:
+      uri: https://your-git-repository-url/openshift-analyzer.git
+      ref: main
+    contextDir: backend
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: openshift-analyzer-frontend
+  labels:
+    app: openshift-analyzer
+    component: frontend
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: openshift-analyzer-frontend:latest
+  source:
+    git:
+      uri: https://your-git-repository-url/openshift-analyzer.git
+      ref: main
+    contextDir: frontend
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  triggers:
+    - type: ConfigChange
+    - type: ImageChange
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: openshift-analyzer-backend
+  labels:
+    app: openshift-analyzer
+    component: backend
+spec:
+  lookupPolicy:
+    local: true
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: openshift-analyzer-frontend
+  labels:
+    app: openshift-analyzer
+    component: frontend
+spec:
+  lookupPolicy:
+    local: true 

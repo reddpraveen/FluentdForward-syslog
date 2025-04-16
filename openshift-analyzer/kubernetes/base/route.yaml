@@ -7,7 +7,7 @@ metadata:
 spec:
   to:
     kind: Service
-    name: openshift-analyzer
+    name: openshift-analyzer-frontend
   port:
     targetPort: http
   tls:
