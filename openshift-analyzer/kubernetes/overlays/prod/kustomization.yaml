@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- ../../base
+
+namePrefix: prod-
+
+patches:
+- path: patches/deployment.yaml
+  target:
+    kind: Deployment
+    name: openshift-analyzer
+
+secretGenerator:
+- name: openshift-analyzer-auth
+  literals:
+  - oauth-client-id=openshift-analyzer
+  # Other secrets should be provided separately in a secure way 

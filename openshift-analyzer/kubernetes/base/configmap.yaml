@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openshift-analyzer-config
+  labels:
+    app: openshift-analyzer
+data:
+  config.yaml: |
+    app:
+      name: "OpenShift Analyzer"
+      version: "1.0.0"
+      description: "OpenShift-native troubleshooting and resource analysis web application"
+
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+      cors:
+        origins: ["*"]
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        headers: ["Content-Type", "Authorization"]
+
+    auth:
+      enabled: true
+      type: "oauth" # Options: oauth, ldap, none
+      oauth:
+        provider: "openshift"
+        client_id: "${OAUTH_CLIENT_ID}"
+        client_secret: "${OAUTH_CLIENT_SECRET}"
+        redirect_uri: "${OAUTH_REDIRECT_URI}"
+        scopes: ["user:info"]
+      ldap:
+        server: "${LDAP_SERVER}"
+        port: "${LDAP_PORT}"
+        bind_dn: "${LDAP_BIND_DN}"
+        bind_password: "${LDAP_BIND_PASSWORD}"
+        search_base: "${LDAP_SEARCH_BASE}"
+        search_filter: "${LDAP_SEARCH_FILTER}"
+
+    kubernetes:
+      in_cluster: true
+      kubeconfig_path: "/app/config/kubeconfig"
+      timeout: 30
+
+    features:
+      metadata_cleaner:
+        enabled: true
+        strip_fields:
+          - "status"
+          - "metadata.managedFields"
+          - "metadata.creationTimestamp"
+          - "metadata.resourceVersion"
+          - "metadata.selfLink"
+          - "metadata.uid"
+          - "metadata.generation"
+      
+      troubleshooter:
+        enabled: true
+        kb_search:
+          enabled: true
+          source: "redhat"
+          max_results: 5
+      
+      cluster_comparison:
+        enabled: true
+        default_resource_types:
+          - "Deployment"
+          - "Service"
+          - "ConfigMap"
+          - "MachineSet"
+      
+      operator_analysis:
+        enabled: true
+
+    plugins:
+      directory: "/app/plugins"
+      auto_discover: true
+      reload_interval: 60  # seconds 

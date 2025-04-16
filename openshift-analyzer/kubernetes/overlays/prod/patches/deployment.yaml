@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-analyzer
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+      - name: backend
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          initialDelaySeconds: 60
+        readinessProbe:
+          initialDelaySeconds: 30 

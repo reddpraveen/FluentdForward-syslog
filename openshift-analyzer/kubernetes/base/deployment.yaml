@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-analyzer
+  labels:
+    app: openshift-analyzer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-analyzer
+  template:
+    metadata:
+      labels:
+        app: openshift-analyzer
+    spec:
+      serviceAccountName: openshift-analyzer
+      containers:
+      - name: backend
+        image: registry.access.redhat.com/ubi9/python-311:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: CONFIG_PATH
+          value: /app/config/config.yaml
+        - name: KUBERNETES_SERVICE_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: KUBERNETES_SERVICE_PORT
+          value: "443"
+        - name: OAUTH_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: openshift-analyzer-auth
+              key: oauth-client-id
+              optional: true
+        - name: OAUTH_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: openshift-analyzer-auth
+              key: oauth-client-secret
+              optional: true
+        - name: OAUTH_REDIRECT_URI
+          valueFrom:
+            secretKeyRef:
+              name: openshift-analyzer-auth
+              key: oauth-redirect-uri
+              optional: true
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: plugins-volume
+          mountPath: /app/plugins
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+        workingDir: /app
+        command: ["python"]
+        args: ["main.py"]
+      volumes:
+      - name: config-volume
+        configMap:
+          name: openshift-analyzer-config
+      - name: plugins-volume
+        emptyDir: {} 

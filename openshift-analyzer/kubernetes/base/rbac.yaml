@@ -1,0 +1,67 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-analyzer
+  labels:
+    app: openshift-analyzer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openshift-analyzer
+  labels:
+    app: openshift-analyzer
+rules:
+# Core resource access
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets", "namespaces", "events", "persistentvolumeclaims", "persistentvolumes"]
+  verbs: ["get", "list", "watch"]
+# App resources
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+# Batch resources
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
+# OpenShift specific resources
+- apiGroups: ["route.openshift.io"]
+  resources: ["routes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps.openshift.io"]
+  resources: ["deploymentconfigs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["build.openshift.io"]
+  resources: ["builds", "buildconfigs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["image.openshift.io"]
+  resources: ["imagestreams", "imagestreamtags"]
+  verbs: ["get", "list", "watch"]
+# Operator related
+- apiGroups: ["operators.coreos.com"]
+  resources: ["clusterserviceversions", "subscriptions", "operatorgroups", "installplans"]
+  verbs: ["get", "list", "watch"]
+# OpenShift cluster configuration
+- apiGroups: ["config.openshift.io"]
+  resources: ["clusteroperators", "clusterversions", "infrastructures", "networks"]
+  verbs: ["get", "list", "watch"]
+# Machine configuration
+- apiGroups: ["machine.openshift.io"]
+  resources: ["machines", "machinesets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshift-analyzer
+  labels:
+    app: openshift-analyzer
+subjects:
+- kind: ServiceAccount
+  name: openshift-analyzer
+  namespace: openshift-analyzer-ns
+roleRef:
+  kind: ClusterRole
+  name: openshift-analyzer
+  apiGroup: rbac.authorization.k8s.io 

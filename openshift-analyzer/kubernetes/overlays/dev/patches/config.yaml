@@ -1,0 +1,13 @@
+app:
+  name: "OpenShift Analyzer (Dev)"
+
+server:
+  debug: true
+
+auth:
+  enabled: false  # Disable auth for development
+
+features:
+  troubleshooter:
+    kb_search:
+      enabled: false  # Disable external KB search in dev 

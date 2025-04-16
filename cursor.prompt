@@ -1,0 +1,80 @@
+You are my engineering partner to design and build an OpenShift-native troubleshooting and resource analysis web application.
+
+### 🧭 Objective:
+Create a web app that runs **inside an OpenShift 4.14+ cluster**, built on **Red Hat-certified base images**, and helps platform engineers with:
+
+1. Metadata sanitization for resource copying  
+2. Root cause analysis from events/status  
+3. Multi-cluster resource comparison  
+4. Extensibility for future use cases
+5. interface to check all installed operators versions and should be able to compare across different clusters.
+6. UI should be able to fetch data from openshift cluster when a cluster api and token is provided in the UI to login. and also 
+integrate with oauth or ldap
+
+---
+
+### 🎯 Functional Requirements
+
+#### 1. **Resource Metadata Cleaner**
+- Fetch YAML for any resource via API.
+- Automatically strip non-reusable fields like:
+  - `status`, `metadata.managedFields`, `metadata.creationTimestamp`, `resourceVersion`, etc.
+- Allow editing in the browser.
+- Copy or export cleaned YAML for reuse (e.g., as new resource).
+
+#### 2. **Troubleshooting Assistant**
+- Accept resource name and namespace.
+- Pull `oc describe`, `oc get events`, and custom status conditions.
+- Analyze and summarize potential issues.
+- **Suggest root causes and show search links to Red Hat KB articles or solutions**.
+
+#### 3. **Cluster Comparison Tool**
+- Connect to two clusters via kubeconfigs or service accounts.
+- Compare selected resource types (e.g., MachineSets, Deployments).
+- Highlight extra/missing/mismatched values across clusters (e.g., DR vs Prod).
+
+#### 4. **Built for Extensibility**
+- Add new modules or analyzers (e.g., image tag drift checker, PVC snapshot tool) without rebuilding images.
+- Use **ConfigMaps or hot-reloadable plugin framework** (like WASM or embedded Python/Go).
+- Avoid needing Podman builds for each logic change.
+
+---
+
+### 🧰 Technical Requirements
+
+- Runs on **OpenShift 4.14+**
+- Use **Red Hat UBI (Universal Base Image)** for all containers:
+  - `registry.access.redhat.com/ubi9/python-311`
+  - `registry.access.redhat.com/ubi9/nodejs-18`
+  - `registry.access.redhat.com/ubi9/go-toolset`
+- **Frontend:** React + Tailwind CSS or MUI
+- **Backend:** FastAPI (Python) or Go — must run on UBI image
+- Use OpenShift APIs with either in-cluster service account or mounted kubeconfigs
+- Frontend served via Route; backend exposed as internal service
+
+---
+
+### 🧩 UI Design Suggestions
+
+- Main layout = tabs or sidebar:
+  - 📄 Metadata Cleaner
+  - 🛠️ Troubleshooter
+  - 🔍 Cluster Comparer
+  - ⚙️ Future Tools
+
+- Use `monaco-editor` for YAML editing
+- Add collapsible explanation/mind map panel for each tool
+
+---
+
+### 📦 Deliverables from Cursor:
+1. **Folder structure** for extensible app
+2. **React frontend UI scaffold** using UBI-compatible node image
+3. **FastAPI/Go backend** using UBI-based images
+4. **OpenShift YAML manifests** (Deployment, Service, Route, ConfigMaps)
+5. **Config-based plugin structure** for future features
+6. (Optional) use Tekton pipeline to auto-update code in OpenShift without image rebuilds
+
+---
+
+Use best practices for OpenShift-native apps (readiness/liveness probes, RBAC, ConfigMaps, secrets). Code should prioritize **extensibility**, **security**, and **dev speed**.
