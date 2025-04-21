@@ -10,6 +10,9 @@ WORKDIR /app
 ENV NODE_OPTIONS="--max-old-space-size=2048"
 # Use fewer workers to reduce memory pressure
 ENV npm_config_jobs=2
+# Force dependency resolution 
+ENV npm_config_legacy_peer_deps=true
+ENV npm_config_strict_peer_deps=false
 
 # Set proper permissions for the non-root user
 RUN chown -R 1001:0 /app && \
@@ -21,14 +24,14 @@ USER 1001
 # Copy package files for dependency installation
 COPY --chown=1001:0 package*.json ./
 
-# Use npm install instead of npm ci (which requires package-lock.json)
-RUN npm install --no-fund --no-audit
+# Use npm install with flags to handle dependency resolution issues
+RUN npm install --no-fund --no-audit --legacy-peer-deps --force
 
 # Copy the rest of the application
 COPY --chown=1001:0 . .
 
 # Build the application
-RUN npm run build
+RUN npm run build || npm run build -- --legacy-peer-deps
 
 # Production stage using NGINX
 FROM registry.access.redhat.com/ubi8/nginx-118:latest
