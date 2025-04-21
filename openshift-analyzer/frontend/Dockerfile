@@ -7,11 +7,15 @@ RUN mkdir -p /app
 WORKDIR /app
 USER 1001
 
+# Set NODE_OPTIONS to prevent memory-related crashes
+ENV NODE_OPTIONS="--max_old_space_size=2048"
+
 # Copy package files for dependency installation
 COPY --chown=1001:0 package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Use npm install instead of npm ci to avoid segmentation faults
+# Common issue with UBI images and CI mode
+RUN npm install
 
 # Copy the rest of the application
 COPY --chown=1001:0 . .
