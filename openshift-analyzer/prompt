@@ -1,0 +1,61 @@
+
+sude podnan build --memory 6g-t default-route-openshift-image-registry.apps.dev.azcanc.cloud.xxx.com/analyzer-ns/openshift-analyzer-frontend
+STEP 1: FROM registry.access.redhat.com/ubi9/nodejs-18:latest AS build
+STEP 2: USER 0
+-→> Using cache b65eadc923b415a7d4a931901b598b6c91f50e5656df6a1c37238d232336d254
+STEP 3: RUN mkdic -p /app
+--> Using cache b8aaf9fe202697b85d9ad764cc4f4ab0d57c25424e6627fe2be24ae335659dda
+STEP 4:
+RUN echo
+node --max-old-space-size=4096 |"\§@"™ › /usc/bin/node-large 8& chmod +x /ust/bin/node-large
+2c4a03cfb4e9e79cab1e7d150de6663e8f96f6337f4a41c8ddce2afcb99943ab
+STEP 5: WORKDIR
+/app
+4f228b5af7dd58088282fe56f2434e70e8ef1f134469efcfb498fb436311574a
+STEP 6: USER 1001
+b78b25a4d463923ff1699c525d1858c6472d3617958ad7983f7caf883ee8b6f6
+STEP 7: ENV NODE_OPTIONS="--max-old-space-size=4096"
+02e8e85282ab218cf39df6cedb5bb743b067400813c308b98bfc6d7e2d5baeaf
+STEP 8: ENV npm config.jobs=1
+49a43a0785b83a20ce9a43946944be9623bd7013e4b2cb3aca5d504f87de3bbb
+STEP 9: COPY --chowo=1001:0 package*. json ./
+dc29812e506f7f101fbe1eeed96ad7dc6732ee4bde618713d561f34dc3c8f46b
+STEP 10: RUN opm install --no-fund --no-audit --prefer-offline
+--no-optional --legacy-peer-deps || npo install --no-fund --no-audit--prefer-offline --production --no-optional --legacy-peer-deps &&
+install --no-fund --no-audit --prefer-offline
+--only-dev --no-optional --legacy-peer-deps
+/use/bin/node[8]: /sec/node_platform. cc:68: std:: unique_ete<long unsigned int› node::WockecThreadsTaskRunner: :DelaxedTaskScheduler: :Start(): Assertion (0) = (uxthread create(tuget(), stact.thread, this)) * failed.
+1: 0x5638c19a954 node:: Abort() [/usc/bin/node]
+2: 0x5638c19Fac91 node: :Assert(node:: AssertionInfe const&) [/use/bin/node]
+3: 0x5638c1a7acac node:: WorkerIhreadsTaskRunner: : WorkerThreadsTaskRunner(int) [/usc/bin/node]
+4: 0x5638c1a7a17 node: NodePlatfocm: :NodePlatform(int, v8:: IcacingContceller*, v8:: RageAllecator*) [/usc/bin/node]
+5: 0x5638c19b459c node::V8Platform:: Initialize(int) [/usc/bin/node]
+6: 0x5638c19b18ab node: :InitializelncePerProcess(std: vector<std::_ cxx11::basic_stcing<char, std::char traits<char›, std: :allocator<char››, std: :allocator<std::_cxx11:: basic stcing<char,
+std:: chac traits<char›, std: :allocator‹char> › › › const&, node::PcocessFlags::Flags) [/usc/bin/node]
+7: 0x5638c19b1d2e node::Start(int, char**) [/usc/bin/node]
+8: 0x2b7f775ec5d0 [/lib64/libc.so.6]
+9: 0x2b7f775ec680
+libe stact main [/1ib64/libc.50.6]
+10: 0x5638c191dee5 _start [/use/bin/node]
+/us/bin/node[9]: /scs/node platform. Cc:68:std: unique_etr<long unsigned int› node: WockecThreadsTaskRuaner::DelayedlaskScheduler: Start(): Assertion (0) -- (uk thread create(t.get(), stact thread, this)) *
+failed.
+1: 0x559600b7954 node:: Abort() [/usc/bin/node]
+2: 0x559b®e0b7c91 node::Assert(node: :AssectionIafe const&) [/usc/bin/node]
+3: 0x559b0e137cac node: :WockecThceadsTaskRunner: :WorkerIhceadsTaskßunnecint) [/use/bin/node]
+: 4: 0x559b®e13717 node: :NodePlatfoch: NodePlatfocu(int, v8::IcacingContcoller*, v8:: RageAllocator*) [/usc/bin/node]
+5: 0x559b0e07159c node::V8Platform:: Initialize(int) [/usc/bin/node]
+5: 0x559be96e8ab node: InitializelncePerPrecess(std::vector<std::_Cx11:: basic sting<char, std: chactcaitsschar›, std:: allocatorschar››, std: allocator‹std:: _cxx11: basic sting<char,
+std:: chac.tcaits<char>,
+std:: allocator<char> › › › const&, node::PcocessElags: :Flags) [/use/bin/node]
+7: 0x559b0e06ed2e node::Start(int, chan**) [/usc/bin/node]
+8: 0x2ae33060b5d0 [/lib64/libc.so.6]
+9: 0x2ae33060b680
+libe stact maio [/lib64/libc.so.6]
+10: 0x559b0dfdaee5
+start [/usc/bin/node]
+Error: error building at STEP "RUN pm install --no-fund --no-audit--prefer-offline - -no-optional
+--legacy-peer-deps ||
+now install --no-fund --no-audit - -prefer-offline --production --no-optional --legacy-
+peer-deps &&
+apn install --no-fund --no-audit --prefer-offline
+--only-dev --no-optional --legacy-peer-deps": error while running runtime: exit status 134
