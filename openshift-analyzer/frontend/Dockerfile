@@ -6,7 +6,8 @@ WORKDIR /usr/share/nginx/html
 
 # Create a minimal frontend directly
 USER 0
-RUN echo '<!DOCTYPE html>
+RUN cat > index.html << 'EOL'
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -72,7 +73,8 @@ RUN echo '<!DOCTYPE html>
     }
   </script>
 </body>
-</html>' > index.html
+</html>
+EOL
 
 # Configure NGINX
 COPY nginx.conf /etc/nginx/conf.d/default.conf
