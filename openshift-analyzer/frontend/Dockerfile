@@ -4,24 +4,31 @@ FROM registry.access.redhat.com/ubi9/nodejs-18:latest as build
 # Add application user and set working directory
 USER 0
 RUN mkdir -p /app
+# Add more memory for node
+RUN echo "node --max-old-space-size=4096 \"\$@\"" > /usr/bin/node-large && chmod +x /usr/bin/node-large
 WORKDIR /app
 USER 1001
 
-# Set NODE_OPTIONS to prevent memory-related crashes
-ENV NODE_OPTIONS="--max_old_space_size=2048"
+# Increase NODE memory limits significantly and reduce concurrency
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+# Use a single thread for more stability but slower builds
+ENV npm_config_jobs=1
 
 # Copy package files for dependency installation
 COPY --chown=1001:0 package*.json ./
 
-# Use npm install instead of npm ci to avoid segmentation faults
-# Common issue with UBI images and CI mode
-RUN npm install
+# Break down installation to reduce memory pressure - serial mode with no extras
+RUN npm install --no-fund --no-audit --prefer-offline --no-optional --legacy-peer-deps || \
+    # If it fails, retry with a more cautious approach
+    npm install --no-fund --no-audit --prefer-offline --production --no-optional --legacy-peer-deps && \
+    npm install --no-fund --no-audit --prefer-offline --only=dev --no-optional --legacy-peer-deps
 
 # Copy the rest of the application
 COPY --chown=1001:0 . .
 
-# Build the application
-RUN npm run build
+# Build the application - if build fails due to memory, use node-large
+RUN npm run build || \
+    NODE_OPTIONS="--max-old-space-size=4096" /usr/bin/node-large ./node_modules/.bin/react-scripts build
 
 # Production stage using NGINX
 FROM registry.access.redhat.com/ubi9/nginx-120:latest
