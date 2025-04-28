@@ -1,0 +1,70 @@
+This is an interesting situation with your OpenShift 4.14 upgrade. Let me clarify my understanding:
+	1.	You have an OpenShift 4.14 upgrade that’s currently paused at the node update phase
+	2.	Cluster operators have been upgraded to 4.14
+	3.	You want to change your proxy configuration from dev to prod proxy
+	4.	You’re concerned about potential conflicts with the paused upgrade process
+The proxy change is significant since it will likely trigger node restarts. Let’s analyze the potential impact:
+When you change the proxy configuration in OpenShift, it affects the Machine Config Operator (MCO), which manages node configurations. The MCO will create new MachineConfigs and trigger rolling reboots of nodes to apply these changes.
+Since your upgrade is paused at the node update phase, there are two key considerations:
+	1.	Conflict risk: Changing the proxy while an upgrade is paused could potentially create conflicts in the Machine Config Operator’s operations. The MCO might already have pending configurations for the 4.14 upgrade that haven’t been applied to nodes yet.
+	2.	Reboot sequence: If you proceed with the proxy change, you would likely see a single reboot per node that applies both the pending upgrade changes and the proxy changes together, rather than separate reboots for each.
+I recommend the following approaches:
+	•	Option 1 (Safest): Complete the upgrade first, then change the proxy. This avoids any potential conflicts.
+	•	Option 2: Check the current state of your MachineConfigPools to determine if they’re already waiting for configuration changes using oc get mcp. If they show as “Updating” or not “Ready”, it’s better to wait.
+	•	Option 3: If you must change the proxy now, make a backup of your etcd data first as a precaution.
+Would you like more specific information on how to check the current state of your MachineConfigPools or how to safely proceed with the proxy change
+
+
+
+⸻
+
+Here is the clear answer:
+
+1. Will the proxy change cause node reboots?
+
+Yes, changing the proxy (.spec.proxy in Proxy object or install-config) will trigger a MachineConfig change.
+In OpenShift, proxy setting is part of node systemd/env, so MachineConfigDaemon will recognize it as a change, generate a new rendered config, and nodes will reboot to apply new configuration (even if unrelated to upgrade).
+
+Summary: Proxy change = triggers MachineConfig change = causes node reboots.
+
+⸻
+
+2. Will it conflict with the paused upgrade?
+
+Potentially yes, if you are not careful.
+
+Because:
+	•	You have upgrade in progress (but paused at node phase).
+	•	MachineConfigDaemon watches for config changes regardless of upgrade.
+	•	If you change proxy now, both upgrade-required reboot and proxy-change-required reboot might get mixed.
+	•	This can create unexpected state, like MCP “degraded” or nodes rebooting in wrong order (esp. for control plane nodes).
+
+OpenShift upgrade assumes a very strict flow — node gets new OS image, reboots once — adding another config change mid-upgrade is risky.
+
+⸻
+
+3. Would there be two reboots (upgrade + proxy)?
+
+If you proxy change now, it could cause:
+	•	First reboot for applying proxy.
+	•	Second reboot for upgrade when you resume upgrade later.
+
+Or it could get collapsed into one if you time it perfectly — but no guarantee.
+
+Worst case: nodes could reboot twice separately (bad for control plane nodes).
+
+⸻
+
+4. Best Practice (recommendation)
+	•	Avoid config changes during a paused upgrade — especially ones that require MCP reboots like proxy.
+	•	Finish the upgrade first — let all nodes complete the upgrade, reboot, settle. we
+	•	Then make proxy change safely when the cluster is fully healthy and MCP is idle.
+
+In short:
+
+DO NOT change proxy during paused upgrade unless absolutely urgent.
+First resume and complete upgrade, then update proxy.
+
+⸻
+
+5. How to check if the proxy change would cause rendered config change before applying
