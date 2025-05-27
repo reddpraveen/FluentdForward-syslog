@@ -310,3 +310,404 @@ spec:
 3. **Monitoring Dashboard:** Real-time ingestion and health metrics
 4. **Runbook:** Emergency procedures and rollback steps
 5. **Communication Plan:** Stakeholder updates and escalation procedures
+
+
+
+
+=============================
+
+# OpenShift 4.14 Dashboard Namespace Switching Troubleshooting
+
+## Problem Description
+Dashboards only populate when first visiting the monitoring namespace, but fail to load data when switching to other namespaces. This indicates issues with:
+- Namespace context not being properly passed to Prometheus queries
+- RBAC permissions for cross-namespace monitoring
+- Console frontend caching issues
+- Prometheus query template variable substitution
+
+## Step 1: Verify Console and Monitoring Pod Health
+
+### Check Console Pods
+```bash
+# Check console pod status
+oc get pods -n openshift-console
+oc logs -n openshift-console deployment/console -c console --tail=50
+
+# Check for JavaScript errors in console logs
+oc logs -n openshift-console deployment/console -c console | grep -i error
+
+# Check console configuration
+oc get consoles.config.openshift.io cluster -o yaml
+```
+
+### Check Monitoring Stack Health
+```bash
+# Check Prometheus pods
+oc get pods -n openshift-monitoring | grep prometheus
+
+# Check Prometheus operator
+oc get pods -n openshift-monitoring | grep prometheus-operator
+oc logs -n openshift-monitoring deployment/prometheus-operator --tail=50
+
+# Check Thanos querier (handles multi-namespace queries)
+oc get pods -n openshift-monitoring | grep thanos-querier
+oc logs -n openshift-monitoring deployment/thanos-querier --tail=50
+
+# Check cluster monitoring config
+oc get configmap cluster-monitoring-config -n openshift-monitoring -o yaml
+```
+
+## Step 2: Verify RBAC and Permissions
+
+### Check User Monitoring Permissions
+```bash
+# Check if user can view monitoring in target namespaces
+oc auth can-i get pods --as=system:serviceaccount:openshift-console:console -n <target-namespace>
+oc auth can-i get services --as=system:serviceaccount:openshift-console:console -n <target-namespace>
+
+# Check monitoring-specific permissions
+oc auth can-i get servicemonitors --as=system:serviceaccount:openshift-console:console -n <target-namespace>
+
+# Verify console service account permissions
+oc describe clusterrolebinding console
+oc describe rolebinding -n <target-namespace> | grep console
+```
+
+### Fix Console Service Account Permissions
+```yaml
+# If permissions are missing, apply this RBAC fix
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: console-monitoring-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+subjects:
+- kind: ServiceAccount
+  name: console
+  namespace: openshift-console
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: console-namespace-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+- kind: ServiceAccount
+  name: console
+  namespace: openshift-console
+```
+
+## Step 3: Check Prometheus Query Issues
+
+### Test Prometheus Queries Manually
+```bash
+# Port forward to Prometheus
+oc port-forward -n openshift-monitoring svc/prometheus-k8s 9090:9090
+
+# Test namespace-specific queries (in another terminal)
+curl -G 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=up{namespace="<your-namespace>"}'
+
+# Test cross-namespace queries
+curl -G 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=kube_pod_info{namespace="<your-namespace>"}'
+
+# Check if namespace label exists in metrics
+curl -G 'http://localhost:9090/api/v1/label/namespace/values'
+```
+
+### Check ServiceMonitor Configuration
+```bash
+# List ServiceMonitors in target namespace
+oc get servicemonitor -n <target-namespace>
+
+# Check ServiceMonitor configuration
+oc get servicemonitor -n <target-namespace> -o yaml
+
+# Verify service discovery
+oc get endpoints -n <target-namespace>
+```
+
+## Step 4: Console Frontend Debugging
+
+### Clear Console Cache and Restart
+```bash
+# Restart console pods to clear cache
+oc rollout restart deployment/console -n openshift-console
+
+# Check console startup logs
+oc logs -n openshift-console deployment/console -c console -f
+
+# Verify console service
+oc get svc console -n openshift-console
+oc describe svc console -n openshift-console
+```
+
+### Check Console Configuration
+```bash
+# Check console operator status
+oc get consoles.operator.openshift.io cluster -o yaml
+
+# Check console routes
+oc get routes -n openshift-console
+
+# Verify console configmap
+oc get configmap console-config -n openshift-console -o yaml
+```
+
+## Step 5: Browser-Side Debugging
+
+### Browser Console Debug Steps
+```javascript
+// Open browser developer tools (F12)
+// Navigate to Console tab and run these checks:
+
+// 1. Check for JavaScript errors
+console.log("Checking for errors...");
+
+// 2. Check namespace context in local storage
+localStorage.getItem('bridge/last-namespace-name');
+localStorage.getItem('bridge/active-namespace');
+
+// 3. Clear console cache
+localStorage.clear();
+sessionStorage.clear();
+
+// 4. Check network requests
+// Go to Network tab, filter by "api/prometheus" and observe failed requests
+```
+
+### Browser Network Analysis
+1. Open Network tab in browser dev tools
+2. Switch namespaces and observe API calls
+3. Look for failed requests to `/api/prometheus/` endpoints
+4. Check request headers for proper namespace parameters
+
+## Step 6: User Workload Monitoring Configuration
+
+### Enable User Workload Monitoring (if not enabled)
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+    prometheusK8s:
+      retention: 15d
+      volumeClaimTemplate:
+        spec:
+          storageClassName: managed-premium
+          resources:
+            requests:
+              storage: 100Gi
+```
+
+### Configure User Workload Monitoring
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-workload-monitoring-config
+  namespace: openshift-user-workload-monitoring
+data:
+  config.yaml: |
+    prometheus:
+      retention: 7d
+      resources:
+        requests:
+          cpu: 100m
+          memory: 512Mi
+    thanosRuler:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+```
+
+## Step 7: Namespace-Specific Monitoring Setup
+
+### Verify Target Namespace Configuration
+```bash
+# Check if namespace has monitoring labels
+oc get namespace <target-namespace> --show-labels
+
+# Add monitoring labels if missing
+oc label namespace <target-namespace> openshift.io/cluster-monitoring="true"
+
+# Check for PodMonitor and ServiceMonitor resources
+oc get podmonitor,servicemonitor -n <target-namespace>
+```
+
+### Create Test ServiceMonitor
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: test-service-monitor
+  namespace: <target-namespace>
+spec:
+  selector:
+    matchLabels:
+      app: test-app
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 30s
+```
+
+## Step 8: Thanos Querier Issues
+
+### Check Thanos Configuration
+```bash
+# Check Thanos querier logs for namespace-related errors
+oc logs -n openshift-monitoring deployment/thanos-querier -c thanos-query --tail=100
+
+# Check Thanos querier configuration
+oc get secret thanos-querier-web-config -n openshift-monitoring -o yaml
+
+# Test Thanos API directly
+oc port-forward -n openshift-monitoring svc/thanos-querier 9091:9091
+
+# Test namespace query through Thanos
+curl -G 'http://localhost:9091/api/v1/query' \
+  --data-urlencode 'query=up{namespace="<your-namespace>"}'
+```
+
+### Fix Thanos Querier Issues
+```bash
+# Restart Thanos querier
+oc rollout restart deployment/thanos-querier -n openshift-monitoring
+
+# Check Thanos store gateway
+oc get pods -n openshift-monitoring | grep thanos-store
+oc logs -n openshift-monitoring deployment/thanos-store-shard-0 --tail=50
+```
+
+## Step 9: Prometheus Operator Issues
+
+### Check Prometheus Operator
+```bash
+# Check operator logs
+oc logs -n openshift-monitoring deployment/prometheus-operator --tail=100
+
+# Check Prometheus custom resources
+oc get prometheus -n openshift-monitoring
+oc get prometheus -n openshift-monitoring prometheus-k8s -o yaml
+
+# Check ServiceMonitor discovery
+oc logs -n openshift-monitoring prometheus-k8s-0 -c prometheus | grep -i servicemonitor
+```
+
+### Fix ServiceMonitor Discovery
+```bash
+# Check if Prometheus is discovering ServiceMonitors
+oc exec -n openshift-monitoring prometheus-k8s-0 -c prometheus -- \
+  wget -qO- localhost:9090/api/v1/targets | jq '.data.activeTargets[] | select(.labels.namespace=="<your-namespace>")'
+
+# Restart Prometheus if needed
+oc delete pod prometheus-k8s-0 -n openshift-monitoring
+```
+
+## Step 10: Complete Fix Implementation
+
+### Apply All Fixes
+```bash
+#!/bin/bash
+# comprehensive-dashboard-fix.sh
+
+echo "=== OpenShift 4.14 Dashboard Fix ==="
+
+# 1. Fix RBAC permissions
+oc apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: console-monitoring-fix
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+subjects:
+- kind: ServiceAccount
+  name: console
+  namespace: openshift-console
+EOF
+
+# 2. Restart console
+echo "Restarting console..."
+oc rollout restart deployment/console -n openshift-console
+
+# 3. Restart Thanos querier
+echo "Restarting Thanos querier..."
+oc rollout restart deployment/thanos-querier -n openshift-monitoring
+
+# 4. Enable user workload monitoring if not enabled
+echo "Checking user workload monitoring..."
+if ! oc get configmap cluster-monitoring-config -n openshift-monitoring >/dev/null 2>&1; then
+  oc apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true
+EOF
+fi
+
+# 5. Wait for rollouts
+oc rollout status deployment/console -n openshift-console
+oc rollout status deployment/thanos-querier -n openshift-monitoring
+
+echo "=== Fix applied successfully ==="
+echo "Please clear browser cache and retry dashboard access"
+```
+
+## Step 11: Verification Steps
+
+### Test Dashboard Functionality
+```bash
+# 1. Verify console is accessible
+curl -k -I https://$(oc get route console -n openshift-console -o jsonpath='{.spec.host}')
+
+# 2. Test namespace switching via API
+oc get --raw="/api/v1/namespaces" | jq '.items[].metadata.name'
+
+# 3. Test Prometheus metrics access
+oc get --raw="/api/v1/namespaces/openshift-monitoring/services/thanos-querier:web/proxy/api/v1/query?query=up" | jq
+
+# 4. Verify user can access target namespace
+oc auth can-i get pods -n <target-namespace>
+```
+
+### Browser Testing Checklist
+1. ✅ Clear browser cache completely
+2. ✅ Open new incognito/private window
+3. ✅ Navigate to OpenShift console
+4. ✅ Go to Monitoring → Dashboards
+5. ✅ Select first namespace → verify data loads
+6. ✅ Switch to second namespace → verify data loads
+7. ✅ Switch back to first namespace → verify data still loads
+
+## Common Root Causes and Solutions
+
+| **Issue** | **Root Cause** | **Solution** |
+|-----------|----------------|--------------|
+| No data after namespace switch | Console service account lacks permissions | Apply RBAC fixes in Step 2 |
+| Dashboard loads but no metrics | ServiceMonitors not discovered | Check ServiceMonitor configuration |
+| 403 errors in browser | User lacks monitoring permissions | Grant cluster-monitoring-view role |
+| Queries timeout | Thanos querier issues | Restart Thanos querier |
+| Cache issues | Browser/console cache | Clear cache and restart console |
+| Partial data loading | Prometheus service discovery | Restart Prometheus operator |
+
+This comprehensive troubleshooting should resolve the namespace switching dashboard issues in OpenShift 4.14.
