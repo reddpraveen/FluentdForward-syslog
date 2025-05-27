@@ -1,0 +1,312 @@
+# OpenShift Logging Cluster Context & Prep Call Agenda
+
+## Environment Context
+- **OpenShift Version:** 4.14
+- **Logging Version:** 5.9
+- **Storage Backend:** Azure Blob Storage
+- **Current Ingestion Rate:** 5MB/s
+- **Maximum Capacity:** 20MB/s
+- **Log Outputs:** External Elasticsearch + 30 syslog containers + LokiStack (default)
+
+## Current Architecture Challenges
+- CLF (ClusterLogForwarder) with multiple outputs creating log duplication
+- Debug-enabled syslog containers writing to stdout (captured by Vector)
+- Vector simultaneously sending to LokiStack
+- Hundreds of applications requiring debug logging capability
+- Log volume unpredictability during debug scenarios
+
+---
+
+## Prep Call Agenda Items
+
+### 1. Current Collector Settings & Loki Ingestion Throttle
+
+**Questions to Address:**
+- What are the current Vector collector resource limits and buffer settings?
+- What is the Loki ingestion throttle set to? (5MB/s or 8MB/s)
+- Are we hitting any current ingestion limits?
+
+**Commands to Run Before Call:**
+```bash
+# Check Vector configuration
+oc get configmap/vector -n openshift-logging -o yaml
+
+# Check Vector DaemonSet resources
+oc get daemonset/vector -n openshift-logging -o yaml | grep -A 10 resources
+
+# Check LokiStack limits
+oc get lokistack -n openshift-logging -o yaml | grep -A 20 limits
+
+# Current Vector metrics
+oc exec -n openshift-logging ds/vector -- curl -s localhost:8686/metrics | grep vector_processed_events_total
+```
+
+**Expected Default Settings:**
+- Loki ingestion rate: 4MB/s per tenant
+- Loki burst limit: 6MB/s
+- Max line size: 256KB
+- Max entries per push: 10,000
+
+### 2. Business Hours Logging Assessment
+
+**Questions to Address:**
+- Have we measured average cluster logging ingestion during peak business hours?
+- Can Red Hat confirm Loki can handle our projected throughput?
+- What's our current baseline vs. peak usage patterns?
+
+**Metrics to Gather:**
+```bash
+# Business hours ingestion rate (run during 9 AM - 5 PM)
+oc exec -n openshift-logging ds/vector -- curl -s localhost:8686/metrics | grep rate
+
+# Loki distributor metrics
+oc exec -n openshift-logging deployment/lokistack-distributor -- curl -s localhost:3100/metrics | grep loki_distributor
+
+# Prometheus query for average rates
+rate(vector_processed_events_total[1h])
+rate(vector_processed_bytes_total[1h])
+```
+
+**Red Hat Engagement:**
+- Open support case with current metrics
+- Request Loki capacity assessment
+- Provide: node count, expected log volume, retention requirements
+
+### 3. Debug Pods Current Assessment
+
+**Questions to Address:**
+- Do we have a current assessment of pods running with debug enabled?
+- Can we confirm no new pods have enabled debug since the last scan?
+- What's our process for tracking debug-enabled applications?
+
+**Debug Detection Commands:**
+```bash
+# Comprehensive debug pod scan
+for ns in $(oc get ns -o name | cut -d/ -f2); do
+  echo "=== Namespace: $ns ==="
+  oc get pods -n $ns -o json | jq -r '.items[] | select(.spec.containers[].env[]?.value? | contains("debug") or contains("DEBUG") or contains("TRACE")) | .metadata.name'
+done
+
+# Check for debug in ConfigMaps
+oc get configmaps --all-namespaces -o json | jq -r '.items[] | select(.data | to_entries[] | .value | contains("debug") or contains("DEBUG")) | "\(.metadata.namespace)/\(.metadata.name)"'
+
+# Check for debug command line args
+oc get pods --all-namespaces -o json | jq -r '.items[] | select(.spec.containers[].args[]? | contains("--debug") or contains("--log-level=debug")) | "\(.metadata.namespace)/\(.metadata.name)"'
+```
+
+**Tracking Strategy:**
+- Implement automated daily scans
+- Use admission controllers to flag debug-enabled deployments
+- Create dashboard for debug pod tracking
+
+### 4. Log Ingestion Delay/Issue Response Plan
+
+**Questions to Address:**
+- What's our plan if log ingestion into Loki is delayed?
+- What are our escalation procedures for logging issues?
+- Do we have emergency log filtering capabilities?
+
+**Emergency Response Plan:**
+
+**Level 1 Response (< 10% over limit):**
+```yaml
+# Enable log sampling
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: emergency-sampling
+spec:
+  filters:
+    - name: sample-debug-logs
+      type: json
+      json:
+        javascript: |
+          if (record.log && record.log.level === "DEBUG") {
+            if (Math.random() < 0.1) return record; // 10% sampling
+            return null;
+          }
+          return record;
+```
+
+**Level 2 Response (10-25% over limit):**
+```yaml
+# Drop non-critical logs
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: emergency-filter
+spec:
+  filters:
+    - name: critical-only
+      type: json
+      json:
+        javascript: |
+          const level = record.log?.level;
+          if (level === "ERROR" || level === "FATAL" || level === "WARN") {
+            return record;
+          }
+          return null; // Drop INFO, DEBUG, TRACE
+```
+
+**Level 3 Response (> 25% over limit):**
+- Activate incident response
+- Temporary application debug logging moratorium
+- Emergency storage scaling
+
+**Monitoring Alerts:**
+```yaml
+# Prometheus alert rules
+- alert: LokiIngestionBacklog
+  expr: increase(loki_distributor_ingester_append_failures_total[5m]) > 100
+  for: 2m
+  annotations:
+    summary: "Loki ingestion failing - activate response plan"
+
+- alert: HighLogIngestionRate
+  expr: rate(vector_processed_bytes_total[5m]) > 15000000  # 15MB/s
+  for: 5m
+  annotations:
+    summary: "Log ingestion rate approaching limits"
+```
+
+### 5. Loki Storage Capacity Assessment
+
+**Questions to Address:**
+- How much storage do we have allocated for Loki in the cluster?
+- Is current storage sufficient for projected log volumes?
+- What's our storage growth projection?
+
+**Storage Assessment Commands:**
+```bash
+# Current Loki storage usage
+oc get pvc -n openshift-logging | grep loki
+
+# LokiStack storage configuration
+oc get lokistack -n openshift-logging -o jsonpath='{.spec.storage}'
+
+# Current disk usage
+oc exec -n openshift-logging deployment/lokistack-querier -- df -h /var/loki
+
+# Storage class details
+oc get storageclass
+```
+
+**Storage Calculations:**
+- **Current Rate:** 5MB/s × 86,400 seconds = 432GB/day
+- **Peak Rate:** 20MB/s × 86,400 seconds = 1.73TB/day
+- **30-day retention:** 12.96TB - 51.8TB storage needed
+
+**Recommended Storage Configuration:**
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: lokistack-sample
+spec:
+  size: 1x.medium  # Scale based on requirements
+  storage:
+    size: 15Ti  # Minimum for 30-day retention with headroom
+    storageClassName: managed-premium  # Azure premium SSD
+  limits:
+    global:
+      retention:
+        days: 30
+      storage:
+        maxGlobalStreamsPerUser: 10000
+        maxChunksPerQuery: 2000000
+```
+
+### 6. Success Confidence Assessment
+
+**Questions to Address:**
+- How confident are we this implementation will be successful?
+- What are our biggest risk factors?
+- What would cause us to abort/rollback the implementation?
+
+**Risk Assessment:**
+
+**HIGH RISK FACTORS:**
+- 4x potential increase in log volume (5MB/s → 20MB/s)
+- Log duplication across multiple outputs
+- Unpredictable debug logging from hundreds of applications
+- Limited experience with high-volume Loki deployments
+
+**MEDIUM RISK FACTORS:**
+- Azure Blob storage latency considerations
+- Vector buffer/resource limitations
+- Storage capacity planning uncertainties
+
+**MITIGATION STRATEGIES:**
+```yaml
+# Gradual rollout configuration
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: staged-rollout
+spec:
+  filters:
+    - name: namespace-sampling
+      type: json
+      json:
+        javascript: |
+          // Stage 1: Only specific namespaces
+          const allowedNamespaces = ["app-tier1", "app-tier2"];
+          if (allowedNamespaces.includes(record.kubernetes.namespace_name)) {
+            return record;
+          }
+          return null;
+```
+
+**Success Metrics:**
+- Log ingestion rate consistently < 15MB/s
+- Loki write latency < 500ms (p95)
+- Zero log loss during business hours
+- Storage growth < 1TB/day average
+- No application performance impact
+
+**Rollback Triggers:**
+- Sustained ingestion rate > 18MB/s
+- Loki write failures > 5% for 10+ minutes
+- Storage growth > 2TB/day for 3+ consecutive days
+- Application performance degradation attributed to logging
+
+**Confidence Level: MEDIUM-HIGH**
+- ✅ Technical solution is architecturally sound
+- ✅ Comprehensive monitoring and alerting planned
+- ✅ Clear rollback procedures defined
+- ⚠️ High log volume variability risk
+- ⚠️ Limited production testing at scale
+
+**Recommendation:** Proceed with staged rollout approach, robust monitoring, and clearly defined success/failure criteria.
+
+---
+
+## Pre-Call Action Items
+
+### Technical Team Tasks:
+1. Run all diagnostic commands listed above
+2. Document current resource utilization
+3. Identify all current debug-enabled applications
+4. Test emergency log filtering in non-production
+5. Validate storage capacity calculations
+
+### Business/Management Tasks:
+1. Define acceptable risk tolerance levels
+2. Approve staged rollout timeline
+3. Establish incident response procedures
+4. Coordinate with application teams for debug logging schedules
+
+### Red Hat Engagement:
+1. Open support case for capacity assessment
+2. Request architectural review of proposed solution
+3. Validate emergency procedures with support team
+
+---
+
+## Post-Call Deliverables
+
+1. **Decision Matrix:** Go/No-Go criteria with specific metrics
+2. **Implementation Timeline:** Staged rollout schedule
+3. **Monitoring Dashboard:** Real-time ingestion and health metrics
+4. **Runbook:** Emergency procedures and rollback steps
+5. **Communication Plan:** Stakeholder updates and escalation procedures
