@@ -1,3 +1,531 @@
+# OpenShift Native CLF Rate Limiting and Muting
+
+## Method 1: Label-Based Log Routing and Muting
+
+### Step 1: Label Debug-Enabled Pods
+```bash
+# Label pods that have debug logging enabled
+oc label pod <pod-name> -n <namespace> logging.openshift.io/debug-enabled=true
+oc label pod <pod-name> -n <namespace> logging.openshift.io/rate-limit=high
+
+# Label entire namespaces for syslog containers
+oc label namespace syslog-containers logging.openshift.io/debug-mute=true
+```
+
+### Step 2: Native CLF with Input Selection
+```yaml
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: debug-log-control
+  namespace: openshift-logging
+spec:
+  inputs:
+    # Separate input for debug-enabled pods
+    - name: debug-pods
+      type: application
+      application:
+        selector:
+          matchLabels:
+            logging.openshift.io/debug-enabled: "true"
+    
+    # Input for muted namespaces (syslog containers)
+    - name: muted-namespaces
+      type: application
+      application:
+        namespaces:
+          - syslog-containers
+          - monitoring-debug
+    
+    # Regular application logs (excluding debug pods)
+    - name: regular-apps
+      type: application
+      application:
+        selector:
+          matchExpressions:
+            - key: logging.openshift.io/debug-enabled
+              operator: DoesNotExist
+
+  outputs:
+    # Regular output for normal logs
+    - name: azure-blob-regular
+      type: azureMonitor
+      azureMonitor:
+        customerId: "your-workspace-id"
+        sharedKey: "your-shared-key"
+    
+    # Separate output for sampled debug logs
+    - name: azure-blob-debug-sampled
+      type: azureMonitor
+      azureMonitor:
+        customerId: "your-debug-workspace-id"
+        sharedKey: "your-debug-shared-key"
+    
+    # Null output for muted logs
+    - name: null-output
+      type: "null"
+
+  pipelines:
+    # Regular logs pipeline - full throughput
+    - name: regular-logs
+      inputRefs:
+        - regular-apps
+      outputRefs:
+        - azure-blob-regular
+        - default  # Still send to LokiStack
+    
+    # Debug logs pipeline - rate limited by separate storage
+    - name: debug-logs-limited
+      inputRefs:
+        - debug-pods
+      outputRefs:
+        - azure-blob-debug-sampled  # Separate storage with limits
+    
+    # Muted logs pipeline - send to null
+    - name: muted-logs
+      inputRefs:
+        - muted-namespaces
+      outputRefs:
+        - null-output  # Effectively mutes the logs
+```
+
+## Method 2: Namespace-Based Native Filtering
+
+### Complete Namespace Muting
+```yaml
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: namespace-muting
+  namespace: openshift-logging
+spec:
+  inputs:
+    # Explicitly exclude problematic namespaces
+    - name: filtered-applications
+      type: application
+      application:
+        excludes:
+          - namespace: syslog-containers
+          - namespace: debug-heavy-apps
+          - namespace: monitoring-verbose
+
+  outputs:
+    - name: production-logs
+      type: loki
+      loki:
+        lokiStack: openshift-logging
+
+  pipelines:
+    - name: production-pipeline
+      inputRefs:
+        - filtered-applications
+      outputRefs:
+        - production-logs
+```
+
+## Method 3: Pod Name Pattern-Based Filtering
+
+### Filter by Pod Name Patterns
+```yaml
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: pod-pattern-filter
+  namespace: openshift-logging
+spec:
+  inputs:
+    # Include only non-debug pods
+    - name: production-pods
+      type: application
+      application:
+        selector:
+          matchExpressions:
+            # Exclude pods with debug in the name
+            - key: metadata.name
+              operator: NotIn
+              values:
+                - "debug"
+                - "trace"
+                - "verbose"
+
+    # Separate input for syslog pods to mute
+    - name: syslog-pods
+      type: application
+      application:
+        selector:
+          matchExpressions:
+            - key: metadata.name
+              operator: In
+              values:
+                - "syslog-1"
+                - "syslog-2"
+                - "syslog-3"
+                # ... continue for all 30 syslog pods
+
+  outputs:
+    - name: main-storage
+      type: loki
+      loki:
+        lokiStack: openshift-logging
+    
+    - name: discard
+      type: "null"
+
+  pipelines:
+    - name: production-logs
+      inputRefs:
+        - production-pods
+      outputRefs:
+        - main-storage
+    
+    - name: muted-syslog
+      inputRefs:
+        - syslog-pods
+      outputRefs:
+        - discard
+```
+
+## Method 4: Resource-Based Rate Limiting via Separate Outputs
+
+### Different Storage Tiers for Rate Limiting
+```yaml
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: tiered-logging
+  namespace: openshift-logging
+spec:
+  inputs:
+    # High-priority applications
+    - name: tier1-apps
+      type: application
+      application:
+        namespaces:
+          - production
+          - critical-services
+
+    # Medium-priority applications  
+    - name: tier2-apps
+      type: application
+      application:
+        namespaces:
+          - staging
+          - integration
+
+    # Low-priority/debug applications
+    - name: tier3-apps
+      type: application
+      application:
+        namespaces:
+          - development
+          - debug-env
+          - syslog-containers
+
+  outputs:
+    # High-throughput storage for critical apps
+    - name: tier1-storage
+      type: loki
+      loki:
+        lokiStack: openshift-logging
+        
+    # Medium-throughput storage
+    - name: tier2-storage
+      type: azureMonitor
+      azureMonitor:
+        customerId: "tier2-workspace"
+        sharedKey: "tier2-key"
+        
+    # Low-throughput/sampled storage for debug
+    - name: tier3-storage-limited
+      type: azureMonitor
+      azureMonitor:
+        customerId: "debug-workspace"
+        sharedKey: "debug-key"
+        # This workspace configured with lower ingestion limits
+
+  pipelines:
+    - name: tier1-pipeline
+      inputRefs:
+        - tier1-apps
+      outputRefs:
+        - tier1-storage
+        
+    - name: tier2-pipeline
+      inputRefs:
+        - tier2-apps
+      outputRefs:
+        - tier2-storage
+        
+    - name: tier3-pipeline-limited
+      inputRefs:
+        - tier3-apps
+      outputRefs:
+        - tier3-storage-limited  # Inherently rate-limited by destination
+```
+
+## Method 5: Time-Based Log Routing
+
+### Route Debug Logs to Different Retention Policies
+```yaml
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: retention-based-routing
+  namespace: openshift-logging
+spec:
+  inputs:
+    - name: debug-applications
+      type: application
+      application:
+        selector:
+          matchLabels:
+            app.kubernetes.io/debug: "true"
+
+    - name: production-applications
+      type: application
+      application:
+        selector:
+          matchExpressions:
+            - key: app.kubernetes.io/debug
+              operator: DoesNotExist
+
+  outputs:
+    # Short retention for debug logs (auto rate limiting via retention)
+    - name: debug-short-retention
+      type: loki
+      loki:
+        tenantKey: "debug-tenant"
+        lokiStack: openshift-logging
+        
+    # Normal retention for production logs
+    - name: production-storage
+      type: loki
+      loki:
+        tenantKey: "production-tenant" 
+        lokiStack: openshift-logging
+
+  pipelines:
+    - name: debug-pipeline
+      inputRefs:
+        - debug-applications
+      outputRefs:
+        - debug-short-retention
+        
+    - name: production-pipeline
+      inputRefs:
+        - production-applications
+      outputRefs:
+        - production-storage
+```
+
+## Method 6: Vector Configuration for Native Rate Limiting
+
+### Configure Vector Directly for Rate Limiting
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-rate-limit-config
+  namespace: openshift-logging
+data:
+  vector.yaml: |
+    sources:
+      kubernetes_logs:
+        type: kubernetes_logs
+        
+    transforms:
+      # Route based on namespace
+      namespace_router:
+        type: route
+        inputs:
+          - kubernetes_logs
+        route:
+          syslog_containers: '.kubernetes.namespace_name == "syslog-containers"'
+          debug_apps: '.kubernetes.namespace_name | contains("debug")'
+          production: 'true'  # Default route
+    
+    sinks:
+      # High-rate production logs
+      production_loki:
+        type: loki
+        inputs:
+          - namespace_router.production
+        endpoint: http://lokistack-gateway-http.openshift-logging.svc:8080/api/logs/v1/application/
+        
+      # Rate-limited debug logs
+      debug_loki:
+        type: loki
+        inputs:
+          - namespace_router.debug_apps
+        endpoint: http://lokistack-gateway-http.openshift-logging.svc:8080/api/logs/v1/application/
+        batch:
+          max_events: 100      # Smaller batches
+          timeout_secs: 60     # Longer timeout
+        buffer:
+          max_events: 1000     # Smaller buffer = natural rate limiting
+          
+      # Discarded syslog container logs
+      syslog_discard:
+        type: blackhole
+        inputs:
+          - namespace_router.syslog_containers
+```
+
+## Method 7: LokiStack Tenant-Based Rate Limiting
+
+### Configure Different Tenants with Different Limits
+```yaml
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: lokistack-sample
+  namespace: openshift-logging
+spec:
+  size: 1x.medium
+  storage:
+    size: 10Ti
+    storageClassName: managed-premium
+  tenants:
+    mode: openshift-logging
+  limits:
+    global:
+      ingestion:
+        ingestionRate: 8          # 8MB/s for production tenant
+        ingestionBurstSize: 12    # 12MB/s burst
+    tenants:
+      debug-tenant:
+        ingestion:
+          ingestionRate: 1        # 1MB/s for debug logs
+          ingestionBurstSize: 2   # 2MB/s burst
+      syslog-tenant:
+        ingestion:
+          ingestionRate: 0.1      # 100KB/s for syslog (very limited)
+          ingestionBurstSize: 0.2 # 200KB/s burst
+---
+apiVersion: logging.coreos.com/v1
+kind: ClusterLogForwarder
+metadata:
+  name: tenant-based-limiting
+spec:
+  outputs:
+    - name: debug-tenant-output
+      type: loki
+      loki:
+        tenantKey: "debug-tenant"
+        lokiStack: openshift-logging
+        
+    - name: syslog-tenant-output  
+      type: loki
+      loki:
+        tenantKey: "syslog-tenant"
+        lokiStack: openshift-logging
+        
+    - name: production-tenant-output
+      type: loki
+      loki:
+        tenantKey: "application"  # Default tenant
+        lokiStack: openshift-logging
+
+  pipelines:
+    - name: debug-limited-pipeline
+      inputRefs:
+        - application
+      filterRefs:
+        - debug-namespace-filter
+      outputRefs:
+        - debug-tenant-output
+        
+    - name: syslog-limited-pipeline
+      inputRefs:
+        - application  
+      filterRefs:
+        - syslog-namespace-filter
+      outputRefs:
+        - syslog-tenant-output
+```
+
+## Implementation Commands
+
+### Apply Debug Pod Labels
+```bash
+#!/bin/bash
+# label-debug-pods.sh
+
+# Label all syslog containers for muting
+for i in {1..30}; do
+  oc label pod syslog-$i -n syslog-containers logging.openshift.io/debug-mute=true
+done
+
+# Label debug-enabled application pods
+oc get pods --all-namespaces -o json | \
+jq -r '.items[] | select(.spec.containers[].env[]? | .name == "LOG_LEVEL" and .value == "DEBUG") | "\(.metadata.namespace) \(.metadata.name)"' | \
+while read namespace pod; do
+  oc label pod $pod -n $namespace logging.openshift.io/debug-enabled=true
+done
+
+# Label namespaces for bulk operations
+oc label namespace syslog-containers logging.openshift.io/log-level=muted
+oc label namespace debug-apps logging.openshift.io/log-level=debug
+```
+
+### Apply CLF Configuration
+```bash
+#!/bin/bash
+# apply-native-rate-limiting.sh
+
+# Backup existing configuration
+oc get clusterlogforwarder instance -n openshift-logging -o yaml > clf-backup-$(date +%Y%m%d-%H%M%S).yaml
+
+# Apply the new native configuration
+oc apply -f native-clf-rate-limiting.yaml
+
+# Verify the configuration
+oc get clusterlogforwarder instance -n openshift-logging -o yaml
+
+# Monitor Vector restart
+oc rollout status daemonset/vector -n openshift-logging
+```
+
+### Monitor Rate Limiting Effectiveness
+```bash
+#!/bin/bash
+# monitor-rate-limiting.sh
+
+# Check log ingestion rates
+echo "=== Current Log Ingestion Rates ==="
+oc exec -n openshift-logging ds/vector -- curl -s localhost:8686/metrics | grep processed_events_total
+
+# Check Loki ingestion
+echo "=== Loki Ingestion Status ==="
+oc exec -n openshift-logging deployment/lokistack-distributor -- curl -s localhost:3100/metrics | grep distributor_ingester
+
+# Check for dropped logs
+echo "=== Dropped/Discarded Logs ==="
+oc logs -n openshift-logging ds/vector | grep -i "drop\|discard\|null" | tail -10
+```
+
+## Native OpenShift Logging Features Summary
+
+1. **Input Selection**: Use `selector` and `namespaces` to filter at source
+2. **Output Routing**: Route different log types to different destinations
+3. **Null Output**: Use `type: "null"` to effectively mute logs
+4. **Tenant-Based Limits**: Configure different rate limits per tenant in LokiStack
+5. **Vector Configuration**: Direct Vector config for sophisticated routing
+6. **Label-Based Filtering**: Use Kubernetes labels for fine-grained control
+
+This approach uses only native OpenShift logging capabilities without any custom JavaScript filtering.
+
+
+
+
+
+
+
+
+
+
+
+
 # OpenShift Logging Cluster Context & Prep Call Agenda
 
 ## Environment Context
