@@ -1,3 +1,14 @@
+specific node
+oc get pods --all-namespaces --field-selector=spec.nodeName=<NODE_NAME>,status.phase=Terminating -o json | \
+jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name)"' | \
+while read namespace pod; do
+  echo "Force deleting pod $pod in namespace $namespace"
+  oc delete pod $pod -n $namespace --force --grace-period=0
+done
+
+
+
+
 #!/bin/bash
 
 # File containing OpenShift API server hostnames (one per line)
