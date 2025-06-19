@@ -1,0 +1,208 @@
+# OpenShift LokiStack LogCLI Setup and Usage Guide
+
+## Prerequisites
+- OpenShift 4.14+
+- LokiStack 5.9 deployed (typically in `openshift-logging` namespace)
+- Cluster logging reader permissions
+
+## Setup Instructions
+
+### 1. Get LokiStack Token
+First, get the authentication token for LokiStack access:
+
+```bash
+# Get the cluster-logging-reader token
+TOKEN_NAME=$(oc get secrets -n openshift-logging | grep cluster-logging-reader | awk '{print $1}')
+TOKEN=$(oc get secret $TOKEN_NAME -n openshift-logging -o jsonpath='{.data.token}' | base64 -d)
+
+# Create base64 encoded token for the secret
+echo -n "$TOKEN" | base64
+```
+
+### 2. Update Configuration
+Before deploying, update the following values in the YAML:
+
+- Replace `your-namespace` with your target OpenShift project/namespace
+- Replace the base64 token in `lokistack-credentials` secret with the token from step 1
+- Update LokiStack gateway URL if different from default:
+  ```
+  https://lokistack-logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080
+  ```
+
+### 3. Deploy to OpenShift
+```bash
+# Create or switch to your project
+oc new-project your-namespace  # or oc project your-namespace
+
+# Apply the configuration
+oc apply -f openshift-lokistack-logcli.yaml
+
+# Verify deployment
+oc get pods -l app=logcli-container
+oc get deployment logcli-container
+
+# Check if SCC is applied correctly
+oc get pod -l app=logcli-container -o yaml | grep scc
+```
+
+### 4. Access the Container
+```bash
+# Get shell access to the container
+oc exec -it deployment/logcli-container -- /bin/bash
+
+# Or using pod name directly
+POD_NAME=$(oc get pods -l app=logcli-container -o jsonpath='{.items[0].metadata.name}')
+oc exec -it $POD_NAME -- /bin/bash
+```
+
+## Usage Examples for LokiStack
+
+Once inside the container, you can run LogQL queries specifically for LokiStack:
+
+### Basic LokiStack Queries
+```bash
+# Query application logs from a specific namespace
+logcli query '{kubernetes_namespace_name="myapp"}'
+
+# Query infrastructure logs
+logcli query '{log_type="infrastructure"}'
+
+# Query application logs with error level
+logcli query '{log_type="application"} |= "ERROR"'
+
+# Query specific pod logs
+logcli query '{kubernetes_pod_name=~"myapp-.*"}'
+```
+
+### LokiStack Specific Labels
+```bash
+# List all available labels
+logcli labels
+
+# Common LokiStack labels:
+# - kubernetes_namespace_name
+# - kubernetes_pod_name  
+# - kubernetes_container_name
+# - log_type (application/infrastructure)
+# - kubernetes_node_name
+# - openshift_cluster_name
+```
+
+### Using Pre-configured Aliases
+```bash
+# Short query alias
+lq '{kubernetes_namespace_name="default"}'
+
+# Tail logs in real-time  
+lt '{kubernetes_pod_name=~"myapp-.*"}'
+
+# Raw output for processing
+lapp '{log_type="application"}' | grep ERROR
+
+# JSON Lines output
+lstream '{kubernetes_namespace_name="myapp"}' | jq .
+```
+
+### Advanced LokiStack LogQL Examples
+```bash
+# Filter by multiple labels
+logcli query '{kubernetes_namespace_name="myapp", log_type="application"} |= "database"'
+
+# Rate queries for application logs
+logcli query 'rate({log_type="application"}[5m])'
+
+# Count errors per namespace
+logcli query 'sum by (kubernetes_namespace_name) (rate({log_type="application"} |= "ERROR" [5m]))'
+
+# Query with time range
+logcli query --since=1h '{kubernetes_namespace_name="myapp"}' 
+
+# Query infrastructure logs from specific nodes
+logcli query '{log_type="infrastructure", kubernetes_node_name="worker-1"}'
+
+# OpenShift specific - audit logs
+logcli query '{log_type="audit"}' --since=30m
+```
+
+## Configuration Details
+
+### Environment Variables Set
+- `LOKI_ADDR`: LokiStack gateway internal service URL
+- `LOKI_BEARER_TOKEN`: Authentication token from OpenShift secret
+- `LOKI_TLS_SKIP_VERIFY`: TLS verification setting (false for LokiStack)
+
+### Configuration Files
+- `~/.config/logcli/config.yml`: LogCLI configuration file
+- Token mounted at `/etc/loki-secrets/token`
+
+### Pre-configured Aliases for LokiStack
+- `lq`: Short for `logcli query`
+- `lt`: Short for `logcli query --tail`  
+- `ll`: Short for `logcli labels`
+- `lapp`: Raw output format
+- `lstream`: JSON lines output format
+
+### OpenShift Security Context
+- Uses Red Hat UBI9 base image
+- Custom SecurityContextConstraints (SCC)
+- ServiceAccount with cluster-logging-reader permissions
+- Non-root user execution (UID 1001)
+
+## Troubleshooting
+
+### Check LokiStack Configuration
+```bash
+# Verify environment variables
+echo $LOKI_ADDR
+echo $LOKI_BEARER_TOKEN
+
+# Test LokiStack connectivity
+logcli labels
+
+# Check if LokiStack gateway is accessible
+curl -k -H "Authorization: Bearer $LOKI_BEARER_TOKEN" "$LOKI_ADDR/loki/api/v1/labels"
+```
+
+### Common LokiStack Issues
+1. **Authentication errors**: 
+   - Verify cluster-logging-reader token is valid
+   - Check token has proper RBAC permissions
+   
+2. **Connection issues**: 
+   - Verify LokiStack is running in openshift-logging namespace
+   - Check if gateway service is accessible
+   
+3. **No logs returned**:
+   - Verify log forwarding is configured
+   - Check if ClusterLogForwarder is properly set up
+   - Confirm applications are writing logs
+
+### OpenShift Debugging
+```bash
+# Check pod status and events
+oc describe pod -l app=logcli-container
+
+# Check pod logs
+oc logs deployment/logcli-container
+
+# Verify SCC assignment
+oc get pod -l app=logcli-container -o yaml | grep scc
+
+# Check service account permissions
+oc auth can-i get pods --as=system:serviceaccount:your-namespace:logcli-sa
+
+# Verify LokiStack gateway service
+oc get svc -n openshift-logging | grep gateway
+```
+
+### LokiStack Verification
+```bash
+# Check if LokiStack is running
+oc get lokistack -n openshift-logging
+
+# Verify ClusterLogForwarder configuration
+oc get clusterlogforwarder -n openshift-logging
+
+# Check cluster logging status
+oc get clusterlogging -n openshift-logging
+```
