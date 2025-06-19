@@ -1,0 +1,379 @@
+---
+# Secret for LokiStack authentication token
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lokistack-credentials
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+type: Opaque
+data:
+  # Base64 encoded token for LokiStack access
+  # For LokiStack, this should be your cluster-logging-reader token
+  # oc get secret <cluster-logging-reader-token> -o jsonpath='{.data.token}' | base64 -d | base64
+  token: eW91ci1sb2tpc3RhY2stdG9rZW4taGVyZQ==  # Replace with actual token
+
+---
+# ConfigMap for LogCLI configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logcli-config
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+data:
+  # LogCLI configuration for LokiStack
+  config.yaml: |
+    # LokiStack gateway URL (typically internal service)
+    # Format: https://lokistack-<name>-gateway-http.<namespace>.svc.cluster.local:8080
+    url: https://lokistack-logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080
+    tls_skip_verify: false
+    
+  # Enhanced configuration script for LokiStack
+  configure-logcli.sh: |
+    #!/bin/bash
+    set -e
+    
+    # LokiStack specific configuration
+    export LOKI_ADDR="https://lokistack-logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080"
+    export LOKI_BEARER_TOKEN="$(cat /etc/loki-secrets/token)"
+    export LOKI_TLS_SKIP_VERIFY="false"
+    
+    # Create logcli config directory
+    mkdir -p ~/.config/logcli
+    
+    # Write LokiStack configuration
+    cat > ~/.config/logcli/config.yml << EOF
+    url: ${LOKI_ADDR}
+    bearer-token: ${LOKI_BEARER_TOKEN}
+    tls-skip-verify: ${LOKI_TLS_SKIP_VERIFY}
+    EOF
+    
+    # Add to bash profile with LokiStack specific settings
+    cat >> ~/.bashrc << 'EOF'
+    # LokiStack Environment Variables
+    export LOKI_ADDR="https://lokistack-logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080"
+    export LOKI_BEARER_TOKEN="$(cat /etc/loki-secrets/token)"
+    export LOKI_TLS_SKIP_VERIFY="false"
+    
+    # Helpful aliases for LokiStack queries
+    alias lq='logcli query'
+    alias lt='logcli query --tail'
+    alias ll='logcli labels'
+    alias lapp='logcli query --output=raw'
+    alias lstream='logcli query --output=jsonl'
+    
+    # LokiStack specific query helpers
+    alias logs-app='logcli query "{kubernetes_namespace_name=\"$1\"}"'
+    alias logs-pod='logcli query "{kubernetes_pod_name=\"$1\"}"'
+    alias logs-container='logcli query "{kubernetes_container_name=\"$1\"}"'
+    
+    echo "=========================="
+    echo "LogCLI configured for LokiStack 5.9"
+    echo "=========================="
+    echo "Available commands:"
+    echo "  logcli query 'query'     - Basic query"
+    echo "  lq 'query'               - Query shortcut"
+    echo "  lt 'query'               - Tail logs"
+    echo "  ll                       - List labels"
+    echo "  lapp 'query'             - Raw output"
+    echo "  lstream 'query'          - JSON lines output"
+    echo ""
+    echo "LokiStack specific examples:"
+    echo "  lq '{kubernetes_namespace_name=\"myapp\"}'"
+    echo "  lq '{kubernetes_pod_name=~\"myapp-.*\"}'"
+    echo "  lq '{log_type=\"application\"} |= \"ERROR\"'"
+    echo "  lq '{log_type=\"infrastructure\"}'"
+    echo "=========================="
+    EOF
+    
+    # Test connectivity
+    echo "Testing LokiStack connectivity..."
+    if logcli labels > /dev/null 2>&1; then
+        echo "✓ Successfully connected to LokiStack"
+    else
+        echo "⚠ Warning: Could not connect to LokiStack. Check configuration."
+    fi
+
+---
+# SecurityContextConstraints for the LogCLI container
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: logcli-scc
+  labels:
+    app: logcli-container
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegeEscalation: false
+allowPrivilegedContainer: false
+allowedCapabilities: null
+defaultAddCapabilities: null
+fsGroup:
+  type: MustRunAs
+  ranges:
+    - min: 1000
+      max: 65535
+readOnlyRootFilesystem: false
+requiredDropCapabilities:
+  - KILL
+  - MKNOD
+  - SETUID
+  - SETGID
+runAsUser:
+  type: MustRunAsRange
+  uidRangeMin: 1000
+  uidRangeMax: 65535
+seLinuxContext:
+  type: MustRunAs
+supplementalGroups:
+  type: RunAsAny
+users:
+  - system:serviceaccount:your-namespace:logcli-sa  # Replace namespace
+volumes:
+  - configMap
+  - secret
+  - emptyDir
+  - persistentVolumeClaim
+
+---
+# ServiceAccount for LogCLI
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logcli-sa
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+
+---
+# ClusterRole for LokiStack access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: logcli-cluster-reader
+  labels:
+    app: logcli-container
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding for LokiStack access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: logcli-cluster-reader-binding
+  labels:
+    app: logcli-container
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: logcli-cluster-reader
+subjects:
+- kind: ServiceAccount
+  name: logcli-sa
+  namespace: your-namespace  # Replace with your target namespace
+
+---
+# Deployment for LogCLI container using Red Hat UBI
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logcli-container
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+    app.kubernetes.io/name: logcli
+    app.kubernetes.io/component: log-client
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logcli-container
+  template:
+    metadata:
+      labels:
+        app: logcli-container
+        app.kubernetes.io/name: logcli
+        app.kubernetes.io/component: log-client
+      annotations:
+        # OpenShift specific annotations
+        openshift.io/scc: logcli-scc
+    spec:
+      serviceAccountName: logcli-sa
+      
+      # Security context for OpenShift
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      
+      containers:
+      - name: logcli
+        # Using Red Hat UBI with LogCLI installed
+        image: registry.redhat.io/ubi9/ubi:latest
+        imagePullPolicy: Always
+        
+        # Keep container running and install logcli
+        command: ["/bin/bash"]
+        args: 
+        - -c
+        - |
+          # Install required packages
+          dnf update -y
+          dnf install -y wget curl tar gzip
+          
+          # Download and install LogCLI
+          LOGCLI_VERSION="3.0.0"
+          wget -O /tmp/logcli.tar.gz "https://github.com/grafana/loki/releases/download/v${LOGCLI_VERSION}/logcli-linux-amd64.zip"
+          cd /tmp
+          unzip logcli.tar.gz
+          chmod +x logcli-linux-amd64
+          cp logcli-linux-amd64 /usr/local/bin/logcli
+          
+          # Run configuration script
+          chmod +x /etc/logcli-config/configure-logcli.sh
+          /etc/logcli-config/configure-logcli.sh
+          
+          # Keep container running
+          tail -f /dev/null
+        
+        # Environment variables for LokiStack
+        env:
+        - name: LOKI_ADDR
+          value: "https://lokistack-logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080"
+        - name: LOKI_BEARER_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: lokistack-credentials
+              key: token
+        - name: LOKI_TLS_SKIP_VERIFY
+          value: "false"
+        
+        # Volume mounts
+        volumeMounts:
+        - name: loki-secrets
+          mountPath: /etc/loki-secrets
+          readOnly: true
+        - name: logcli-config
+          mountPath: /etc/logcli-config
+          readOnly: true
+        - name: logcli-cache
+          mountPath: /tmp/logcli-cache
+        
+        # Resource limits for OpenShift
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsUser: 1001
+          runAsGroup: 1001
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: false
+        
+        # Health checks
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - "logcli --version"
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - "logcli labels > /dev/null 2>&1"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          
+      volumes:
+      - name: loki-secrets
+        secret:
+          secretName: lokistack-credentials
+      - name: logcli-config
+        configMap:
+          name: logcli-config
+          defaultMode: 0755
+      - name: logcli-cache
+        emptyDir: {}
+      
+      # Node selector for OpenShift
+      nodeSelector:
+        kubernetes.io/os: linux
+      
+      # Tolerations for OpenShift
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 300
+
+---
+# Optional: Route for external access (if needed)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: logcli-route
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+spec:
+  to:
+    kind: Service
+    name: logcli-service
+    weight: 100
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+
+---
+# Service for the LogCLI container
+apiVersion: v1
+kind: Service
+metadata:
+  name: logcli-service
+  namespace: your-namespace  # Replace with your target namespace
+  labels:
+    app: logcli-container
+spec:
+  selector:
+    app: logcli-container
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  type: ClusterIP
