@@ -73,9 +73,11 @@ jobs:
           echo "# TODO: Add code owners here\n*       " > .github/CODEOWNERS
           # Inject default CI workflow
           mkdir -p .github/workflows
-          cat <<EOF > .github/workflows/ci.yml
+          cat > .github/workflows/ci.yml <<'EOC'
 name: CI
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -83,9 +85,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run a one-line script
         run: echo "Hello, world!"
-EOF
+EOC
           # Inject auto-release workflow
-          cat <<EOF > .github/workflows/auto-release.yml
+          cat > .github/workflows/auto-release.yml <<'EOA'
 name: Auto Release on PR Merge
 
 on:
@@ -123,7 +125,7 @@ jobs:
           git tag "$NEXT_TAG"
           git push origin "$NEXT_TAG"
           gh release create "$NEXT_TAG" --generate-notes --title "Release $NEXT_TAG"
-EOF
+EOA
           # Create applications/app-config and caas-appliation-instance.yaml
           mkdir -p applications/app-config
           cat <<EOF > applications/app-config/caas-appliation-instance.yaml
