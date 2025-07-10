@@ -1,0 +1,98 @@
+name: Duplicate Repository Structure
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repository (owner/repo)'
+        required: true
+        type: string
+      destination_repo:
+        description: 'Destination repository (owner/repo)'
+        required: true
+        type: string
+
+jobs:
+  duplicate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Create destination repository
+        run: |
+          gh repo create ${{ github.event.inputs.destination_repo }} --public --confirm
+
+      - name: Mirror source repository structure (branches, files)
+        run: |
+          git clone --bare https://github.com/${{ github.event.inputs.source_repo }}.git
+          cd $(basename ${{ github.event.inputs.source_repo }})
+          git push --mirror https://github.com/${{ github.event.inputs.destination_repo }}.git
+
+      - name: Copy collaborators from source to destination
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COLLABS=$(gh api repos/${{ github.event.inputs.source_repo }}/collaborators --jq '.[] | .login')
+          for user in $COLLABS; do
+            gh api repos/${{ github.event.inputs.destination_repo }}/collaborators/$user -X PUT -f permission=push
+          done
+
+      - name: Copy branch protection rules
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCHES=$(gh api repos/${{ github.event.inputs.source_repo }}/branches --jq '.[].name')
+          for branch in $BRANCHES; do
+            PROTECTION=$(gh api repos/${{ github.event.inputs.source_repo }}/branches/$branch/protection || echo '{}')
+            if [ "$PROTECTION" != '{}' ]; then
+              gh api repos/${{ github.event.inputs.destination_repo }}/branches/$branch/protection \
+                --method PUT \
+                --input <(echo "$PROTECTION")
+            fi
+          done
+
+      - name: Inject default README
+        run: |
+          git clone https://github.com/${{ github.event.inputs.destination_repo }}.git dest-repo
+          echo "# ${{ github.event.inputs.destination_repo }}\n\nThis is a duplicated repository." > dest-repo/README.md
+          cd dest-repo
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add README.md
+          git commit -m "Add default README"
+          git push
+
+      - name: Inject default CODEOWNERS
+        run: |
+          echo "*       @github-actions" > dest-repo/.github/CODEOWNERS
+          cd dest-repo
+          git add .github/CODEOWNERS
+          git commit -m "Add default CODEOWNERS"
+          git push
+
+      - name: Inject default CI workflow
+        run: |
+          mkdir -p dest-repo/.github/workflows
+          cat <<EOF > dest-repo/.github/workflows/ci.yml
+          name: CI
+          on: [push, pull_request]
+          jobs:
+            build:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v4
+                - name: Run a one-line script
+                  run: echo "Hello, world!"
+          EOF
+          cd dest-repo
+          git add .github/workflows/ci.yml
+          git commit -m "Add default CI workflow"
+          git push
+
+      - name: Output summary
+        run: |
+          echo "Repository ${{ github.event.inputs.destination_repo }} created and initialized with structure, collaborators, branch protection, README, CODEOWNERS, and CI workflow." 

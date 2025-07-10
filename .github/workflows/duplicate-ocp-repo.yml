@@ -1,0 +1,95 @@
+name: Duplicate OCP Operator Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: 'Source repository (owner/repo)'
+        required: true
+        type: string
+      destination_repo:
+        description: 'Destination repository (owner/new-repo)'
+        required: true
+        type: string
+      folder_prefix:
+        description: 'Folder prefix for instance/operator (e.g., vso)'
+        required: true
+        type: string
+      cluster_config_type:
+        description: 'Cluster config type (single or separate for azure/hci)'
+        required: true
+        type: choice
+        options:
+          - single
+          - separate
+
+jobs:
+  duplicate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
+
+      - name: Create destination repository
+        run: |
+          gh repo create ${{ github.event.inputs.destination_repo }} --public --confirm
+
+      - name: Clone source repository
+        run: |
+          git clone https://github.com/${{ github.event.inputs.source_repo }}.git source-repo
+
+      - name: Prepare new repo structure
+        run: |
+          set -e
+          NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
+          SRCREPO=$(basename "${{ github.event.inputs.source_repo }}")
+          PREFIX="${{ github.event.inputs.folder_prefix }}"
+          mkdir "$NEWREPO"
+          cd "$NEWREPO"
+          # Create top-level folders
+          mkdir applications applicationset .github "$PREFIX-instance" "$PREFIX-operator"
+          touch .gitignore
+          # Create README.md
+          echo "# $NEWREPO\n\nrepo used by team to manage installation and configuration of OCP operators." > README.md
+          # Prepare <prefix>-operator
+          SRCOP=../source-repo/${SRCREPO}-operator
+          DESTOP="$PREFIX-operator"
+          cp "$SRCOP/Chart.lock" "$DESTOP/Chart.lock"
+          sed "s/$SRCREPO/$NEWREPO/g" "$SRCOP/Chart.yaml" > "$DESTOP/Chart.yaml"
+          sed "s/$SRCREPO/$NEWREPO/g" "$SRCOP/README.md" > "$DESTOP/README.md"
+          mkdir "$DESTOP/templates"
+          cp -r "$SRCOP/templates/." "$DESTOP/templates/"
+          cp "$SRCOP/templates/helpers.tpl" "$DESTOP/templates/helpers.tpl"
+          touch "$DESTOP/values-dev.yaml" "$DESTOP/values-uat.yaml" "$DESTOP/values.yaml"
+          # Prepare <prefix>-instance
+          DESTINST="$PREFIX-instance"
+          if [ "${{ github.event.inputs.cluster_config_type }}" = "separate" ]; then
+            for cluster in azure hci; do
+              mkdir -p "$DESTINST/$cluster/base" "$DESTINST/$cluster/overlays"
+            done
+          else
+            mkdir -p "$DESTINST/base" "$DESTINST/overlays"
+          fi
+          # applicationset, applications, .github: only structure
+          mkdir -p applicationset applications .github
+          cd ..
+
+      - name: Initialize git and push to new repo
+        run: |
+          NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
+          cd "$NEWREPO"
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Initial OCP operator repo structure"
+          git branch -M main
+          git remote add origin https://github.com/${{ github.event.inputs.destination_repo }}.git
+          git push -u origin main
+
+      - name: Output summary
+        run: |
+          echo "Repository ${{ github.event.inputs.destination_repo }} created and initialized with OCP operator structure using prefix ${{ github.event.inputs.folder_prefix }}." 
