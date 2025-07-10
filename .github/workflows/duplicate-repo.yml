@@ -96,3 +96,41 @@ jobs:
       - name: Output summary
         run: |
           echo "Repository ${{ github.event.inputs.destination_repo }} created and initialized with structure, collaborators, branch protection, README, CODEOWNERS, and CI workflow." 
+
+name: Auto Release on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - stable
+
+jobs:
+  tag_release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          git fetch --tags
+          TAG=$(git tag --sort=-v:refname | head -n 1)
+          echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Bump tag and create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Bump tag (simple: v1, v2, v3, ...)
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+          if [[ "$LATEST_TAG" =~ ^v([0-9]+)$ ]]; then
+            NEXT_TAG="v$(( ${BASH_REMATCH[1]} + 1 ))"
+          else
+            NEXT_TAG="v1"
+          fi
+          git tag "$NEXT_TAG"
+          git push origin "$NEXT_TAG"
+          gh release create "$NEXT_TAG" --generate-notes --title "Release $NEXT_TAG" 

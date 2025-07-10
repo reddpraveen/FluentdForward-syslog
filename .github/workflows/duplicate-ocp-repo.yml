@@ -7,6 +7,7 @@ on:
         description: 'Source repository (owner/repo)'
         required: true
         type: string
+        default: RHVaultSecretsOperator
       destination_repo:
         description: 'Destination repository (owner/new-repo)'
         required: true
@@ -33,8 +34,20 @@ jobs:
       - name: Set up GitHub CLI
         uses: cli/cli-action@v2
 
-      - name: Create destination repository
+      - name: Check if destination repository exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
         run: |
+          if gh repo view ${{ github.event.inputs.destination_repo }} > /dev/null 2>&1; then
+            echo "ERROR: Repository ${{ github.event.inputs.destination_repo }} already exists."
+            exit 1
+          fi
+
+      - name: Create destination repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+        run: |
+          gh auth login --with-token < $GH_TOKEN
           gh repo create ${{ github.event.inputs.destination_repo }} --public --confirm
 
       - name: Clone source repository
@@ -43,7 +56,7 @@ jobs:
 
       - name: Prepare new repo structure
         run: |
-          set -e
+          set -euo pipefail
           NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
           SRCREPO=$(basename "${{ github.event.inputs.source_repo }}")
           PREFIX="${{ github.event.inputs.folder_prefix }}"
@@ -51,9 +64,102 @@ jobs:
           cd "$NEWREPO"
           # Create top-level folders
           mkdir applications applicationset .github "$PREFIX-instance" "$PREFIX-operator"
-          touch .gitignore
-          # Create README.md
+          # Create .gitignore with <prefix>-operator/charts
+          echo "${PREFIX}-operator/charts" > .gitignore
+          # Create README.md for dev/initial and stable
           echo "# $NEWREPO\n\nrepo used by team to manage installation and configuration of OCP operators." > README.md
+          # Create CODEOWNERS
+          mkdir -p .github
+          echo "# TODO: Add code owners here\n*       " > .github/CODEOWNERS
+          # Inject default CI workflow
+          mkdir -p .github/workflows
+          cat <<EOF > .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run a one-line script
+        run: echo "Hello, world!"
+EOF
+          # Inject auto-release workflow
+          cat <<EOF > .github/workflows/auto-release.yml
+name: Auto Release on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - stable
+
+jobs:
+  tag_release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get latest tag
+        id: get_tag
+        run: |
+          git fetch --tags
+          TAG=$(git tag --sort=-v:refname | head -n 1)
+          echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Bump tag and create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Bump tag (simple: v1, v2, v3, ...)
+          LATEST_TAG="${{ steps.get_tag.outputs.latest_tag }}"
+          if [[ "$LATEST_TAG" =~ ^v([0-9]+)$ ]]; then
+            NEXT_TAG="v$(( ${BASH_REMATCH[1]} + 1 ))"
+          else
+            NEXT_TAG="v1"
+          fi
+          git tag "$NEXT_TAG"
+          git push origin "$NEXT_TAG"
+          gh release create "$NEXT_TAG" --generate-notes --title "Release $NEXT_TAG"
+EOF
+          # Create applications/app-config and caas-appliation-instance.yaml
+          mkdir -p applications/app-config
+          cat <<EOF > applications/app-config/caas-appliation-instance.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: $NEWREPO
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/your-org/$NEWREPO.git'
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+          # Create applications/base and applications/overlays, each with kustomization.yaml and instance.yaml
+          create_kustomize_dir() {
+            local dir=$1
+            mkdir -p "$dir"
+            touch "$dir/instance.yaml"
+            cat <<EOY > "$dir/kustomization.yaml"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - instance.yaml
+EOY
+          }
+          create_kustomize_dir applications/base
+          create_kustomize_dir applications/overlays
           # Prepare <prefix>-operator
           SRCOP=../source-repo/${SRCREPO}-operator
           DESTOP="$PREFIX-operator"
@@ -64,21 +170,68 @@ jobs:
           cp -r "$SRCOP/templates/." "$DESTOP/templates/"
           cp "$SRCOP/templates/helpers.tpl" "$DESTOP/templates/helpers.tpl"
           touch "$DESTOP/values-dev.yaml" "$DESTOP/values-uat.yaml" "$DESTOP/values.yaml"
-          # Prepare <prefix>-instance
+          # Prepare <prefix>-instance with overlays logic, each with kustomization.yaml and instance.yaml
           DESTINST="$PREFIX-instance"
           if [ "${{ github.event.inputs.cluster_config_type }}" = "separate" ]; then
             for cluster in azure hci; do
-              mkdir -p "$DESTINST/$cluster/base" "$DESTINST/$cluster/overlays"
+              create_kustomize_dir "$DESTINST/$cluster/base"
+              create_kustomize_dir "$DESTINST/$cluster/overlays"
             done
           else
-            mkdir -p "$DESTINST/base" "$DESTINST/overlays"
+            create_kustomize_dir "$DESTINST/base"
+            create_kustomize_dir "$DESTINST/overlays"
           fi
-          # applicationset, applications, .github: only structure
-          mkdir -p applicationset applications .github
+          # Create applicationset with a sample ApplicationSet definition
+          cat <<EOF > applicationset/sample-applicationset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ${NEWREPO}-set
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: in-cluster
+  template:
+    metadata:
+      name: ${NEWREPO}-appset
+    spec:
+      project: default
+      source:
+        repoURL: 'https://github.com/your-org/${NEWREPO}.git'
+        targetRevision: HEAD
+        path: .
+      destination:
+        server: 'https://kubernetes.default.svc'
+        namespace: default
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+EOF
           cd ..
 
-      - name: Initialize git and push to new repo
+      - name: Create and push master branch (README only)
         run: |
+          set -euo pipefail
+          NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
+          mkdir master-tmp
+          echo "# $NEWREPO\n\nrepo used by team to manage installation and configuration of OCP operators." > master-tmp/README.md
+          cd master-tmp
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add README.md
+          git commit -m "Initial README for master branch"
+          git branch -M master
+          git remote add origin https://github.com/${{ github.event.inputs.destination_repo }}.git
+          git push -u origin master
+          cd ..
+
+      - name: Create and push dev/initial branch (full structure)
+        run: |
+          set -euo pipefail
           NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
           cd "$NEWREPO"
           git init
@@ -86,10 +239,77 @@ jobs:
           git config user.email "github-actions@github.com"
           git add .
           git commit -m "Initial OCP operator repo structure"
-          git branch -M main
+          git branch -M dev/initial
           git remote add origin https://github.com/${{ github.event.inputs.destination_repo }}.git
-          git push -u origin main
+          git push -u origin dev/initial
+          cd ..
 
-      - name: Output summary
+      - name: Create and push stable branch (full structure)
         run: |
-          echo "Repository ${{ github.event.inputs.destination_repo }} created and initialized with OCP operator structure using prefix ${{ github.event.inputs.folder_prefix }}." 
+          set -euo pipefail
+          NEWREPO=$(basename "${{ github.event.inputs.destination_repo }}")
+          cp -r "$NEWREPO" stable-tmp
+          cd stable-tmp
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Initial OCP operator repo structure for stable"
+          git branch -M stable
+          git remote add origin https://github.com/${{ github.event.inputs.destination_repo }}.git
+          git push -u origin stable
+          cd ..
+
+      - name: Copy repo settings (description, topics, visibility)
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+        run: |
+          DESC=$(gh api repos/${{ github.event.inputs.source_repo }} --jq '.description')
+          TOPICS=$(gh api repos/${{ github.event.inputs.source_repo }}/topics --jq '.names | join(",")')
+          VISIBILITY=$(gh api repos/${{ github.event.inputs.source_repo }} --jq '.visibility')
+          gh repo edit ${{ github.event.inputs.destination_repo }} --description "$DESC" --visibility "$VISIBILITY"
+          if [ -n "$TOPICS" ]; then
+            gh repo edit ${{ github.event.inputs.destination_repo }} --add-topic $TOPICS
+          fi
+
+      - name: Copy collaborators from source to destination
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+        run: |
+          COLLABS=$(gh api repos/${{ github.event.inputs.source_repo }}/collaborators --jq '.[] | .login')
+          for user in $COLLABS; do
+            gh api repos/${{ github.event.inputs.destination_repo }}/collaborators/$user -X PUT -f permission=push
+          done
+
+      - name: Copy branch protection rules from source to destination
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+        run: |
+          BRANCHES=$(gh api repos/${{ github.event.inputs.source_repo }}/branches --jq '.[].name')
+          for branch in $BRANCHES; do
+            PROTECTION=$(gh api repos/${{ github.event.inputs.source_repo }}/branches/$branch/protection || echo '{}')
+            if [ "$PROTECTION" != '{}' ]; then
+              gh api repos/${{ github.event.inputs.destination_repo }}/branches/$branch/protection \
+                --method PUT \
+                --input <(echo "$PROTECTION")
+            fi
+          done
+
+      - name: Create PR from dev/initial to stable
+        env:
+          GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+        run: |
+          gh pr create \
+            --base stable \
+            --head dev/initial \
+            --title "Initial PR: dev/initial → stable" \
+            --body "Automated PR from dev/initial to stable. Please review and approve to merge into stable."
+
+      - name: Output detailed summary
+        run: |
+          echo "Repository ${{ github.event.inputs.destination_repo }} created and initialized with master (README only), dev/initial (full structure), and stable (full structure) branches."
+          echo "- PR created from dev/initial to stable."
+          echo "- Repo settings (description, topics, visibility) copied."
+          echo "- Collaborators copied."
+          echo "- Branch protection rules copied."
+          echo "- CODEOWNERS, CI workflow, Application, ApplicationSet, kustomization.yaml, and instance.yaml files created." 
