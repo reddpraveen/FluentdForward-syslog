@@ -8,7 +8,7 @@ echo "======================================================================="
 # Get LokiStack configuration
 echo "LokiStack Configuration:"
 echo "----------------------"
-oc get lokistack instance -n openshift-logging -o yaml | grep -A 15 "size:"
+oc get lokistack logging-loki -n openshift-logging -o yaml | grep -A 15 "size:"
 
 # Check current ingester count
 echo ""
@@ -24,7 +24,7 @@ echo "---------------------------"
 echo "Node Name,Ingesters,CPU Request,Memory Request"
 echo "-------------------------------------------"
 
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   INGESTERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-ingester" | wc -l)
   
   if [ $INGESTERS -gt 0 ]; then
@@ -56,7 +56,7 @@ fi
 echo ""
 echo "Nodes without Ingesters (Potential Candidates for Scaling Down):"
 echo "------------------------------------------------------------"
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   INGESTERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-ingester" | wc -l)
   if [ $INGESTERS -eq 0 ]; then
     echo "$node (No Ingesters)"
@@ -67,7 +67,7 @@ done
 echo ""
 echo "Nodes with Only One Ingester (Use Caution When Scaling Down):"
 echo "---------------------------------------------------------"
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   INGESTERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-ingester" | wc -l)
   if [ $INGESTERS -eq 1 ]; then
     echo "$node (One Ingester)"
@@ -78,7 +78,7 @@ done
 echo ""
 echo "Nodes with Multiple Ingesters (Avoid Scaling Down):"
 echo "------------------------------------------------"
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   INGESTERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-ingester" | wc -l)
   if [ $INGESTERS -gt 1 ]; then
     echo "$node ($INGESTERS Ingesters)"

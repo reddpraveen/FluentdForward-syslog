@@ -2,12 +2,22 @@
 
 set -e
 
-echo "====================================================="
-echo "COMPREHENSIVE ANALYSIS OF LOGGING NODES FOR SCALING DOWN"
-echo "====================================================="
-echo "This script will analyze your logging nodes to determine"
-echo "which ones can be safely scaled down for ODF migration."
-echo ""
+# Create output directory if it doesn't exist
+OUTPUT_DIR="logging-analysis-$(date +%Y%m%d-%H%M%S)"
+mkdir -p $OUTPUT_DIR
+
+# Function to log output to both screen and file
+log_output() {
+  echo "$1" | tee -a "$OUTPUT_DIR/analysis.log"
+}
+
+log_output "====================================================="
+log_output "COMPREHENSIVE ANALYSIS OF LOGGING NODES FOR SCALING DOWN"
+log_output "====================================================="
+log_output "This script will analyze your logging nodes to determine"
+log_output "which ones can be safely scaled down for ODF migration."
+log_output "Output is being saved to: $OUTPUT_DIR/analysis.log"
+log_output ""
 
 # Make scripts executable
 chmod +x check-logging-nodes-resources.sh
@@ -16,66 +26,73 @@ chmod +x check-node-utilization.sh
 chmod +x check-loki-distribution.sh
 
 # Run all analysis scripts
-echo "1. Checking allocated resources for logging nodes..."
-echo "--------------------------------------------------"
-./check-logging-nodes-resources.sh
+log_output "1. Checking allocated resources for logging nodes..."
+log_output "--------------------------------------------------"
+./check-logging-nodes-resources.sh | tee -a "$OUTPUT_DIR/resources.log"
 
-echo ""
-echo "2. Analyzing Loki component distribution..."
-echo "----------------------------------------"
-./analyze-loki-distribution.sh
+log_output ""
+log_output "2. Analyzing Loki component distribution..."
+log_output "----------------------------------------"
+./analyze-loki-distribution.sh | tee -a "$OUTPUT_DIR/distribution.log"
 
-echo ""
-echo "3. Checking resource utilization for logging nodes..."
-echo "------------------------------------------------"
-./check-node-utilization.sh
+log_output ""
+log_output "3. Checking resource utilization for logging nodes..."
+log_output "------------------------------------------------"
+./check-node-utilization.sh | tee -a "$OUTPUT_DIR/utilization.log"
 
-echo ""
-echo "4. Checking Loki distribution for 1x medium LokiStack with 4 ingesters..."
-echo "-------------------------------------------------------------------"
-./check-loki-distribution.sh
+log_output ""
+log_output "4. Checking Loki distribution for 1x medium LokiStack with 4 ingesters..."
+log_output "-------------------------------------------------------------------"
+./check-loki-distribution.sh | tee -a "$OUTPUT_DIR/loki-distribution.log"
 
-echo ""
-echo "====================================================="
-echo "SUMMARY OF FINDINGS AND RECOMMENDATIONS"
-echo "====================================================="
-echo "Based on the analysis above, here are the key findings:"
-echo ""
+log_output ""
+log_output "====================================================="
+log_output "SUMMARY OF FINDINGS AND RECOMMENDATIONS"
+log_output "====================================================="
+log_output "Based on the analysis above, here are the key findings:"
+log_output ""
 
 # Identify potential candidates for scaling down
-echo "Potential Candidates for Scaling Down:"
-echo "-----------------------------------"
-echo "1. Nodes with low CPU and memory utilization"
-echo "2. Nodes without Loki ingesters"
-echo "3. Nodes with minimal Loki components"
-echo ""
+log_output "Potential Candidates for Scaling Down:"
+log_output "-----------------------------------"
+log_output "1. Nodes with low CPU and memory utilization"
+log_output "2. Nodes without Loki ingesters"
+log_output "3. Nodes with minimal Loki components"
+log_output ""
 
 # Identify nodes to avoid scaling down
-echo "Nodes to Avoid Scaling Down:"
-echo "-------------------------"
-echo "1. Nodes with critical Loki components like compactors"
-echo "2. Nodes with multiple ingesters"
-echo "3. Nodes with high resource utilization"
-echo ""
+log_output "Nodes to Avoid Scaling Down:"
+log_output "-------------------------"
+log_output "1. Nodes with critical Loki components like compactors"
+log_output "2. Nodes with multiple ingesters"
+log_output "3. Nodes with high resource utilization"
+log_output ""
 
 # Final recommendations
-echo "Final Recommendations:"
-echo "-------------------"
-echo "1. Prioritize scaling down nodes without ingesters"
-echo "2. If you must scale down a node with one ingester, ensure you have enough capacity on other nodes"
-echo "3. Never scale down a node with multiple ingesters"
-echo "4. Ensure you maintain at least 4 ingesters for your 1x medium LokiStack"
-echo "5. Consider the impact on data availability and query performance"
-echo ""
-echo "Note: Before scaling down, ensure you have enough resources on the remaining nodes"
-echo "      to handle the workload of the removed nodes."
-echo ""
-echo "====================================================="
-echo "NEXT STEPS"
-echo "====================================================="
-echo "1. Review the analysis above to identify potential nodes for scaling down"
-echo "2. Verify that scaling down these nodes won't impact your LokiStack"
-echo "3. Plan the scaling down process to minimize disruption"
-echo "4. After scaling down, scale up your ODF machineset with the freed resources"
-echo ""
-echo "For more detailed information, refer to the individual analysis sections above." 
+log_output "Final Recommendations:"
+log_output "-------------------"
+log_output "1. Prioritize scaling down nodes without ingesters"
+log_output "2. If you must scale down a node with one ingester, ensure you have enough capacity on other nodes"
+log_output "3. Never scale down a node with multiple ingesters"
+log_output "4. Ensure you maintain at least 4 ingesters for your 1x medium LokiStack"
+log_output "5. Consider the impact on data availability and query performance"
+log_output ""
+log_output "Note: Before scaling down, ensure you have enough resources on the remaining nodes"
+log_output "      to handle the workload of the removed nodes."
+log_output ""
+log_output "====================================================="
+log_output "NEXT STEPS"
+log_output "====================================================="
+log_output "1. Review the analysis above to identify potential nodes for scaling down"
+log_output "2. Verify that scaling down these nodes won't impact your LokiStack"
+log_output "3. Plan the scaling down process to minimize disruption"
+log_output "4. After scaling down, scale up your ODF machineset with the freed resources"
+log_output ""
+log_output "For more detailed information, refer to the individual analysis sections above."
+log_output ""
+log_output "Analysis complete. Results saved to: $OUTPUT_DIR/analysis.log"
+log_output "Individual component logs saved to:"
+log_output "  - $OUTPUT_DIR/resources.log"
+log_output "  - $OUTPUT_DIR/distribution.log"
+log_output "  - $OUTPUT_DIR/utilization.log"
+log_output "  - $OUTPUT_DIR/loki-distribution.log" 

@@ -8,7 +8,7 @@ echo "============================================================="
 # Get LokiStack configuration
 echo "LokiStack Configuration:"
 echo "----------------------"
-oc get lokistack instance -n openshift-logging -o yaml | grep -A 15 "size:"
+oc get lokistack logging-loki -n openshift-logging -o yaml | grep -A 15 "size:"
 
 # Get all Loki pods and their resource requests
 echo ""
@@ -23,7 +23,7 @@ echo "----------------------------------"
 echo "Node Name,Ingesters,Queriers,Compactors,Distributors,Total Components"
 echo "-------------------------------------------------------------------"
 
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   INGESTERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-ingester" | wc -l)
   QUERIERS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-querier" | wc -l)
   COMPACTORS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-compactor" | wc -l)

@@ -6,7 +6,7 @@ echo "Checking allocated resources for logging nodes..."
 
 # Get all logging nodes
 echo "Getting list of logging nodes..."
-LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging=true -o name)
+LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging='' -o name)
 
 echo "Node Name,CPU Allocated (cores),Memory Allocated (Mi),Pods Running,Loki Ingesters,Loki Queriers,Loki Compactors,Loki Distributors"
 echo "--------------------------------------------------------------------------------------------------------"
@@ -33,7 +33,7 @@ done
 echo ""
 echo "Checking LokiStack configuration..."
 echo "----------------------------------"
-oc get lokistack instance -n openshift-logging -o yaml | grep -A 10 "size:"
+oc get lokistack logging-loki -n openshift-logging -o yaml | grep -A 10 "size:"
 
 echo ""
 echo "Checking Loki component resource requests..."

@@ -6,7 +6,7 @@ echo "Checking resource utilization for logging nodes..."
 echo "==============================================="
 
 # Get all logging nodes
-LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging=true -o name)
+LOGGING_NODES=$(oc get nodes -l node-role.kubernetes.io/logging='' -o name)
 
 echo "Node Name,CPU Utilization %,Memory Utilization %,CPU Allocated (cores),Memory Allocated (Mi),CPU Capacity (cores),Memory Capacity (Mi)"
 echo "----------------------------------------------------------------------------------------------------------------------------"
@@ -15,8 +15,8 @@ for node in $LOGGING_NODES; do
   NODE_NAME=$(echo $node | cut -d'/' -f2)
   
   # Get CPU and memory utilization
-  CPU_UTIL=$(oc top node $NODE_NAME --no-headers | awk '{print $3}' | sed 's/%//')
-  MEM_UTIL=$(oc top node $NODE_NAME --no-headers | awk '{print $5}' | sed 's/%//')
+  CPU_UTIL=$(oc adm top node $NODE_NAME --no-headers | awk '{print $3}' | sed 's/%//')
+  MEM_UTIL=$(oc adm top node $NODE_NAME --no-headers | awk '{print $5}' | sed 's/%//')
   
   # Get CPU and memory allocated
   CPU_ALLOCATED=$(oc describe $node | grep -A 5 "Allocated resources:" | grep "cpu" | awk '{print $2}' | sed 's/(//' | sed 's/)//')
@@ -33,19 +33,19 @@ done
 echo ""
 echo "Nodes with Low Utilization (Potential Candidates for Scaling Down):"
 echo "----------------------------------------------------------------"
-oc top nodes -l node-role.kubernetes.io/logging=true --sort-by=cpu | grep -v "NAME" | awk '$3 < 30 {print $1 " (CPU: " $3 "%, MEM: " $5 "%)"}'
+oc adm top nodes -l node-role.kubernetes.io/logging='' --sort-by=cpu | grep -v "NAME" | awk '$3 < 30 {print $1 " (CPU: " $3 "%, MEM: " $5 "%)"}'
 
 # Check for nodes with high utilization
 echo ""
 echo "Nodes with High Utilization (Avoid Scaling Down):"
 echo "----------------------------------------------"
-oc top nodes -l node-role.kubernetes.io/logging=true --sort-by=cpu | grep -v "NAME" | awk '$3 > 70 {print $1 " (CPU: " $3 "%, MEM: " $5 "%)"}'
+oc adm top nodes -l node-role.kubernetes.io/logging='' --sort-by=cpu | grep -v "NAME" | awk '$3 > 70 {print $1 " (CPU: " $3 "%, MEM: " $5 "%)"}'
 
 # Check for nodes with critical Loki components
 echo ""
 echo "Nodes with Critical Loki Components (Avoid Scaling Down):"
 echo "-----------------------------------------------------"
-for node in $(oc get nodes -l node-role.kubernetes.io/logging=true -o name | cut -d'/' -f2); do
+for node in $(oc get nodes -l node-role.kubernetes.io/logging='' -o name | cut -d'/' -f2); do
   COMPACTORS=$(oc get pods -n openshift-logging -o wide | grep $node | grep "loki-compactor" | wc -l)
   if [ $COMPACTORS -gt 0 ]; then
     echo "$node (Has Compactor)"
