@@ -26,7 +26,7 @@ This document describes the automated workflow for creating new OCP operator man
 - **Initial PR**: Automatically created from dev/initial to stable for manual review and merge.
 
 ## Folder and File Structure
-- `applications/app-config/caas-appliation-instance.yaml`: ArgoCD Application, with new repo name.
+- `applications/app-config/appliation-instance.yaml`: ArgoCD Application, with new repo name.
 - `applications/base`, `applications/overlays`: Each with kustomization.yaml (referencing instance.yaml) and an empty instance.yaml.
 - `applicationset/sample-applicationset.yaml`: Sample ApplicationSet, with new repo name.
 - `<prefix>-operator/`: Chart.lock, Chart.yaml, README.md (with new repo name), templates/, empty values-dev.yaml, values-uat.yaml, values.yaml.
