@@ -51,3 +51,250 @@ data:
         # allow guest authentication for now
         guest:
           dangerouslyAllowOutsideDevelopment: true
+
+
+
+
+
+
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-backstage-config-backend-base-urls
+data:
+  "app-config.backend-base-urls.yaml": |
+    #app:
+      # As of 0.6 (RHDH 1.6), this is not needed on OCP by default, but needed on other platforms
+    #  baseUrl: https://my-rhdh.example.com
+    #backend:
+    #  # As of 0.6 (RHDH 1.6), this is not needed on OCP by default, but needed on other platforms
+    #  baseUrl: https://my-rhdh.example.com
+    #  cors:
+    #    # As of 0.6 (RHDH 1.6), this is not needed on OCP by default, but needed on other platforms
+    #    origin: https://my-rhdh.example.com
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-backstage-config-backend-auth
+data:
+  "app-config.backend-auth.yaml": |
+    backend:
+      auth:
+        externalAccess:
+          - type: legacy
+            options:
+              subject: legacy-default-config
+              secret: "${BACKEND_SECRET}"
+    auth:
+      environment: development
+      providers:
+        guest:
+          # using the guest user to query the '/api/dynamic-plugins-info/loaded-plugins' endpoint.
+          dangerouslyAllowOutsideDevelopment: true
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-backstage-backend-auth-secret
+stringData:
+  # generated with the command below (from https://backstage.io/docs/auth/service-to-service-auth/#setup):
+  # node -p 'require("crypto").randomBytes(24).toString("base64")'
+  BACKEND_SECRET: "R2FxRVNrcmwzYzhhN3l0V1VRcnQ3L1pLT09WaVhDNUEK" # notsecret
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-backstage-config-cm1
+data:
+  app-config1-cm1.db.yaml: |
+    backend:
+      database:
+        connection:
+          password: ${POSTGRESQL_PASSWORD}
+          user: ${POSTGRESQL_USER}
+  app-config2-cm1.yaml: |
+    # Some comment in this file
+  app-config3-cm1.odo.yaml: |
+    catalog:
+      locations:
+        - type: url
+          target: https://github.com/ododev/odo-backstage-software-template/blob/main/template.yaml
+          rules:
+            - allow: [Template]
+    # # catalog.providers.githubOrg.default.orgUrl
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-backstage-config-cm2
+data:
+  app-config1-cm2.gh.yaml: |
+    auth:
+      # see https://backstage.io/docs/auth/ to learn about auth providers
+      environment: development
+      providers:
+        github:
+          development:
+            clientId: '${GH_CLIENT_ID}'
+            clientSecret: '${GH_CLIENT_SECRET}'
+  app-config2-cm2.yaml: |
+    # a comment
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-dynamic-plugins-config-cm
+data:
+  dynamic-plugins.yaml: |
+    includes:
+      - dynamic-plugins.default.yaml
+    plugins:
+      - package: ./dynamic-plugins/dist/roadiehq-scaffolder-backend-module-utils-dynamic
+        disabled: false
+      - package: './dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-dynamic'
+        disabled: false
+        pluginConfig:
+          catalog:
+            providers:
+              github:
+                myorg:
+                  organization: '${GITHUB_ORG}'
+                  schedule:
+                    # supports cron, ISO duration, "human duration" (used below)
+                    frequency: { minutes: 30}
+                    # supports ISO duration, "human duration (used below)
+                    timeout: { minutes: 3}
+                    initialDelay: { seconds: 15}
+      - package: ./dynamic-plugins/dist/backstage-plugin-techdocs-backend-dynamic
+        disabled: false
+        pluginConfig:
+          # Reference documentation https://backstage.io/docs/features/techdocs/configuration
+          # Note: After experimenting with basic setup, use CI/CD to generate docs
+          # and an external cloud storage when deploying TechDocs for production use-case.
+          # https://backstage.io/docs/features/techdocs/how-to-guides#how-to-migrate-from-techdocs-basic-to-recommended-deployment-approach
+          techdocs:
+            builder: local
+            generator:
+              runIn: local
+            publisher:
+              type: local
+      - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-gitlab-dynamic
+        disabled: false
+        pluginConfig:
+          catalog:
+            providers:
+              gitlab: {}
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-env-cm-1
+data:
+  CM_ENV1: "cm env 1"
+  CM_ENV2: "cm env 2"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-env-cm-11
+data:
+  CM_ENV11: "cm env 11"
+  CM_ENV12: "cm env 12"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-gh-auth-secret
+stringData:
+  GH_CLIENT_ID: "my GH client ID"
+  GH_CLIENT_SECRET: "my GH client secret"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-backstage-extra-files-cm1
+data:
+  cm_file1.txt: |
+    # From ConfigMap
+    Lorem Ipsum
+    Dolor Sit Amet
+  cm_file2.properties: |
+    conf.x=y
+    conf.y=z
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-backstage-extra-files-secret1
+stringData:
+  secret_file1.txt: |
+    # From Secret
+    Lorem Ipsum
+    Dolor Sit Amet
+  secret_file2.properties: |
+    sec.a=b
+    sec.b=c
+  secrets.prod.yaml: |
+    appId: 1
+    webhookUrl: https://smee.io/foo
+    clientId: someGithubAppClientId
+    clientSecret: someGithubAppClientSecret
+    webhookSecret: someWebhookSecret
+    privateKey: |
+      SomeRsaPrivateKey
+
+---
+apiVersion: rhdh.redhat.com/v1alpha4
+kind: Backstage
+metadata:
+  name: bs-app-config
+spec:
+  database:
+    enableLocalDb: true
+  deployment:
+    patch:
+      spec:
+        replicas: 1
+  application:
+    appConfig:
+      configMaps:
+        - name: "my-backstage-config-backend-base-urls"
+        - name: "my-backstage-config-backend-auth"
+        - name: "my-backstage-config-cm1"
+        - name: "my-backstage-config-cm2"
+          key: "app-config1-cm2.gh.yaml"
+    dynamicPluginsConfigMapName: "my-dynamic-plugins-config-cm"
+    extraFiles:
+      mountPath: /tmp/my-extra-files
+      configMaps:
+        - name: "my-backstage-extra-files-cm1"
+      secrets:
+        - name: "my-backstage-extra-files-secret1"
+          key: secret_file1.txt
+    extraEnvs:
+      envs:
+        - name: GITHUB_ORG
+          value: 'my-gh-org'
+        - name: MY_ENV_VAR_2
+          value: my-value-2
+      configMaps:
+        - name: my-env-cm-1
+        - name: my-env-cm-11
+          key: CM_ENV11
+      secrets:
+        - name: "my-backstage-backend-auth-secret"
+          key: BACKEND_SECRET
+        - name: my-gh-auth-secret
