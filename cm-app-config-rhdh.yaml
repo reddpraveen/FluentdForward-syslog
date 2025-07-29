@@ -298,3 +298,165 @@ spec:
         - name: "my-backstage-backend-auth-secret"
           key: BACKEND_SECRET
         - name: my-gh-auth-secret
+
+
+
+
+
+First, Extract Credentials from OpenShift Secret
+bash# Extract vCenter credentials from OpenShift secret
+export GOVC_URL=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.server}' | base64 -d)
+export GOVC_USERNAME=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.username}' | base64 -d)
+export GOVC_PASSWORD=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.password}' | base64 -d)
+export GOVC_INSECURE=true  # Usually needed for OpenShift vSphere setups
+
+# Verify connection
+govc about
+Alternative: One-liner Setup
+bash# Set all govc environment variables in one command
+eval $(oc get secret vsphere-creds -n openshift-config -o json | jq -r '.data | to_entries[] | "export GOVC_" + (.key | ascii_upcase | gsub("\\."; "_")) + "=" + (.value | @base64d)')
+export GOVC_INSECURE=true
+Check VMs Missing CTK Options
+bash# List all VMs and check for CTK configuration
+echo "=== VMs Missing CTK Configuration ==="
+govc find . -type m | while read vm; do
+    vm_name=$(basename "$vm")
+    echo "Checking: $vm_name"
+    
+    # Get extra config for the VM
+    ctk_main=$(govc vm.info -e "$vm" 2>/dev/null | grep "^ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+    ctk_scsi=$(govc vm.info -e "$vm" 2>/dev/null | grep "^scsi0:0.ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+    
+    # Check if CTK is missing or not set to TRUE
+    if [[ "$ctk_main" != "TRUE" ]] || [[ "$ctk_scsi" != "TRUE" ]]; then
+        echo "❌ VM: $vm_name"
+        echo "   ctkEnabled: ${ctk_main:-MISSING}"
+        echo "   scsi0:0.ctkEnabled: ${ctk_scsi:-MISSING}"
+        echo "   ---"
+    fi
+done
+More Comprehensive CTK Check Script
+bash#!/bin/bash
+# Script: check_ctk_status.sh
+
+# Setup govc credentials from OpenShift
+setup_govc() {
+    echo "Setting up govc credentials from OpenShift secret..."
+    export GOVC_URL=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.server}' | base64 -d)
+    export GOVC_USERNAME=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.username}' | base64 -d)
+    export GOVC_PASSWORD=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.password}' | base64 -d)
+    export GOVC_INSECURE=true
+    
+    # Test connection
+    if ! govc about >/dev/null 2>&1; then
+        echo "Failed to connect to vCenter"
+        exit 1
+    fi
+    echo "Connected to vCenter: $GOVC_URL"
+}
+
+# Check CTK status for all VMs
+check_ctk_status() {
+    echo -e "\n=== CTK Status Report ==="
+    echo -e "VM Name\t\t\t\tctkEnabled\tscsi0:0.ctkEnabled\tStatus"
+    echo -e "-------\t\t\t\t----------\t----------------\t------"
+    
+    govc find . -type m | while read vm; do
+        vm_name=$(basename "$vm")
+        
+        # Get VM extra configuration
+        vm_config=$(govc vm.info -e "$vm" 2>/dev/null)
+        ctk_main=$(echo "$vm_config" | grep "^ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+        ctk_scsi=$(echo "$vm_config" | grep "^scsi0:0.ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+        
+        # Determine status
+        if [[ "$ctk_main" == "TRUE" ]] && [[ "$ctk_scsi" == "TRUE" ]]; then
+            status="✅ ENABLED"
+        elif [[ -n "$ctk_main" ]] || [[ -n "$ctk_scsi" ]]; then
+            status="⚠️  PARTIAL"
+        else
+            status="❌ MISSING"
+        fi
+        
+        printf "%-30s\t%-10s\t%-16s\t%s\n" \
+            "$vm_name" \
+            "${ctk_main:-MISSING}" \
+            "${ctk_scsi:-MISSING}" \
+            "$status"
+    done
+}
+
+# Main execution
+setup_govc
+check_ctk_status
+Filter for OpenShift Worker Nodes Only
+bash# Check CTK status specifically for OpenShift worker nodes
+echo "=== OpenShift Worker Nodes CTK Status ==="
+govc find . -type m | grep -E "(worker|rhcos)" | while read vm; do
+    vm_name=$(basename "$vm")
+    
+    # Get power state
+    power_state=$(govc vm.info "$vm" | grep "Power state:" | cut -d: -f2 | tr -d ' ')
+    
+    # Get CTK configuration
+    ctk_main=$(govc vm.info -e "$vm" 2>/dev/null | grep "^ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+    ctk_scsi=$(govc vm.info -e "$vm" 2>/dev/null | grep "^scsi0:0.ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+    
+    if [[ "$ctk_main" != "TRUE" ]] || [[ "$ctk_scsi" != "TRUE" ]]; then
+        echo "Worker Node: $vm_name (Power: $power_state)"
+        echo "  ctkEnabled: ${ctk_main:-MISSING}"
+        echo "  scsi0:0.ctkEnabled: ${ctk_scsi:-MISSING}"
+        echo "  Host: $(govc vm.info "$vm" | grep "Host:" | cut -d: -f2 | tr -d ' ')"
+        echo "  ---"
+    fi
+done
+Export Results to File
+bash# Create detailed report and save to file
+{
+    echo "CTK Status Report - $(date)"
+    echo "=================================="
+    echo ""
+    
+    govc find . -type m | while read vm; do
+        vm_name=$(basename "$vm")
+        vm_info=$(govc vm.info "$vm")
+        vm_config=$(govc vm.info -e "$vm" 2>/dev/null)
+        
+        power_state=$(echo "$vm_info" | grep "Power state:" | cut -d: -f2 | tr -d ' ')
+        host=$(echo "$vm_info" | grep "Host:" | cut -d: -f2 | tr -d ' ')
+        ctk_main=$(echo "$vm_config" | grep "^ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+        ctk_scsi=$(echo "$vm_config" | grep "^scsi0:0.ctkEnabled:" | cut -d: -f2 | tr -d ' ')
+        
+        if [[ "$ctk_main" != "TRUE" ]] || [[ "$ctk_scsi" != "TRUE" ]]; then
+            echo "VM: $vm_name"
+            echo "  Power State: $power_state"
+            echo "  Host: $host"
+            echo "  ctkEnabled: ${ctk_main:-MISSING}"
+            echo "  scsi0:0.ctkEnabled: ${ctk_scsi:-MISSING}"
+            echo ""
+        fi
+    done
+} > ctk_missing_report.txt
+
+echo "Report saved to ctk_missing_report.txt"
+Quick Commands Summary
+bash# 1. Setup credentials
+export GOVC_URL=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.server}' | base64 -d)
+export GOVC_USERNAME=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.username}' | base64 -d)
+export GOVC_PASSWORD=$(oc get secret vsphere-creds -n openshift-config -o jsonpath='{.data.vcenter\.password}' | base64 -d)
+export GOVC_INSECURE=true
+
+# 2. Test connection
+govc about
+
+# 3. Quick CTK check
+govc find . -type m | xargs -I {} sh -c 'echo "=== {} ==="; govc vm.info -e "{}" | grep -E "(ctkEnabled|scsi.*ctkEnabled)"'
+Note: Make sure you have:
+
+oc CLI tool configured and logged into your OpenShift cluster
+govc CLI tool installed
+jq and base64 utilities available
+Proper permissions to access the vsphere-creds secret in the openshift-config namespace
+
+The secret is typically in openshift-config namespace, but if it's in a different namespace in your setup, adjust the namespace accordingly.
+
