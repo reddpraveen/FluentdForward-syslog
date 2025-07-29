@@ -1,3 +1,17 @@
+#!/bin/bash
+# Check CTK for specific cluster
+CLUSTER_NAME="ocp4prd-dfg"
+
+govc find . -type m | while read vm; do
+    cluster=$(govc vm.info "$vm" | grep "Cluster:" | cut -d: -f2 | tr -d ' ')
+    if [[ "$cluster" == "$CLUSTER_NAME" ]]; then
+        echo "=== $vm ==="
+        govc vm.info -e "$vm" | grep -E "(ctkEnabled|scsi.*ctkEnabled)"
+        echo ""
+    fi
+done
+
+
 kind: ConfigMap
 apiVersion: v1
 metadata:
