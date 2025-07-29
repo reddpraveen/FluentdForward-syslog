@@ -1,4 +1,18 @@
 #!/bin/bash
+# Check CTK for VMs in specific folder
+CLUSTER_NAME="ocp4prd-dfg"
+VM_FOLDER="/ddd/vm/$CLUSTER_NAME"
+
+echo "=== Checking CTK for VMs in folder: $VM_FOLDER ==="
+echo ""
+
+govc find "$VM_FOLDER" -type m | while read vm; do
+    echo "=== $vm ==="
+    govc vm.info -e "$vm" | grep -E "(ctkEnabled|scsi.*ctkEnabled)"
+    echo ""
+done
+
+#!/bin/bash
 # Check CTK for specific cluster
 CLUSTER_NAME="ocp4prd-dfg"
 
