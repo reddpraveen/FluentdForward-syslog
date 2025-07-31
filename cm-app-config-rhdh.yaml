@@ -1,3 +1,604 @@
+# Complete Operator-Based RHDH Ansible Plugin Implementation
+# Based on Red Hat Developer Learning Path - Converted from Helm to Operator
+
+## Prerequisites
+- RHDH Operator installed
+- OpenShift cluster access
+- Red Hat registry credentials
+- GitHub authentication configured
+
+---
+
+# STEP 1: Download and Setup Plugin Registry
+# ==========================================
+
+# 1.1: Create namespace for plugin registry
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rhdh-plugins
+
+---
+
+# 1.2: Create ImageStream for plugin registry
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: rhdh-plugin-registry
+  namespace: rhdh-plugins
+spec:
+  lookupPolicy:
+    local: true
+
+---
+
+# 1.3: Create BuildConfig for plugin registry
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: rhdh-plugin-registry-build
+  namespace: rhdh-plugins
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: rhdh-plugin-registry:latest
+  source:
+    type: Dockerfile
+    dockerfile: |
+      FROM registry.access.redhat.com/ubi8/httpd-24:latest
+      USER root
+      
+      # Create plugins directory
+      RUN mkdir -p /var/www/html/plugins
+      
+      # Copy plugin files (these will be added via ConfigMap)
+      COPY plugins/ /var/www/html/plugins/
+      
+      # Set permissions
+      RUN chown -R 1001:0 /var/www/html && \
+          chmod -R g+rw /var/www/html
+      
+      USER 1001
+      EXPOSE 8080
+  strategy:
+    type: Docker
+  triggers:
+    - type: ConfigChange
+
+---
+
+# 1.4: ConfigMap containing plugin files (simulating downloaded plugins)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ansible-plugin-files
+  namespace: rhdh-plugins
+data:
+  # These represent the extracted plugin files from the bundle
+  # In practice, you would download from access.redhat.com and extract
+  backstage-plugin-ansible-backend-1.0.0.tgz.integrity: |
+    sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH_FROM_DOWNLOADED_BUNDLE
+  module-backstage-rhaap-1.0.0.tgz.integrity: |
+    sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH_FROM_DOWNLOADED_BUNDLE
+  ansible-plugin-backstage-rhaap-backend-1.0.0.tgz.integrity: |
+    sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH_FROM_DOWNLOADED_BUNDLE
+
+---
+
+# 1.5: Service for plugin registry
+apiVersion: v1
+kind: Service
+metadata:
+  name: rhdh-plugin-registry
+  namespace: rhdh-plugins
+spec:
+  selector:
+    app: rhdh-plugin-registry
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+
+---
+
+# 1.6: Route for plugin registry
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: rhdh-plugin-registry
+  namespace: rhdh-plugins
+spec:
+  to:
+    kind: Service
+    name: rhdh-plugin-registry
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+
+---
+
+# STEP 2: Red Hat Registry Pull Secret
+# ===================================
+
+# 2.1: Secret for Red Hat registry access
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redhat-registry-secret
+  namespace: rhdh-system
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: |
+    # Base64 encoded Docker config for registry.redhat.io
+    # Replace with your actual Red Hat registry credentials
+    # Format: {"auths":{"registry.redhat.io":{"username":"your-username","password":"your-token","auth":"base64-encoded-username:password"}}}
+    # Use: echo -n '{"auths":{"registry.redhat.io":{"username":"USERNAME","password":"TOKEN","auth":"BASE64_USERNAME:TOKEN"}}}' | base64 -w 0
+    REPLACE_WITH_BASE64_ENCODED_DOCKER_CONFIG
+
+---
+
+# STEP 3: Main Application ConfigMap (app-config-rhdh equivalent)
+# ==============================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config-rhdh-ansible
+  namespace: rhdh-system
+data:
+  app-config.yaml: |
+    app:
+      title: Red Hat Developer Hub with Ansible
+      baseUrl: ${BACKEND_URL}
+
+    backend:
+      baseUrl: ${BACKEND_URL}
+      listen:
+        port: 7007
+      csp:
+        connect-src: ["'self'", 'http:', 'https:']
+      cors:
+        origin: ${BACKEND_URL}
+
+    # Authentication configuration
+    auth:
+      environment: development
+      providers:
+        github:
+          development:
+            clientId: ${GITHUB_CLIENT_ID}
+            clientSecret: ${GITHUB_CLIENT_SECRET}
+
+    # Integrations configuration
+    integrations:
+      github:
+        - host: github.com
+          token: ${GITHUB_TOKEN}
+
+    # Ansible Configuration (equivalent to Helm ansible: section)
+    ansible:
+      # Dev Spaces integration
+      devSpaces:
+        baseUrl: ${DEV_SPACES_URL}
+      
+      # Ansible Automation Platform integration
+      rhaap:
+        baseUrl: ${AAP_BASE_URL}
+        username: ${AAP_USERNAME}
+        password: ${AAP_PASSWORD}
+        
+      # Private Automation Hub integration
+      automationHub:
+        baseUrl: ${PAH_BASE_URL}
+        username: ${PAH_USERNAME}
+        password: ${PAH_PASSWORD}
+
+    # Catalog configuration for templates
+    catalog:
+      import:
+        entityFilename: catalog-info.yaml
+        pullRequestBranchName: backstage-integration
+      rules:
+        - allow: [Component, System, API, Resource, Location, Template]
+      locations:
+        # Ansible templates location
+        - type: url
+          target: https://github.com/your-org/ansible-templates/blob/main/catalog-info.yaml
+          rules:
+            - allow: [Template]
+
+    # Plugin configuration
+    dynamicPlugins:
+      frontend:
+        ansible.plugin-ansible:
+          appIcons:
+            - name: ansible
+              importName: AnsibleIcon
+          dynamicRoutes:
+            - path: /ansible
+              importName: AnsiblePage
+              menuItem:
+                icon: ansible
+                text: Ansible
+
+---
+
+# STEP 4: Dynamic Plugins Configuration
+# ====================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rhdh-dynamic-plugins-ansible
+  namespace: rhdh-system
+data:
+  dynamic-plugins.yaml: |
+    includes:
+      - dynamic-plugins.default.yaml
+    
+    plugins:
+      # Ansible backend plugin
+      - package: 'http://rhdh-plugin-registry-rhdh-plugins.apps.your-cluster.com/plugins/backstage-plugin-ansible-backend-1.0.0.tgz'
+        disabled: false
+        integrity: 'sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH'
+        pluginConfig:
+          ansible:
+            baseUrl: ${AAP_BASE_URL}
+            username: ${AAP_USERNAME}
+            password: ${AAP_PASSWORD}
+      
+      # RHAAP module
+      - package: 'http://rhdh-plugin-registry-rhdh-plugins.apps.your-cluster.com/plugins/module-backstage-rhaap-1.0.0.tgz'
+        disabled: false
+        integrity: 'sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH'
+      
+      # Ansible RHAAP backend
+      - package: 'http://rhdh-plugin-registry-rhdh-plugins.apps.your-cluster.com/plugins/ansible-plugin-backstage-rhaap-backend-1.0.0.tgz'
+        disabled: false
+        integrity: 'sha512-REPLACE_WITH_ACTUAL_INTEGRITY_HASH'
+      
+      # GitHub integration plugins
+      - package: '@backstage/plugin-catalog-backend-module-github@0.2.0'
+        disabled: false
+      
+      - package: '@backstage/plugin-scaffolder-backend-module-github@0.2.0'
+        disabled: false
+
+---
+
+# STEP 5: Environment Variables Secret
+# ===================================
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rhdh-ansible-env-vars
+  namespace: rhdh-system
+type: Opaque
+data:
+  # Base64 encode all these values
+  GITHUB_CLIENT_ID: REPLACE_WITH_BASE64_ENCODED_GITHUB_CLIENT_ID
+  GITHUB_CLIENT_SECRET: REPLACE_WITH_BASE64_ENCODED_GITHUB_CLIENT_SECRET
+  GITHUB_TOKEN: REPLACE_WITH_BASE64_ENCODED_GITHUB_TOKEN
+  AAP_BASE_URL: REPLACE_WITH_BASE64_ENCODED_AAP_URL
+  AAP_USERNAME: REPLACE_WITH_BASE64_ENCODED_AAP_USERNAME
+  AAP_PASSWORD: REPLACE_WITH_BASE64_ENCODED_AAP_PASSWORD
+  PAH_BASE_URL: REPLACE_WITH_BASE64_ENCODED_PAH_URL
+  PAH_USERNAME: REPLACE_WITH_BASE64_ENCODED_PAH_USERNAME
+  PAH_PASSWORD: REPLACE_WITH_BASE64_ENCODED_PAH_PASSWORD
+  DEV_SPACES_URL: REPLACE_WITH_BASE64_ENCODED_DEV_SPACES_URL
+  BACKEND_URL: REPLACE_WITH_BASE64_ENCODED_BACKEND_URL
+
+---
+
+# STEP 6: Main Backstage Instance Configuration
+# =============================================
+
+apiVersion: rhdh.redhat.com/v1alpha1
+kind: Backstage
+metadata:
+  name: rhdh-ansible-instance
+  namespace: rhdh-system
+spec:
+  application:
+    # App configuration
+    appConfig:
+      configMaps:
+        - name: app-config-rhdh-ansible
+    
+    # Environment variables
+    extraEnvs:
+      envs:
+        - name: BACKEND_URL
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: BACKEND_URL
+        - name: GITHUB_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: GITHUB_CLIENT_ID
+        - name: GITHUB_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: GITHUB_CLIENT_SECRET
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: GITHUB_TOKEN
+        - name: AAP_BASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: AAP_BASE_URL
+        - name: AAP_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: AAP_USERNAME
+        - name: AAP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: AAP_PASSWORD
+        - name: PAH_BASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: PAH_BASE_URL
+        - name: PAH_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: PAH_USERNAME
+        - name: PAH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: PAH_PASSWORD
+        - name: DEV_SPACES_URL
+          valueFrom:
+            secretKeyRef:
+              name: rhdh-ansible-env-vars
+              key: DEV_SPACES_URL
+    
+    # Image pull secrets for Red Hat registry
+    imagePullSecrets:
+      - redhat-registry-secret
+    
+    # Ansible Dev Tools container (equivalent to Helm extraContainers)
+    extraContainers:
+      - name: ansible-devtools-server
+        image: registry.redhat.io/ansible-automation-platform-25/ansible-dev-tools-rhel8:latest
+        imagePullPolicy: IfNotPresent
+        command:
+          - "adt"
+          - "server"
+        ports:
+          - name: http
+            containerPort: 8000
+            protocol: TCP
+        env:
+          - name: ADT_HOST
+            value: "0.0.0.0"
+          - name: ADT_PORT
+            value: "8000"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "250m"
+        volumeMounts:
+          - name: ansible-workspace
+            mountPath: /workspace
+    
+    # Extra volumes
+    extraVolumes:
+      - name: ansible-workspace
+        emptyDir: {}
+    
+    # Dynamic plugins configuration
+    dynamicPluginsConfigMapName: rhdh-dynamic-plugins-ansible
+    
+  # Database configuration
+  database:
+    enableLocalDb: true
+
+---
+
+# STEP 7: RBAC Configuration
+# =========================
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rhdh-ansible-sa
+  namespace: rhdh-system
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rhdh-ansible-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["build.openshift.io"]
+  resources: ["builds", "buildconfigs"]
+  verbs: ["get", "list", "watch", "create"]
+- apiGroups: ["image.openshift.io"]
+  resources: ["imagestreams"]
+  verbs: ["get", "list", "watch"]
+
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rhdh-ansible-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rhdh-ansible-reader
+subjects:
+- kind: ServiceAccount
+  name: rhdh-ansible-sa
+  namespace: rhdh-system
+
+---
+
+# STEP 8: Ansible Templates Repository Structure
+# =============================================
+
+# This is the structure you need in your GitHub repository for templates
+
+# catalog-info.yaml (root of your ansible-templates repository)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ansible-templates-catalog
+  namespace: rhdh-system
+data:
+  catalog-info.yaml: |
+    apiVersion: backstage.io/v1alpha1
+    kind: Location
+    metadata:
+      name: ansible-templates
+      description: Ansible playbook and collection templates
+    spec:
+      targets:
+        - ./templates/ansible-playbook/template.yaml
+        - ./templates/ansible-collection/template.yaml
+
+---
+
+# IMPLEMENTATION STEPS SCRIPT
+# ===========================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: implementation-steps
+  namespace: rhdh-system
+data:
+  deploy.sh: |
+    #!/bin/bash
+    
+    echo "=== RHDH Ansible Plugin Implementation Steps ==="
+    
+    # Step 1: Create namespaces
+    echo "Step 1: Creating namespaces..."
+    kubectl create namespace rhdh-plugins --dry-run=client -o yaml | kubectl apply -f -
+    kubectl create namespace rhdh-system --dry-run=client -o yaml | kubectl apply -f -
+    
+    # Step 2: Download Ansible plugins (manual step)
+    echo "Step 2: MANUAL - Download ansible-backstage-rhaap-bundle from access.redhat.com"
+    echo "Extract and note the integrity hashes from *.integrity files"
+    
+    # Step 3: Update integrity hashes
+    echo "Step 3: Update integrity hashes in dynamic-plugins.yaml ConfigMap"
+    
+    # Step 4: Create Red Hat registry secret
+    echo "Step 4: Create Red Hat registry secret..."
+    echo "kubectl create secret docker-registry redhat-registry-secret \\"
+    echo "  --docker-server=registry.redhat.io \\"
+    echo "  --docker-username=YOUR_USERNAME \\"
+    echo "  --docker-password=YOUR_TOKEN \\"
+    echo "  -n rhdh-system"
+    
+    # Step 5: Apply all configurations
+    echo "Step 5: Applying configurations..."
+    kubectl apply -f ansible-plugin-files.yaml
+    kubectl apply -f plugin-registry-build.yaml
+    kubectl apply -f app-config-rhdh-ansible.yaml
+    kubectl apply -f rhdh-dynamic-plugins-ansible.yaml
+    kubectl apply -f rhdh-ansible-env-vars.yaml
+    kubectl apply -f rhdh-ansible-instance.yaml
+    kubectl apply -f rbac-config.yaml
+    
+    # Step 6: Trigger plugin registry build
+    echo "Step 6: Triggering plugin registry build..."
+    oc start-build rhdh-plugin-registry-build -n rhdh-plugins
+    
+    # Step 7: Wait for deployment
+    echo "Step 7: Waiting for deployment..."
+    kubectl wait --for=condition=Available deployment/rhdh-ansible-instance-backstage-backend -n rhdh-system --timeout=600s
+    
+    # Step 8: Get route URL
+    echo "Step 8: Getting RHDH URL..."
+    echo "RHDH URL: $(oc get route rhdh-ansible-instance -n rhdh-system -o jsonpath='{.spec.host}')"
+    
+    echo "=== Installation Complete ==="
+    echo "Next steps:"
+    echo "1. Access RHDH using the URL above"
+    echo "2. Sign out and sign in with GitHub"
+    echo "3. Navigate to Create -> Browse templates"
+    echo "4. Verify Ansible templates are available"
+
+  verify.sh: |
+    #!/bin/bash
+    
+    echo "=== Verification Steps ==="
+    
+    # Check plugin registry
+    echo "Plugin registry status:"
+    kubectl get pods -n rhdh-plugins
+    kubectl get route -n rhdh-plugins
+    
+    # Check RHDH pods
+    echo "RHDH pods status:"
+    kubectl get pods -n rhdh-system
+    
+    # Check logs
+    echo "RHDH backend logs:"
+    kubectl logs -n rhdh-system deployment/rhdh-ansible-instance-backstage-backend --tail=50
+    
+    # Check ansible dev tools container
+    echo "Ansible dev tools status:"
+    kubectl exec -n rhdh-system deployment/rhdh-ansible-instance-backstage-backend -c ansible-devtools-server -- ps aux
+    
+    echo "=== Verification Complete ==="
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----------------------------------
+
 #!/bin/bash
 # Check CTK for VMs in specific folder
 CLUSTER_NAME="ocp4prd-dfg"
