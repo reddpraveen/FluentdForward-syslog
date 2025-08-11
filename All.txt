@@ -1,3 +1,17 @@
+oc -n demo-project patch bc/plugin-registry --type=merge -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "env": [
+          {"name":"TMPDIR","value":"/var/lib/containers/storage/tmp"},
+          {"name":"BUILDAH_TMPDIR","value":"/var/lib/containers/storage/tmp"}
+        ]
+      }
+    }
+  }
+}'
+
+
 # 1) See the pod’s measured usage vs. limit
 oc adm top pod plugin-registry-6-build -n demo-project --containers
 oc -n demo-project describe pod plugin-registry-6-build | egrep -i 'ephemeral-storage|evict|usage'
