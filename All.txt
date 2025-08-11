@@ -1,3 +1,13 @@
+# 1) See the pod’s measured usage vs. limit
+oc adm top pod plugin-registry-6-build -n demo-project --containers
+oc -n demo-project describe pod plugin-registry-6-build | egrep -i 'ephemeral-storage|evict|usage'
+
+# 2) Inside the build container
+oc rsh -n demo-project plugin-registry-6-build \
+  sh -lc 'df -h / /var/tmp /var/lib/containers || true; du -sh /var/tmp 2>/dev/null || true; buildah info | egrep -i "rootless|GraphRoot|GraphDriver"'
+
+
+
 rpm --import https://packages.microsoft.com/keys/microsoft.asc
 
 cat <<EOF > /etc/yum.repos.d/azure-cli.repo
