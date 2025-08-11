@@ -1,0 +1,342 @@
+# ========================================
+
+# What happens after oc start-build:
+
+# 1. Build runs and creates container image
+
+# 2. ImageStream gets updated with new image
+
+# 3. NO POD is created automatically
+
+# 4. You need to deploy the registry manually
+
+# ========================================
+
+# STEP 1: Check Build Status
+
+# ==========================
+
+# Check if build completed successfully
+
+# oc get builds -n rhdh-plugins
+
+# oc logs build/rhdh-plugin-registry-build-1 -n rhdh-plugins
+
+# Verify ImageStream was created
+
+# oc get imagestream -n rhdh-plugins
+
+# oc describe imagestream rhdh-plugin-registry -n rhdh-plugins
+
+-----
+
+# STEP 2: Deploy the Plugin Registry Pod
+
+# ======================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+name: plugin-registry
+namespace: aap
+labels:
+app: plugin-registry
+spec:
+replicas: 1
+selector:
+matchLabels:
+app: plugin-registry
+template:
+metadata:
+labels:
+app: plugin-registry
+spec:
+containers:
+- name: plugin-registry
+# Use the image created by your build
+image: image-registry.openshift-image-registry.svc:5000/aap/plugin-registry:latest
+ports:
+- containerPort: 8080
+name: http
+resources:
+requests:
+memory: “128Mi”
+cpu: “50m”
+limits:
+memory: “256Mi”
+cpu: “100m”
+# Health checks
+livenessProbe:
+httpGet:
+path: /
+port: 8080
+initialDelaySeconds: 30
+periodSeconds: 10
+readinessProbe:
+httpGet:
+path: /
+port: 8080
+initialDelaySeconds: 5
+periodSeconds: 5
+
+-----
+
+# STEP 3: Service for Plugin Registry
+
+# ===================================
+
+apiVersion: v1
+kind: Service
+metadata:
+name: plugin-registry-service
+namespace: aap
+spec:
+selector:
+app: plugin-registry
+ports:
+- name: http
+port: 8080
+targetPort: 8080
+type: ClusterIP
+
+-----
+
+# STEP 4: Route for Plugin Registry
+
+# =================================
+
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+name: plugin-registry-route
+namespace: aap
+spec:
+to:
+kind: Service
+name: plugin-registry-service
+port:
+targetPort: http
+tls:
+termination: edge
+
+-----
+
+# STEP 5: Scripts to Get Plugin Hashes
+
+# ====================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: hash-extraction-scripts
+namespace: aap
+data:
+get-plugin-hashes.sh: |
+#!/bin/bash
+
+```
+echo "=== Getting Plugin Hashes ==="
+
+# Method 1: Get hashes from the running pod
+PLUGIN_POD=$(oc get pods -n aap -l app=plugin-registry -o jsonpath='{.items[0].metadata.name}')
+
+if [ -n "$PLUGIN_POD" ]; then
+    echo "Found plugin registry pod: $PLUGIN_POD"
+    
+    echo "=== Available Plugin Files ==="
+    oc exec -n aap $PLUGIN_POD -- find /var/www/html/plugins -name "*.tgz*" -o -name "*.integrity"
+    
+    echo ""
+    echo "=== Plugin Integrity Hashes ==="
+    
+    # Get backstage-plugin-ansible-backend hash
+    echo "backstage-plugin-ansible-backend:"
+    oc exec -n aap $PLUGIN_POD -- cat /var/www/html/plugins/backstage-plugin-ansible-backend-*.tgz.integrity 2>/dev/null || echo "File not found"
+    
+    # Get module-backstage-rhaap hash
+    echo "module-backstage-rhaap:"
+    oc exec -n aap $PLUGIN_POD -- cat /var/www/html/plugins/module-backstage-rhaap-*.tgz.integrity 2>/dev/null || echo "File not found"
+    
+    # Get ansible-plugin-backstage-rhaap-backend hash
+    echo "ansible-plugin-backstage-rhaap-backend:"
+    oc exec -n aap $PLUGIN_POD -- cat /var/www/html/plugins/ansible-plugin-backstage-rhaap-backend-*.tgz.integrity 2>/dev/null || echo "File not found"
+    
+    echo ""
+    echo "=== Plugin Registry URL ==="
+    REGISTRY_URL=$(oc get route plugin-registry-route -n aap -o jsonpath='{.spec.host}')
+    echo "Plugin Registry URL: https://$REGISTRY_URL"
+    echo "Test access: curl https://$REGISTRY_URL/plugins/"
+    
+else
+    echo "ERROR: Plugin registry pod not found. Deploy the registry first."
+    exit 1
+fi
+```
+
+get-hashes-from-local.sh: |
+#!/bin/bash
+
+```
+echo "=== Getting Hashes from Local Files ==="
+echo "If you still have the extracted plugin files locally:"
+echo ""
+
+# Assuming plugins were extracted to current directory
+if [ -d "./plugins" ] || [ -f "./*.integrity" ]; then
+    echo "Found local plugin files:"
+    find . -name "*.integrity" | while read file; do
+        echo "=== $file ==="
+        cat "$file"
+        echo ""
+    done
+else
+    echo "No local .integrity files found in current directory"
+    echo "Please navigate to where you extracted the ansible-backstage-rhaap-bundle"
+fi
+```
+
+test-registry.sh: |
+#!/bin/bash
+
+```
+echo "=== Testing Plugin Registry ==="
+
+REGISTRY_URL=$(oc get route plugin-registry-route -n aap -o jsonpath='{.spec.host}')
+
+if [ -n "$REGISTRY_URL" ]; then
+    echo "Registry URL: https://$REGISTRY_URL"
+    echo ""
+    echo "Testing registry access..."
+    curl -k -s "https://$REGISTRY_URL/" | head -20
+    echo ""
+    echo "Listing available plugins..."
+    curl -k -s "https://$REGISTRY_URL/plugins/" || echo "Plugins directory not accessible"
+else
+    echo "ERROR: Plugin registry route not found"
+    exit 1
+fi
+```
+
+-----
+
+# STEP 6: Updated Dynamic Plugins ConfigMap with Correct URLs
+
+# ===========================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: rhdh-dynamic-plugins-with-registry
+namespace: rhdh-system
+data:
+dynamic-plugins.yaml: |
+includes:
+- dynamic-plugins.default.yaml
+
+```
+plugins:
+  # Note: Replace REGISTRY_URL with your actual route
+  # Get it with: oc get route rhdh-plugin-registry-route -n rhdh-plugins -o jsonpath='{.spec.host}'
+  
+  # Ansible backend plugin
+  - package: 'https://REPLACE_WITH_REGISTRY_URL/plugins/backstage-plugin-ansible-backend-1.0.0.tgz'
+    disabled: false
+    integrity: 'REPLACE_WITH_HASH_FROM_INTEGRITY_FILE'
+    pluginConfig:
+      ansible:
+        baseUrl: ${AAP_BASE_URL}
+        username: ${AAP_USERNAME}
+        password: ${AAP_PASSWORD}
+  
+  # RHAAP module
+  - package: 'https://REPLACE_WITH_REGISTRY_URL/plugins/module-backstage-rhaap-1.0.0.tgz'
+    disabled: false
+    integrity: 'REPLACE_WITH_HASH_FROM_INTEGRITY_FILE'
+  
+  # Ansible RHAAP backend
+  - package: 'https://REPLACE_WITH_REGISTRY_URL/plugins/ansible-plugin-backstage-rhaap-backend-1.0.0.tgz'
+    disabled: false
+    integrity: 'REPLACE_WITH_HASH_FROM_INTEGRITY_FILE'
+```
+
+-----
+
+# STEP 7: Alternative - Extract Files from Build Image
+
+# ====================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+name: extract-plugin-hashes
+namespace: aap
+spec:
+template:
+spec:
+containers:
+- name: hash-extractor
+image: image-registry.openshift-image-registry.svc:5000/aap/plugin-registry:latest
+command: [”/bin/bash”]
+args:
+- -c
+- |
+echo “=== Extracting Plugin Hashes ===”
+echo “Available files:”
+find /var/www/html/plugins -type f
+echo “”
+echo “=== Integrity Hashes ===”
+for integrity_file in /var/www/html/plugins/*.integrity; do
+if [ -f “$integrity_file” ]; then
+echo “File: $integrity_file”
+echo “Hash: $(cat $integrity_file)”
+echo “—”
+fi
+done
+echo “Job completed - check logs for hashes”
+restartPolicy: Never
+backoffLimit: 2
+
+-----
+
+# STEP 8: Verification Commands ConfigMap
+
+# ======================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: verification-commands
+namespace: aap
+data:
+commands.txt: |
+# Verification Commands for Plugin Registry Setup
+
+```
+# 1. Check if build completed
+oc get builds -n aap
+oc logs build/plugin-registry-build-1 -n aap
+
+# 2. Check ImageStream
+oc get imagestream plugin-registry -n aap
+oc describe imagestream plugin-registry -n aap
+
+# 3. Deploy the registry (apply the Deployment above)
+oc apply -f plugin-registry-deployment.yaml
+
+# 4. Check if pod is running
+oc get pods -n aap
+oc get svc -n aap
+oc get route -n aap
+
+# 5. Get registry URL
+oc get route plugin-registry-route -n aap -o jsonpath='{.spec.host}'
+
+# 6. Extract hashes (run the script from the ConfigMap)
+oc create job hash-extractor-manual --from=cronjob/extract-plugin-hashes -n aap
+oc logs job/hash-extractor-manual -n aap
+
+# 7. Test registry access
+curl -k https://$(oc get route plugin-registry-route -n aap -o jsonpath='{.spec.host}')/
+
+# 8. Update dynamic plugins ConfigMap with correct URLs and hashes
+```
