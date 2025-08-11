@@ -1,0 +1,369 @@
+# OpenShift Build Ephemeral Storage Issue - Complete Fix Guide
+
+## Problem Summary
+
+OpenShift builds fail with “no space left on device” error during Buildah/Skopeo commit phase, even with increased ephemeral-storage limits. The issue occurs because Buildah writes to `/var/tmp` tmpfs instead of disk-backed storage.
+
+**Error**: `error: storing blob to image destination for cache ... no space left on device`
+
+## Root Cause
+
+- Buildah/Skopeo hardcoded to use `/var/tmp` during image commit phase
+- `/var/tmp` in build pods is a small tmpfs filesystem
+- Environment variables (TMPDIR, BUILDAH_TMPDIR) don’t override this behavior
+- Increasing ephemeral-storage limits doesn’t help because the issue is tmpfs, not disk storage
+
+## Solutions (Recommended Order)
+
+### Solution 1: Custom Builder Image with Symlinked /var/tmp (RECOMMENDED)
+
+Create a custom S2I builder image that pre-configures the `/var/tmp` symlink:
+
+**File: `Dockerfile.custom-httpd-builder`**
+
+```dockerfile
+FROM registry.redhat.io/ubi8/httpd-24:latest
+
+USER root
+
+# Create disk-backed tmp directory
+RUN mkdir -p /var/lib/containers/storage/tmp && \
+    chmod 1777 /var/lib/containers/storage/tmp
+
+# Remove existing /var/tmp and create symlink to disk-backed storage
+RUN rm -rf /var/tmp && \
+    ln -sf /var/lib/containers/storage/tmp /var/tmp
+
+# Set environment variables for all build tools
+ENV TMPDIR=/var/lib/containers/storage/tmp \
+    BUILDAH_TMPDIR=/var/lib/containers/storage/tmp \
+    S2I_TMP_DIR=/var/lib/containers/storage/tmp \
+    TMP=/var/lib/containers/storage/tmp \
+    TEMP=/var/lib/containers/storage/tmp
+
+USER 1001
+```
+
+**Build and Push Commands:**
+
+```bash
+# Build the custom image
+podman build -f Dockerfile.custom-httpd-builder -t your-registry/custom-httpd-s2i:latest .
+
+# Push to your registry
+podman push your-registry/custom-httpd-s2i:latest
+
+# Update your BuildConfig to use this image
+oc patch bc/your-buildconfig -p '{"spec":{"strategy":{"sourceStrategy":{"from":{"name":"your-registry/custom-httpd-s2i:latest"}}}}}'
+```
+
+### Solution 2: Enhanced S2I Assemble Script
+
+If you cannot modify the base image, create a comprehensive assemble script:
+
+**File: `assemble`**
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=== Starting enhanced S2I assemble ==="
+
+# Create disk-backed tmp directory
+mkdir -p /var/lib/containers/storage/tmp
+chmod 1777 /var/lib/containers/storage/tmp
+
+# Backup existing /var/tmp if it exists and isn't already a symlink
+if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then
+    echo "Backing up existing /var/tmp contents..."
+    cp -r /var/tmp/* /var/lib/containers/storage/tmp/ 2>/dev/null || true
+    rm -rf /var/tmp
+fi
+
+# Create symlink
+echo "Creating symlink: /var/tmp -> /var/lib/containers/storage/tmp"
+ln -sfn /var/lib/containers/storage/tmp /var/tmp
+
+# Export all relevant environment variables
+export TMPDIR=/var/lib/containers/storage/tmp
+export BUILDAH_TMPDIR=/var/lib/containers/storage/tmp
+export S2I_TMP_DIR=/var/lib/containers/storage/tmp
+export TMP=/var/lib/containers/storage/tmp
+export TEMP=/var/lib/containers/storage/tmp
+
+# Verify the symlink
+echo "Verifying /var/tmp symlink:"
+ls -la /var/tmp
+
+# Call the original assemble script
+echo "Calling original assemble script..."
+if [ -f /usr/libexec/s2i/assemble ]; then
+    exec /usr/libexec/s2i/assemble
+elif [ -f /opt/app-root/s2i/bin/assemble ]; then
+    exec /opt/app-root/s2i/bin/assemble
+else
+    echo "Original assemble script not found, proceeding with default behavior..."
+fi
+```
+
+**Implementation Steps:**
+
+```bash
+# Create ConfigMap with the assemble script
+oc create configmap custom-s2i-scripts --from-file=assemble=./assemble
+
+# Make the script executable
+chmod +x assemble
+
+# Update BuildConfig to use custom script
+oc patch bc/your-buildconfig -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "scripts": "file:///opt/s2i-scripts"
+      }
+    },
+    "spec": {
+      "volumes": [{
+        "name": "custom-scripts",
+        "configMap": {
+          "name": "custom-s2i-scripts",
+          "defaultMode": 493
+        }
+      }],
+      "volumeMounts": [{
+        "name": "custom-scripts",
+        "mountPath": "/opt/s2i-scripts"
+      }]
+    }
+  }
+}'
+```
+
+### Solution 3: Docker Build Strategy (Alternative)
+
+Switch from S2I to Docker build strategy if the above solutions don’t work:
+
+**File: `BuildConfig-docker.yaml`**
+
+```yaml
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: my-app-docker
+  namespace: my-namespace
+spec:
+  source:
+    type: Git
+    git:
+      uri: "https://github.com/your-repo/your-app.git"
+      ref: "main"
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+      env:
+        - name: TMPDIR
+          value: "/var/lib/containers/storage/tmp"
+        - name: BUILDAH_TMPDIR
+          value: "/var/lib/containers/storage/tmp"
+  output:
+    to:
+      kind: ImageStreamTag
+      name: "my-app:latest"
+  resources:
+    requests:
+      ephemeral-storage: "50Gi"
+      memory: "2Gi"
+      cpu: "1"
+    limits:
+      ephemeral-storage: "50Gi"
+      memory: "4Gi"
+      cpu: "2"
+  runPolicy: Serial
+```
+
+**File: `Dockerfile`**
+
+```dockerfile
+FROM registry.redhat.io/ubi8/httpd-24:latest
+
+USER root
+
+# Set up disk-backed tmp directory
+RUN mkdir -p /var/lib/containers/storage/tmp && \
+    chmod 1777 /var/lib/containers/storage/tmp && \
+    rm -rf /var/tmp && \
+    ln -sf /var/lib/containers/storage/tmp /var/tmp
+
+# Set environment variables
+ENV TMPDIR=/var/lib/containers/storage/tmp \
+    BUILDAH_TMPDIR=/var/lib/containers/storage/tmp \
+    TMP=/var/lib/containers/storage/tmp \
+    TEMP=/var/lib/containers/storage/tmp
+
+# Copy your application files
+COPY . /var/www/html/
+
+# Set proper permissions
+RUN chown -R 1001:0 /var/www/html && \
+    chmod -R g+rw /var/www/html
+
+USER 1001
+
+EXPOSE 8080
+```
+
+**Apply Docker BuildConfig:**
+
+```bash
+oc apply -f BuildConfig-docker.yaml
+```
+
+## Debugging Tools
+
+### Build Environment Debug Script
+
+**File: `debug-build-env.sh`**
+
+```bash
+#!/bin/bash
+echo "=== Build Environment Debug Information ==="
+
+echo "Current user: $(whoami)"
+echo "Current UID/GID: $(id)"
+
+echo -e "\n=== Environment Variables ==="
+env | grep -E "(TMP|TEMP|BUILDAH)" | sort
+
+echo -e "\n=== Filesystem Information ==="
+echo "/var/tmp details:"
+ls -la /var/tmp/ || echo "/var/tmp not accessible"
+
+echo -e "\n/var/lib/containers/storage/tmp details:"
+ls -la /var/lib/containers/storage/tmp/ || echo "Directory doesn't exist"
+
+echo -e "\n=== Mount Points ==="
+mount | grep -E "(tmp|tmpfs)"
+
+echo -e "\n=== Disk Usage ==="
+df -h | grep -E "(tmp|var)"
+
+echo -e "\n=== Available Space in Key Directories ==="
+for dir in /var/tmp /var/lib/containers/storage /tmp; do
+    if [ -d "$dir" ]; then
+        echo "$dir: $(du -sh $dir 2>/dev/null || echo 'Unable to determine')"
+    fi
+done
+
+echo -e "\n=== Process List (build related) ==="
+ps aux | grep -E "(buildah|skopeo|podman)" || echo "No build processes found"
+```
+
+**Usage:**
+
+```bash
+# Add to your assemble script or run during build
+chmod +x debug-build-env.sh
+./debug-build-env.sh
+```
+
+## Implementation Checklist
+
+### Pre-Implementation
+
+- [ ] Verify current BuildConfig configuration
+- [ ] Check namespace LimitRange settings
+- [ ] Confirm node disk space availability
+- [ ] Backup existing BuildConfig
+
+### Solution 1 (Custom Builder Image)
+
+- [ ] Create Dockerfile for custom builder
+- [ ] Build and test custom image locally
+- [ ] Push image to accessible registry
+- [ ] Update BuildConfig to use custom image
+- [ ] Test build with new image
+
+### Solution 2 (Custom Assemble Script)
+
+- [ ] Create enhanced assemble script
+- [ ] Test script permissions and execution
+- [ ] Create ConfigMap with script
+- [ ] Update BuildConfig with volume mount
+- [ ] Test build with custom script
+
+### Solution 3 (Docker Strategy)
+
+- [ ] Create Dockerfile for application
+- [ ] Create new BuildConfig with Docker strategy
+- [ ] Test Docker build locally if possible
+- [ ] Deploy and test in OpenShift
+
+### Verification Steps
+
+- [ ] Monitor build logs for symlink creation
+- [ ] Verify /var/tmp points to disk-backed storage
+- [ ] Check environment variables are set correctly
+- [ ] Confirm successful image push
+- [ ] Test application deployment
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+**Issue**: Permission denied when creating symlink
+**Solution**: Ensure the assemble script runs as root or has appropriate permissions
+
+**Issue**: Original assemble script not found
+**Solution**: Check the base image documentation for correct script path
+
+**Issue**: Build still fails with tmpfs error
+**Solution**: Verify symlink creation with debug script and ensure it’s created before Buildah operations
+
+**Issue**: Custom image not accessible
+**Solution**: Check image registry permissions and authentication
+
+### Verification Commands
+
+```bash
+# Check current BuildConfig
+oc describe bc/your-buildconfig
+
+# Monitor build logs
+oc logs -f bc/your-buildconfig
+
+# Debug build pod (if still running)
+oc rsh <build-pod-name>
+ls -la /var/tmp
+mount | grep tmp
+
+# Check build resources
+oc describe build <build-name>
+```
+
+## Expected Results
+
+After implementing any of these solutions:
+
+- `/var/tmp` should be a symlink to `/var/lib/containers/storage/tmp`
+- Build logs should show successful image commit and push
+- No “no space left on device” errors during build
+- Build pods should use ephemeral-storage from disk, not tmpfs
+
+## Additional Notes
+
+- **Solution 1** (Custom Builder Image) is the most reliable long-term solution
+- **Solution 2** (Custom Assemble Script) is good for environments where custom images aren’t allowed
+- **Solution 3** (Docker Strategy) provides the most control but requires Dockerfile maintenance
+- Always test in a development environment first
+- Monitor build performance as disk I/O may be different from tmpfs
+- Consider automating the custom image build and push process in your CI/CD pipeline
+
+## Support
+
+If issues persist after implementing these solutions:
+
+1. Check OpenShift and Buildah versions for known issues
+1. Review Red Hat documentation for your specific OpenShift version
+1. Consider opening a support case with detailed build logs and configuration
