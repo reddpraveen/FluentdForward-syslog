@@ -1,3 +1,33 @@
+oc -n demo-project patch bc/plugin-registry --type='merge' -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "env": [
+          {"name":"TMPDIR","value":"/var/tmp"},
+          {"name":"BUILDAH_TMPDIR","value":"/var/tmp"},
+          {"name":"S2I_TMP_DIR","value":"/var/tmp"}
+        ],
+        "volumes": [
+          {
+            "name": "build-tmp",
+            "source": { "type": "EmptyDir", "emptyDir": { "sizeLimit": "60Gi" } },
+            "mounts": [ { "destinationPath": "/var/tmp" } ]
+          }
+        ]
+      }
+    },
+    "resources": {
+      "requests": { "ephemeral-storage": "50Gi" },
+      "limits":   { "ephemeral-storage": "50Gi" }
+    }
+  }
+}'
+
+oc -n demo-project cancel-build bc/plugin-registry --state=new,running || true
+oc -n demo-project start-build plugin-registry --follow
+
+oc rsh -n demo-project <new-build-pod> sh -lc 'mount | grep " /var/tmp "; df -h /var/tmp; echo $TMPDIR $BUILDAH_TMPDIR $S2I_TMP_DIR'
+------
 oc -n demo-project patch bc/plugin-registry --type='json' -p='[
   {"op":"add","path":"/spec/strategy/sourceStrategy/env","value":[
     {"name":"TMPDIR","value":"/var/lib/containers/storage/tmp"},
