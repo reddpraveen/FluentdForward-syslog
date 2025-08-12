@@ -1,3 +1,166 @@
+
+0) Set variables (edit if needed)
+NS=demo-project
+BC=plugin-registry
+CM_S2I=plugin-registry-s2i
+CM_RUN=plugin-registry-s2i-run
+DISK_TMP=/var/lib/containers/storage/tmp
+1) Create the override scripts locally
+1a) assemble (runs during S2I assemble phase)
+cat <<'EOF' > assemble
+#!/usr/bin/env sh
+set -eu
+
+TARGET="/var/lib/containers/storage/tmp"
+mkdir -p "$TARGET"
+
+# Make /var/tmp point to disk-backed storage
+if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then
+  # best-effort move of any existing files
+  for f in /var/tmp/* /var/tmp/.[!.]* /var/tmp/..?*; do
+    [ -e "$f" ] && mv -f "$f" "$TARGET"/ 2>/dev/null || true
+  done
+  rm -rf /var/tmp
+fi
+[ -L /var/tmp ] || ln -s "$TARGET" /var/tmp
+
+# Export temp dirs recognized by s2i/buildah/skopeo/containers-image
+export TMPDIR="$TARGET"
+export BUILDAH_TMPDIR="$TARGET"
+export S2I_TMP_DIR="$TARGET"
+export STORAGE_TRANSPORT_TMPDIR="$TARGET"
+export XDG_RUNTIME_DIR="$TARGET/run"
+mkdir -p "$XDG_RUNTIME_DIR"
+
+# Call the original assemble script from the builder image
+exec /usr/libexec/s2i/assemble
+EOF
+
+chmod +x assemble
+1b) run (wrapper for the s2i run entrypoint used during commit/push)
+cat <<'EOF' > run
+#!/usr/bin/env sh
+set -eu
+
+TARGET="/var/lib/containers/storage/tmp"
+mkdir -p "$TARGET"
+
+# Ensure /var/tmp is a symlink to disk-backed storage
+if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then
+  rm -rf /var/tmp
+fi
+ln -sfn "$TARGET" /var/tmp
+
+# Export temp dirs so commit/push stages also use disk
+export TMPDIR="$TARGET"
+export BUILDAH_TMPDIR="$TARGET"
+export S2I_TMP_DIR="$TARGET"
+export STORAGE_TRANSPORT_TMPDIR="$TARGET"
+export XDG_RUNTIME_DIR="$TARGET/run"
+mkdir -p "$XDG_RUNTIME_DIR"
+
+# Hand off to the original run script in the builder image
+exec /usr/libexec/s2i/run "$@"
+EOF
+
+chmod +x run
+2) Put scripts into ConfigMaps
+oc -n "$NS" delete configmap "$CM_S2I" --ignore-not-found
+oc -n "$NS" create configmap "$CM_S2I" --from-file=assemble=./assemble
+
+oc -n "$NS" delete configmap "$CM_RUN" --ignore-not-found
+oc -n "$NS" create configmap "$CM_RUN" --from-file=run=./run
+3) Patch the BuildConfig
+Mount assemble under /opt/s2i-scripts and tell S2I to use it.
+Mount run over /usr/libexec/s2i so our wrapper runs during commit/push.
+Set ephemeral storage to a high value (request==limit so the scheduler picks a roomy node).
+Export the temp envs in the strategy for extra safety.
+oc -n "$NS" patch bc/"$BC" --type=merge -p "{
+  \"spec\": {
+    \"strategy\": {
+      \"sourceStrategy\": {
+        \"scripts\": \"/opt/s2i-scripts\",
+        \"env\": [
+          {\"name\":\"TMPDIR\",\"value\":\"$DISK_TMP\"},
+          {\"name\":\"BUILDAH_TMPDIR\",\"value\":\"$DISK_TMP\"},
+          {\"name\":\"S2I_TMP_DIR\",\"value\":\"$DISK_TMP\"},
+          {\"name\":\"STORAGE_TRANSPORT_TMPDIR\",\"value\":\"$DISK_TMP\"},
+          {\"name\":\"XDG_RUNTIME_DIR\",\"value\":\"$DISK_TMP/run\"}
+        ],
+        \"volumes\": [
+          {
+            \"name\": \"s2i-scripts\",
+            \"source\": { \"type\": \"ConfigMap\", \"configMap\": {
+              \"name\": \"$CM_S2I\",
+              \"items\": [{\"key\":\"assemble\",\"path\":\"assemble\"}]
+            }},
+            \"mounts\": [{\"destinationPath\":\"/opt/s2i-scripts\"}]
+          },
+          {
+            \"name\": \"s2i-run\",
+            \"source\": { \"type\": \"ConfigMap\", \"configMap\": {
+              \"name\": \"$CM_RUN\",
+              \"items\": [{\"key\":\"run\",\"path\":\"run\"}]
+            }},
+            \"mounts\": [{\"destinationPath\":\"/usr/libexec/s2i\"}]
+          }
+        ]
+      }
+    },
+    \"resources\": {
+      \"requests\": {\"ephemeral-storage\":\"50Gi\"},
+      \"limits\":   {\"ephemeral-storage\":\"50Gi\"}
+    }
+  }
+}"
+If your project has a ResourceQuota capping ephemeral storage, raise it or use a namespace without that quota.
+4) Restart the build (so changes apply)
+oc -n "$NS" cancel-build bc/"$BC" --state=new,running || true
+oc -n "$NS" start-build "$BC" --follow
+5) Verify inside the new build pod
+POD=$(oc -n "$NS" get pods -l "openshift.io/build.name" -o name | tail -n1 | cut -d/ -f2)
+
+# Check envs and that /var/tmp points to disk-backed storage
+oc -n "$NS" rsh "$POD" sh -lc 'set -e
+echo "TMPDIR=$TMPDIR"
+echo "BUILDAH_TMPDIR=$BUILDAH_TMPDIR"
+echo "S2I_TMP_DIR=$S2I_TMP_DIR"
+echo "STORAGE_TRANSPORT_TMPDIR=$STORAGE_TRANSPORT_TMPDIR"
+echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+ls -ld /var/tmp
+df -h /var/lib/containers/storage/tmp || true
+'
+You should see /var/tmp -> /var/lib/containers/storage/tmp and plenty of space available there.
+Rollback (cleanly undo the overrides)
+NS=demo-project
+BC=plugin-registry
+CM_S2I=plugin-registry-s2i
+CM_RUN=plugin-registry-s2i-run
+
+# Remove volumes + scripts reference
+oc -n "$NS" patch bc/"$BC" --type=json -p '[
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/scripts"},
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/volumes"}
+]' || true
+
+# Clear the temp envs we added (leave array empty)
+oc -n "$NS" patch bc/"$BC" --type=merge -p '{
+  "spec": { "strategy": { "sourceStrategy": { "env": [] } } }
+}'
+
+# Delete configmaps
+oc -n "$NS" delete configmap "$CM_S2I" --ignore-not-found
+oc -n "$NS" delete configmap "$CM_RUN" --ignore-not-found
+
+# (Optional) reset ephemeral storage values
+# oc -n "$NS" patch bc/"$BC" --type=merge -p '{"spec":{"resources":{"requests":{"ephemeral-storage":"20Gi"},"limits":{"ephemeral-storage":"20Gi"}}}}'
+
+# Restart a fresh build
+oc -n "$NS" start-build "$BC" --follow
+
+
+
+-----------
 oc -n demo-project patch bc/plugin-registry --type='merge' -p '{
   "spec": {
     "strategy": {
