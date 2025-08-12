@@ -1,4 +1,59 @@
+NS=demo-project
+BC=plugin-registry
 
+# 1) (Re)create a ConfigMap that holds BOTH scripts you already wrote
+#    (assumes files ./assemble and ./run are in your current dir)
+oc -n "$NS" delete configmap plugin-registry-s2i-all --ignore-not-found
+oc -n "$NS" create configmap plugin-registry-s2i-all \
+  --from-file=assemble=./assemble \
+  --from-file=run=./run
+
+# 2) Clean up any previous volumes/scripts fields we set
+oc -n "$NS" patch bc/"$BC" --type=json -p '[
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/volumes"},
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/scripts"}
+]' || true
+
+# 3) Patch BuildConfig to:
+#    - mount CM at /opt/s2i-scripts
+#    - set scripts: image:///opt/s2i-scripts  (MUST include image://)
+#    - keep the temp-dir envs so buildah/skopeo stage to disk
+oc -n "$NS" patch bc/"$BC" --type=merge -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "scripts": "image:///opt/s2i-scripts",
+        "env": [
+          {"name":"TMPDIR","value":"/var/lib/containers/storage/tmp"},
+          {"name":"BUILDAH_TMPDIR","value":"/var/lib/containers/storage/tmp"},
+          {"name":"S2I_TMP_DIR","value":"/var/lib/containers/storage/tmp"},
+          {"name":"STORAGE_TRANSPORT_TMPDIR","value":"/var/lib/containers/storage/tmp"},
+          {"name":"XDG_RUNTIME_DIR","value":"/var/lib/containers/storage/tmp/run"}
+        ],
+        "volumes": [
+          {
+            "name": "s2i-all",
+            "source": { "type": "ConfigMap", "configMap": {
+              "name": "plugin-registry-s2i-all",
+              "items": [
+                {"key":"assemble","path":"assemble"},
+                {"key":"run","path":"run"}
+              ]
+            }},
+            "mounts": [{ "destinationPath": "/opt/s2i-scripts" }]
+          }
+        ]
+      }
+    }
+  }
+}'
+
+# 4) Restart the build to pick up changes
+oc -n "$NS" cancel-build bc/"$BC" --state=new,running || true
+oc -n "$NS" start-build "$BC" --follow
+
+
+---------------
 NS=demo-project
 BC=plugin-registry
 
