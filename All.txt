@@ -1,3 +1,5 @@
+https://access.redhat.com/downloads/content/480/ver=2.4/rhel---9/2.4/x86_64/product-software?extIdCarryOver=true&sc_cid=RHCTG0250000454096
+
 Quick workaround (no rebuild)
 Point the running container back to the default scripts path.
 # Use the imagestream you built
