@@ -1,0 +1,358 @@
+# Complete OpenShift Build Fix - Copy-Paste Ready
+
+## Problem: “no space left on device” during OpenShift S2I builds
+
+## Solution: Symlink /var/tmp to /opt/tmp (main filesystem) instead of tmpfs
+
+-----
+
+## Method 1: Fixed Custom Image (RECOMMENDED)
+
+### Step 1: Build Fixed Custom HTTPD Image
+
+```bash
+# Create fixed custom image with /opt/tmp target
+oc start-build custom-httpd-s2i --from-dockerfile='FROM image-registry.openshift.image-registry.svc:5000/openshift/httpd:latest
+
+USER root
+
+RUN mkdir -p /opt/tmp && \
+    chmod 1777 /opt/tmp && \
+    rm -rf /var/tmp && \
+    ln -sf /opt/tmp /var/tmp
+
+ENV TMPDIR=/opt/tmp \
+    BUILDAH_TMPDIR=/opt/tmp \
+    S2I_TMP_DIR=/opt/tmp \
+    TMP=/opt/tmp \
+    TEMP=/opt/tmp
+
+USER 1001'
+
+# Monitor the custom image build
+oc logs -f bc/custom-httpd-s2i
+```
+
+### Step 2: Test the Fixed Custom Image
+
+```bash
+# Test the fixed custom image
+oc run test-fixed --image=image-registry.openshift.image-registry.svc:5000/demo-project/custom-httpd-s2i:latest --rm -it --command -- /bin/bash -c "
+echo '=== Testing Fixed Image ===';
+echo 'Symlink check:';
+ls -la /var/tmp;
+echo 'Target directory:';
+ls -la /opt/tmp;
+echo 'Disk space for /opt:';
+df -h /opt;
+echo 'Write test (100MB):';
+dd if=/dev/zero of=/opt/tmp/test-write bs=1M count=100 2>/dev/null && echo 'SUCCESS: Can write to /opt/tmp' || echo 'FAILED: Cannot write';
+rm -f /opt/tmp/test-write;
+echo 'Test completed.';
+"
+```
+
+### Step 3: Update Your Application Build
+
+```bash
+# Update your existing BuildConfig to use fixed custom image and /opt/tmp
+oc patch bc/plugin-registry -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "from": {
+          "kind": "ImageStreamTag",
+          "namespace": "demo-project", 
+          "name": "custom-httpd-s2i:latest"
+        },
+        "env": [
+          {"name": "TMPDIR", "value": "/opt/tmp"},
+          {"name": "BUILDAH_TMPDIR", "value": "/opt/tmp"},
+          {"name": "S2I_TMP_DIR", "value": "/opt/tmp"}
+        ]
+      }
+    }
+  }
+}'
+```
+
+### Step 4: Test Your Application Build
+
+```bash
+# Start build with your source
+oc start-build plugin-registry --from-dir=./your-source-directory
+
+# Monitor build logs
+oc logs -f bc/plugin-registry
+```
+
+-----
+
+## Method 2: S2I Script Override (If custom image rebuild not possible)
+
+### Step 1: Create Fixed Assemble Script
+
+```bash
+cat > assemble << 'EOF'
+#!/bin/bash
+set -e
+
+echo "=== FIXED S2I ASSEMBLE START ==="
+
+# Create temp directory in /opt (main filesystem)
+mkdir -p /opt/tmp
+chmod 1777 /opt/tmp
+
+# Handle existing /var/tmp
+if [ -d /var/tmp ] && [ ! -L /var/tmp ]; then
+    echo "Backing up existing /var/tmp..."
+    cp -rf /var/tmp/* /opt/tmp/ 2>/dev/null || true
+    rm -rf /var/tmp
+fi
+
+# Create symlink to /opt/tmp
+echo "Creating symlink: /var/tmp -> /opt/tmp"
+ln -sfn /opt/tmp /var/tmp
+
+# Set environment variables
+export TMPDIR=/opt/tmp
+export BUILDAH_TMPDIR=/opt/tmp
+export S2I_TMP_DIR=/opt/tmp
+export TMP=/opt/tmp
+export TEMP=/opt/tmp
+
+# Verification
+echo "=== Verification ==="
+echo "Symlink: $(ls -la /var/tmp)"
+echo "Target: $(ls -la /opt/tmp)"
+echo "Space: $(df -h /opt | tail -1)"
+echo "Write test: $(touch /opt/tmp/test && echo 'OK' || echo 'FAIL')"
+rm -f /opt/tmp/test
+
+# Find and execute original assemble
+echo "=== Starting Original Assemble ==="
+if [ -f /usr/libexec/s2i/assemble ]; then
+    exec /usr/libexec/s2i/assemble
+elif [ -f /opt/app-root/s2i/bin/assemble ]; then
+    exec /opt/app-root/s2i/bin/assemble
+else
+    echo "Fallback: copying source"
+    mkdir -p /opt/app-root/src
+    cp -rf /tmp/src/* /opt/app-root/src/ 2>/dev/null || true
+fi
+EOF
+
+chmod +x assemble
+```
+
+### Step 2: Apply S2I Script Override
+
+```bash
+# Create ConfigMap with fixed script
+oc create configmap fixed-s2i-scripts --from-file=assemble --dry-run=client -o yaml | oc apply -f -
+
+# Update BuildConfig to use the script
+oc patch bc/plugin-registry -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "scripts": "file:///opt/fixed-scripts",
+        "env": [
+          {"name": "TMPDIR", "value": "/opt/tmp"},
+          {"name": "BUILDAH_TMPDIR", "value": "/opt/tmp"},
+          {"name": "S2I_TMP_DIR", "value": "/opt/tmp"}
+        ],
+        "volumes": [{
+          "name": "fixed-scripts",
+          "configMap": {
+            "name": "fixed-s2i-scripts",
+            "defaultMode": 493
+          }
+        }],
+        "volumeMounts": [{
+          "name": "fixed-scripts",
+          "mountPath": "/opt/fixed-scripts"
+        }]
+      }
+    }
+  }
+}'
+```
+
+### Step 3: Test the S2I Override
+
+```bash
+# Start build
+oc start-build plugin-registry --from-dir=./your-source-directory
+
+# Monitor for verification messages
+oc logs -f bc/plugin-registry | grep -E "(FIXED|Verification|symlink|OK|FAIL)"
+
+# Full build log
+oc logs -f bc/plugin-registry
+```
+
+-----
+
+## Method 3: Complete Fresh Setup (If starting from scratch)
+
+### Step 1: Create Everything from Scratch
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=== Creating Complete Fresh Setup ==="
+
+# Create custom HTTPD S2I builder
+oc create imagestream custom-httpd-s2i --dry-run=client -o yaml | oc apply -f -
+
+oc new-build --name custom-httpd-s2i --dockerfile='FROM image-registry.openshift.image-registry.svc:5000/openshift/httpd:latest
+
+USER root
+
+RUN mkdir -p /opt/tmp && \
+    chmod 1777 /opt/tmp && \
+    rm -rf /var/tmp && \
+    ln -sf /opt/tmp /var/tmp
+
+ENV TMPDIR=/opt/tmp \
+    BUILDAH_TMPDIR=/opt/tmp \
+    S2I_TMP_DIR=/opt/tmp \
+    TMP=/opt/tmp \
+    TEMP=/opt/tmp
+
+USER 1001'
+
+echo "Waiting for custom builder to complete..."
+oc wait --for=condition=Complete build/custom-httpd-s2i-1 --timeout=600s
+
+# Clean up existing application build
+oc delete bc/plugin-registry is/plugin-registry --ignore-not-found=true
+
+# Create application build
+oc new-build custom-httpd-s2i \
+  --name=plugin-registry \
+  --binary=true \
+  --env TMPDIR=/opt/tmp \
+  --env BUILDAH_TMPDIR=/opt/tmp \
+  --env S2I_TMP_DIR=/opt/tmp
+
+# Set resource limits
+oc patch bc/plugin-registry -p '{
+  "spec": {
+    "resources": {
+      "limits": {
+        "ephemeral-storage": "50Gi",
+        "memory": "4Gi",
+        "cpu": "2"
+      },
+      "requests": {
+        "ephemeral-storage": "40Gi",
+        "memory": "2Gi", 
+        "cpu": "1"
+      }
+    },
+    "successfulBuildsHistoryLimit": 5,
+    "failedBuildsHistoryLimit": 1
+  }
+}'
+
+echo "=== Setup Complete ==="
+echo "To build: oc start-build plugin-registry --from-dir=./your-source-directory"
+echo "To monitor: oc logs -f bc/plugin-registry"
+```
+
+### Step 2: Run Fresh Setup
+
+```bash
+# Save above script as setup-fresh.sh and run
+chmod +x setup-fresh.sh
+./setup-fresh.sh
+```
+
+-----
+
+## Quick Test Commands
+
+```bash
+# Test if /opt/tmp approach works
+oc run test-opt --image=registry.redhat.io/ubi8/ubi:latest --rm -it --command -- /bin/bash -c "
+mkdir -p /opt/tmp;
+df -h /opt;
+dd if=/dev/zero of=/opt/tmp/bigfile bs=1M count=500 2>/dev/null && echo 'SUCCESS: 500MB written to /opt' || echo 'FAILED';
+rm -f /opt/tmp/bigfile;
+"
+
+# Verify your custom image has correct symlink
+oc run verify-custom --image=image-registry.openshift.image-registry.svc:5000/demo-project/custom-httpd-s2i:latest --rm -it --command -- /bin/bash -c "
+echo 'Symlink check:';
+ls -la /var/tmp;
+echo 'Target check:';
+ls -la /opt/tmp;
+"
+```
+
+-----
+
+## Monitoring Commands
+
+```bash
+# Monitor build progress
+oc get builds -w
+
+# Watch build logs with filtering
+oc logs -f bc/plugin-registry | grep -E "(error|Error|SUCCESS|FAIL|symlink|space left)"
+
+# Check build pod resources during build
+oc get pods | grep build
+oc describe pod <build-pod-name> | grep -A 10 Resources
+
+# Check final build status
+oc describe build <build-name>
+```
+
+-----
+
+## Cleanup Commands (if needed)
+
+```bash
+# Clean up test pods
+oc delete pod --field-selector=status.phase==Succeeded
+
+# Reset BuildConfig to original state
+oc patch bc/plugin-registry -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "scripts": null,
+        "volumes": null,
+        "volumeMounts": null
+      }
+    }
+  }
+}'
+
+# Delete custom scripts ConfigMap
+oc delete configmap fixed-s2i-scripts --ignore-not-found=true
+```
+
+-----
+
+## Expected Success Indicators
+
+✅ **Custom image test shows**: Symlink `/var/tmp -> /opt/tmp`  
+✅ **Write test passes**: Can write large files to `/opt/tmp`  
+✅ **Build logs show**: Verification messages with “OK” status  
+✅ **Build completes**: No “no space left on device” errors  
+✅ **Image pushed**: Successfully to registry
+
+-----
+
+## Troubleshooting
+
+**If Method 1 fails**: Try Method 2 (S2I script override)  
+**If both fail**: Use Method 3 (complete fresh setup)  
+**If still issues**: Check that `/opt` has sufficient space with `df -h /opt`
+
+**Key difference**: `/opt/tmp` uses main container filesystem (your 50Gi ephemeral storage) instead of small tmpfs mounts.
