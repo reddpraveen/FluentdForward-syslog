@@ -1,3 +1,45 @@
+Quick workaround (no rebuild)
+Point the running container back to the default scripts path.
+# Use the imagestream you built
+oc new-app --image-stream=plugin-registry \
+  -e STI_SCRIPTS_URL=image:///usr/libexec/s2i \
+  -e S2I_SCRIPTS_URL=image:///usr/libexec/s2i
+Either env is fine; I set both for safety.
+Proper fix (rebuild image without the override)
+Remove the scripts override + volume from the BuildConfig (we only needed them to get the build to pass).
+NS=demo-project
+BC=plugin-registry
+
+oc -n "$NS" patch bc/"$BC" --type=json -p '[
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/scripts"},
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/volumes"}
+]' || true
+(Optional but recommended) Keep the temp-dir envs in BC if you still want builds to avoid /var/tmp:
+oc -n "$NS" patch bc/"$BC" --type=merge -p '{
+  "spec":{"strategy":{"sourceStrategy":{
+    "env":[
+      {"name":"TMPDIR","value":"/var/lib/containers/storage/tmp"},
+      {"name":"BUILDAH_TMPDIR","value":"/var/lib/containers/storage/tmp"},
+      {"name":"S2I_TMP_DIR","value":"/var/lib/containers/storage/tmp"},
+      {"name":"STORAGE_TRANSPORT_TMPDIR","value":"/var/lib/containers/storage/tmp"},
+      {"name":"XDG_RUNTIME_DIR","value":"/var/lib/containers/storage/tmp/run"}
+    ]
+  }}}}'
+Start a fresh build to produce a clean image (its label will revert to the default):
+oc -n "$NS" start-build "$BC" --follow
+Deploy the rebuilt image normally (no envs needed now):
+oc new-app --image-stream=plugin-registry
+(Optional) Check what the image is currently pointing to
+# Show the scripts-url label on the current imagestream tag
+oc -n "$NS" get istag ${BC}:latest \
+  -o jsonpath='{.image.dockerImageMetadata.Config.Labels.io\.openshift\.s2i\.scripts-url}{"\n"}'
+If it prints image:///opt/s2i-scripts, that’s why the runtime was failing.
+If you prefer to keep the current image without rebuilding, you can also patch the created Deployment to inject:
+STI_SCRIPTS_URL=image:///usr/libexec/s2i
+S2I_SCRIPTS_URL=image:///usr/libexec/s2i
+but the rebuild path is cleaner going forward.
+
+----------
 NS=demo-project
 BC=plugin-registry
 
