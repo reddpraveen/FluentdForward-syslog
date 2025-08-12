@@ -1,4 +1,46 @@
 
+NS=demo-project
+BC=plugin-registry
+
+# 1) ConfigMap with BOTH scripts
+oc -n "$NS" delete configmap plugin-registry-s2i-all --ignore-not-found
+oc -n "$NS" create configmap plugin-registry-s2i-all \
+  --from-file=assemble=./assemble \
+  --from-file=run=./run
+
+# 2) Remove the bad 'scripts' field
+oc -n "$NS" patch bc/"$BC" --type=json -p '[
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/scripts"}
+]' || true
+
+# 3) Mount the CM right over the default scripts directory
+oc -n "$NS" patch bc/"$BC" --type=merge -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "volumes": [
+          {
+            "name": "s2i-all",
+            "source": { "type": "ConfigMap", "configMap": {
+              "name": "plugin-registry-s2i-all",
+              "items": [
+                {"key":"assemble","path":"assemble"},
+                {"key":"run","path":"run"}
+              ]
+            }},
+            "mounts": [{ "destinationPath": "/usr/libexec/s2i" }]
+          }
+        ]
+      }
+    }
+  }
+}'
+
+# 4) Restart build
+oc -n "$NS" cancel-build bc/"$BC" --state=new,running || true
+oc -n "$NS" start-build "$BC" --follow
+
+--------
 0) Set variables (edit if needed)
 NS=demo-project
 BC=plugin-registry
