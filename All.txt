@@ -1,6 +1,70 @@
 NS=demo-project
 BC=plugin-registry
 
+# 1) Recreate the ConfigMap with both scripts (expects ./assemble and ./run in your cwd)
+oc -n "$NS" delete configmap plugin-registry-s2i-all --ignore-not-found
+oc -n "$NS" create configmap plugin-registry-s2i-all \
+  --from-file=assemble=./assemble \
+  --from-file=run=./run
+
+# 2) Clean previous fields
+oc -n "$NS" patch bc/"$BC" --type=json -p '[
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/volumes"},
+  {"op":"remove","path":"/spec/strategy/sourceStrategy/scripts"}
+]' || true
+
+# 3) Patch BC: mount CM, set scripts URL, and make files executable (0755 = 493 decimal)
+oc -n "$NS" patch bc/"$BC" --type=merge -p '{
+  "spec": {
+    "strategy": {
+      "sourceStrategy": {
+        "scripts": "image:///opt/s2i-scripts",
+        "volumes": [
+          {
+            "name": "s2i-all",
+            "source": {
+              "type": "ConfigMap",
+              "configMap": {
+                "name": "plugin-registry-s2i-all",
+                "defaultMode": 493,
+                "items": [
+                  { "key": "assemble", "path": "assemble", "mode": 493 },
+                  { "key": "run",      "path": "run",      "mode": 493 }
+                ]
+              }
+            },
+            "mounts": [ { "destinationPath": "/opt/s2i-scripts" } ]
+          }
+        ],
+        "env": [
+          { "name": "TMPDIR",                    "value": "/var/lib/containers/storage/tmp" },
+          { "name": "BUILDAH_TMPDIR",            "value": "/var/lib/containers/storage/tmp" },
+          { "name": "S2I_TMP_DIR",               "value": "/var/lib/containers/storage/tmp" },
+          { "name": "STORAGE_TRANSPORT_TMPDIR",  "value": "/var/lib/containers/storage/tmp" },
+          { "name": "XDG_RUNTIME_DIR",           "value": "/var/lib/containers/storage/tmp/run" }
+        ]
+      }
+    },
+    "resources": {
+      "requests": { "ephemeral-storage": "50Gi" },
+      "limits":   { "ephemeral-storage": "50Gi" }
+    }
+  }
+}'
+
+# 4) Restart build
+oc -n "$NS" cancel-build bc/"$BC" --state=new,running || true
+oc -n "$NS" start-build "$BC" --follow
+
+# 5) (Optional) Verify perms inside build pod
+POD=$(oc -n "$NS" get pods -l "openshift.io/build.name" -o name | tail -n1 | cut -d/ -f2)
+oc -n "$NS" rsh "$POD" sh -lc 'ls -l /opt/s2i-scripts; file /opt/s2i-scripts/assemble'
+
+
+--------------
+NS=demo-project
+BC=plugin-registry
+
 # 1) (Re)create a ConfigMap that holds BOTH scripts you already wrote
 #    (assumes files ./assemble and ./run are in your current dir)
 oc -n "$NS" delete configmap plugin-registry-s2i-all --ignore-not-found
