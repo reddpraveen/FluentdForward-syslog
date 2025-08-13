@@ -1,0 +1,149 @@
+Here is a clean, copy-paste-ready multi-document YAML you can save to a file (for example rhdh-aap-onefile.yaml) and apply with a single command: oc apply -f rhdh-aap-onefile.yaml. Replace every placeholder in angle brackets before applying.
+
+apiVersion: v1
+kind: Namespace
+meta
+  name: <RHDH_NAMESPACE>
+***
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+meta
+  name: plugin-registry
+  namespace: <RHDH_NAMESPACE>
+spec: {}
+***
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+meta
+  name: plugin-registry
+  namespace: <RHDH_NAMESPACE>
+spec:
+  source:
+    type: Binary
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfile: |
+        FROM registry.access.redhat.com/ubi9/httpd-24:latest
+        USER 0
+        RUN mkdir -p /var/www/html && chown -R 1001:0 /var/www/html
+        USER 1001
+        COPY . /var/www/html
+        EXPOSE 8080
+        CMD /usr/libexec/s2i/run
+  output:
+    to:
+      kind: ImageStreamTag
+      name: plugin-registry:latest
+***
+apiVersion: apps/v1
+kind: Deployment
+meta
+  name: plugin-registry
+  namespace: <RHDH_NAMESPACE>
+  labels:
+    app: plugin-registry
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: plugin-registry
+  template:
+    meta
+      labels:
+        app: plugin-registry
+    spec:
+      containers:
+        - name: plugin-registry
+          image: image-registry.openshift-image-registry.svc:5000/<RHDH_NAMESPACE>/plugin-registry:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+***
+apiVersion: v1
+kind: Service
+meta
+  name: plugin-registry
+  namespace: <RHDH_NAMESPACE>
+  labels:
+    app: plugin-registry
+spec:
+  selector:
+    app: plugin-registry
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+***
+apiVersion: route.openshift.io/v1
+kind: Route
+meta
+  name: plugin-registry
+  namespace: <RHDH_NAMESPACE>
+spec:
+  to:
+    kind: Service
+    name: plugin-registry
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+***
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: dynamic-plugins
+  namespace: <RHDH_NAMESPACE>
+
+  dynamic-plugins.yaml: |
+    plugins:
+      - package: ansible-plugin-backstage-rhaap-dynamic
+        integrity: "<INTEGRITY_HASH_FOR_UI>"
+        disabled: false
+        pluginConfig: {}
+        url: "https://plugin-registry-<RHDH_NAMESPACE>.apps.<CLUSTER_DOMAIN>/ansible-plugin-backstage-rhaap-dynamic-<VERSION>.tgz"
+      - package: ansible-plugin-backstage-rhaap-backend-dynamic
+        integrity: "<INTEGRITY_HASH_FOR_BACKEND>"
+        disabled: false
+        pluginConfig: {}
+        url: "https://plugin-registry-<RHDH_NAMESPACE>.apps.<CLUSTER_DOMAIN>/ansible-plugin-backstage-rhaap-backend-dynamic-<VERSION>.tgz"
+      - package: ansible-plugin-scaffolder-backend-module-backstage-rhaap-dynamic
+        integrity: "<INTEGRITY_HASH_FOR_SCAFFOLDER>"
+        disabled: false
+        pluginConfig: {}
+        url: "https://plugin-registry-<RHDH_NAMESPACE>.apps.<CLUSTER_DOMAIN>/ansible-plugin-scaffolder-backend-module-backstage-rhaap-dynamic-<VERSION>.tgz"
+***
+apiVersion: v1
+kind: Secret
+meta
+  name: aap-credentials
+  namespace: <RHDH_NAMESPACE>
+type: Opaque
+stringData:
+  AAP_TOKEN: "<AAP_TOKEN>"
+***
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: app-config-rhdh
+  namespace: <RHDH_NAMESPACE>
+
+  app-config-rhdh.yaml: |
+    ansible:
+      rhaap:
+        baseUrl: "https://<AAP_CONTROLLER_URL>"
+        token: "${AAP_TOKEN}"
+        checkSSL: true
+    backend:
+      reading:
+        allow:
+          - host: "<AAP_CONTROLLER_HOST>"
+
+How to use
+1) Save to a file, for example: rhdh-aap-onefile.yaml.
+2) Apply in one command: oc apply -f rhdh-aap-onefile.yaml
+3) Upload the plugin artifacts into the registry image: oc start-build plugin-registry -n <RHDH_NAMESPACE> --from-dir=<LOCAL_PLUGIN_DIR> --wait
+4) Ensure the RHDH instance loads the dynamic plugins per the operator/CR configuration, or restart the workload if managed directly: oc rollout restart deploy/<RHDH_DEPLOYMENT_NAME> -n <RHDH_NAMESPACE>
+
+Sources
