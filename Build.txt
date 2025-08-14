@@ -1,3 +1,12 @@
+# Show the redirect chain and the final effective URL
+curl -ILs https://<AAP_HOST>/api/v2/me/ | sed -n '/^HTTP\|^Location/p'
+
+# Or just follow to the end and print the final URL + status
+curl -Ls -o /dev/null -w 'FINAL_URL:%{url_effective}\nCODE:%{http_code}\n' \
+  -H "Authorization: Bearer <AAP_TOKEN>" \
+  https://<AAP_HOST>/api/v2/me/
+
+
 # OpenShift Build Ephemeral Storage Issue - Complete Fix Guide
 
 ## Problem Summary
