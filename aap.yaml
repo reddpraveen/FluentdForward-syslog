@@ -1,0 +1,90 @@
+apiVersion: rhdh.redhat.com/v1alpha1
+kind: Backstage
+metadata:
+  name: developer-hub
+  namespace: demo-project #project-namespace
+spec:
+  application:
+    appConfig: # location where the application configuration file can be added in later training exercises
+      mountPath: /opt/app-root/src
+    extraFiles:
+      mountPath: /opt/app-root/src
+    route:
+      # enable an external route to access Developer Hub - will be created by the operator
+      enabled: true
+      # if you want to enable a custom URL to access developer hub, disable the following line
+      # host: maarten-backstage.apps.rm1.0a51.p1.openshiftapps.com
+  database:
+    enableLocalDb: true
+  extraEnvs:
+    envs:
+      - name: LOG_LEVEL
+        value: INFO # change to DEBUG for more logs
+    # Disabling TLS verification (e.g., when working with self-signed certificates)
+    #- name: NODE_TLS_REJECT_UNAUTHORIZED
+    #  value: '0'
+  deployment:
+    patch:
+      spec:
+        replicas: 1
+        template: # patch in order to cache the installation and speed up the startup of the dynamic plugins
+          spec:
+            volumes:
+              - $patch: replace
+                name: dynamic-plugins-root
+                persistentVolumeClaim:
+                  claimName: dynamic-plugins-root
+
+
+
+# operator namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rhdh-operator
+---
+# namespace to work in
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-project #project-namespace
+
+
+
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: developer-hub-operator-group
+  namespace: rhdh-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: demo-project-operator-group
+  namespace: demo-project #project-namespace
+spec:
+  targetNamespaces:
+    - demo-project
+
+
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: developer-hub-operator-subscription
+  namespace: openshift-operators
+spec:
+  channel: fast
+  installPlanApproval: Automatic
+  name: rhdh
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+
+
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: "import-demo-app"
+spec:
+  type: service
+  lifecycle: development
+  owner: "group:default/unset-owner"
