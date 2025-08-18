@@ -1,3 +1,27 @@
+# Exec into Alertmanager and create a multi-year silence
+POD=$(oc -n openshift-monitoring get pod -l app.kubernetes.io/name=alertmanager,alertmanager=main -o jsonpath='{.items[0].metadata.name}')
+
+oc -n openshift-monitoring exec "$POD" -c alertmanager -- \
+  amtool silence add alertname=CollectorHighErrorRate \
+  --author="$(whoami)" \
+  --comment="Keep receiving, always silenced (OpenShift)" \
+  --duration=43800h    # ~5 years
+
+
+Verify / Audit
+List silences:
+POD=$(oc -n openshift-monitoring get pod -l app.kubernetes.io/name=alertmanager,alertmanager=main -o jsonpath='{.items[0].metadata.name}')
+oc -n openshift-monitoring exec "$POD" -c alertmanager -- amtool silence query alertname=CollectorHighErrorRate
+Show active alerts (they’ll appear silenced, not firing):
+oc -n openshift-monitoring exec "$POD" -c alertmanager -- amtool alert
+Remove the “always-silence” if you ever want it to fire again:
+# find ID
+oc -n openshift-monitoring exec "$POD" -c alertmanager -- amtool silence query alertname=CollectorHighErrorRate -o json | jq -r '.[0].id'
+# expire it
+oc -n openshift-monitoring exec "$POD" -c alertmanager -- amtool silence expire <ID>
+
+
+
 # Show the redirect chain and the final effective URL
 curl -ILs https://<AAP_HOST>/api/v2/me/ | sed -n '/^HTTP\|^Location/p'
 
