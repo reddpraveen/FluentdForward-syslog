@@ -1,0 +1,791 @@
+# ==========================================
+# 1) Master kubelet reservation (stability)
+# ==========================================
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: master-node-resource-reservation
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/master: ""
+  kubeletConfig:
+    systemReserved:
+      cpu: "2000m"
+      memory: "4Gi"
+      ephemeral-storage: "10Gi"
+    kubeReserved:
+      cpu: "1000m"
+      memory: "2Gi"
+      ephemeral-storage: "5Gi"
+    enforceNodeAllocatable:
+    - pods
+    - system-reserved
+    - kube-reserved
+    evictionHard:
+      memory.available: "500Mi"
+      nodefs.available: "5%"
+      imagefs.available: "10%"
+      pid.available: "5%"
+    evictionSoft:
+      memory.available: "1Gi"
+      nodefs.available: "10%"
+      imagefs.available: "15%"
+      pid.available: "10%"
+    evictionSoftGracePeriod:
+      memory.available: "90s"
+      nodefs.available: "120s"
+      imagefs.available: "120s"
+      pid.available: "60s"
+    maxPods: 250
+    podPidsLimit: 4096
+    imageGCHighThresholdPercent: 85
+    imageGCLowThresholdPercent: 75
+---
+# ==========================================================
+# 2) Dedicated disk for /var/lib/etcd on control-plane nodes
+#    - EXPECT an additional disk (e.g., /dev/nvme1n1) on all masters
+#    - Formats to XFS once, mounts by label, preserves SELinux
+# ==========================================================
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-etcd-dedicated-disk
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+      - path: /usr/local/bin/setup-etcd-disk.sh
+        mode: 0755
+        contents:
+          inline: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+            LOG=/var/log/etcd-disk-setup.log
+            DEV="${ETCD_DEVICE:-/dev/nvme1n1}"
+            LABEL="${ETCD_LABEL:-etcd-disk}"
+            MNT=/var/lib/etcd
+            echo "[$(date)] starting etcd-disk setup (dev=$DEV label=$LABEL)" | tee -a "$LOG"
+
+            # Require block device
+            [[ -b "$DEV" ]] || { echo "Device $DEV not found" | tee -a "$LOG"; exit 1; }
+
+            # If already mounted & labeled correctly, exit
+            if findmnt -n "$MNT" >/dev/null 2>&1; then
+              src=$(findmnt -n -o SOURCE "$MNT")
+              if blkid "$src" | grep -q "LABEL=\"$LABEL\""; then
+                echo "Already mounted correctly ($src)" | tee -a "$LOG"
+                exit 0
+              fi
+            fi
+
+            mkdir -p "$MNT"
+
+            # If device not labeled, (first time) create XFS
+            if ! blkid "$DEV" | grep -q "LABEL=\"$LABEL\""; then
+              echo "Creating XFS on $DEV with label $LABEL" | tee -a "$LOG"
+              mkfs.xfs -f -L "$LABEL" "$DEV"
+            fi
+
+            # If MNT has data, back it up before mount (one-shot on first node)
+            if [ -n "$(ls -A "$MNT" 2>/dev/null || true)" ]; then
+              BAK="/var/lib/etcd-backup-$(date +%Y%m%d-%H%M%S)"
+              echo "Backing up $MNT to $BAK" | tee -a "$LOG"
+              mkdir -p "$BAK"
+              rsync -a "$MNT/." "$BAK/."
+            fi
+
+            # Mount by label
+            echo "Mounting LABEL=$LABEL at $MNT" | tee -a "$LOG"
+            mount -t xfs -o defaults,noatime,inode64,swalloc LABEL="$LABEL" "$MNT" || {
+              echo "Mount failed" | tee -a "$LOG"; exit 1; }
+
+            # Ownership/SELinux contexts
+            chown -R etcd:etcd "$MNT" || true
+            chmod 700 "$MNT" || true
+            command -v restorecon >/dev/null && restorecon -R "$MNT" || true
+
+            # Basic write smoke test (non-fatal)
+            echo test > "$MNT/.etcd-disk-ok" 2>/dev/null || true
+            rm -f "$MNT/.etcd-disk-ok" || true
+
+            echo "[$(date)] etcd-disk setup complete" | tee -a "$LOG"
+      - path: /usr/local/bin/verify-etcd-disk.sh
+        mode: 0755
+        contents:
+          inline: |
+            #!/usr/bin/env bash
+            set -euo pipefail
+            echo "=== etcd disk verify ==="
+            findmnt /var/lib/etcd || { echo "not mounted"; exit 1; }
+            df -h /var/lib/etcd
+            echo "-- xfs info --"
+            xfs_info /var/lib/etcd || true
+            echo "-- perms --"
+            stat -c "%a %U:%G" /var/lib/etcd
+            echo "-- scheduler --"
+            dev=$(findmnt -n -o SOURCE /var/lib/etcd | sed 's/[0-9]*$//'); base=$(basename "$dev")
+            [ -f "/sys/block/$base/queue/scheduler" ] && cat "/sys/block/$base/queue/scheduler" || true
+    systemd:
+      units:
+      - name: etcd-disk-setup.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Format/label/mount dedicated etcd disk
+          Before=var-lib-etcd.mount kubelet.service
+          DefaultDependencies=no
+          After=local-fs.target
+          Wants=local-fs.target
+
+          [Service]
+          Type=oneshot
+          Environment=ETCD_DEVICE=/dev/nvme1n1
+          Environment=ETCD_LABEL=etcd-disk
+          ExecStart=/usr/local/bin/setup-etcd-disk.sh
+          RemainAfterExit=yes
+          StandardOutput=journal+console
+          StandardError=journal+console
+
+          [Install]
+          WantedBy=multi-user.target
+      - name: var-lib-etcd.mount
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Dedicated mount for /var/lib/etcd
+          After=etcd-disk-setup.service
+          Requires=etcd-disk-setup.service
+          Before=kubelet.service
+
+          [Mount]
+          What=LABEL=etcd-disk
+          Where=/var/lib/etcd
+          Type=xfs
+          Options=defaults,noatime,inode64,swalloc
+
+          [Install]
+          WantedBy=multi-user.target
+---
+# ==========================================
+# 3) PromQL “validation kit” (paste into console)
+# ==========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-promql-cheatsheet
+  namespace: openshift-config
+data:
+  README: |
+    Paste these into Observe -> Metrics (enable "User workload" if needed) to compare BEFORE vs AFTER.
+
+    # p95 WAL fsync (lower is better)
+    histogram_quantile(0.95, sum by(le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))
+
+    # p95 backend commit (lower is better)
+    histogram_quantile(0.95, sum by(le) (rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])))
+
+    # Leader changes (should be ~0 during steady state)
+    increase(etcd_server_leader_changes_seen_total[1h])
+
+    # etcd DB size per member
+    etcd_debugging_mvcc_db_total_size_in_bytes
+
+    # etcd member health table (run with Console -> Query Browser "Table" view)
+    etcd_server_has_leader
+
+    # Node-level iowait for masters (indicates disk pressure)
+    avg by (instance) (rate(node_cpu_seconds_total{mode="iowait", node=~".*master.*"}[5m]))
+
+
+
+
+
+
+
+
+Step-by-step runbook
+Pre-checks & baseline
+Confirm a fast local disk is available on every control-plane node (same device name pattern), e.g. /dev/nvme1n1.
+Baseline etcd: In the OpenShift console → Observe → Metrics, paste the PromQL from the ConfigMap above and take screenshots (keep ~15–30 minutes of data). KCS shows these are the right series to gauge storage health. 
+Red Hat Customer Portal
+(Optional) fio: run a quick 4k sync write on one master to sanity-check SSD/NVMe, per etcd guidance to benchmark disks.
+oc debug node/<master> -- chroot /host sh -c 'fio --name=etcd-fsync --directory=/var/tmp \
+  --rw=write --bs=4k --size=128m --fsync=1 --iodepth=1 --numjobs=1'
+(Goal isn’t a magic number; just capture a before/after delta. etcd strongly recommends SSD and using fio for assessment. ) 
+etcd
+Apply the bundle
+oc apply -f etcd-tuning-bundle.yaml
+oc get mcp master -w
+MCO will roll masters one-by-one (drain/reboot) and run the etcd-disk-setup.service to format/label/mount the device, matching the documented “move etcd to separate disk” approach. 
+docs.redhat.com
+Verify each node after it returns
+# For every master node:
+oc debug node/<master> -- chroot /host bash -c '
+  echo "== mount =="; findmnt /var/lib/etcd;
+  echo "== df =="; df -h /var/lib/etcd;
+  echo "== xfs =="; xfs_info /var/lib/etcd || true;
+  /usr/local/bin/verify-etcd-disk.sh || true
+'
+Then check etcd health:
+P=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)
+oc exec -n openshift-etcd "$P" -c etcd -- etcdctl endpoint status --write-out=table
+oc exec -n openshift-etcd "$P" -c etcd -- etcdctl endpoint health  --write-out=table
+Post-change validation (prove improvement)
+Re-run the same PromQL and compare p95 WAL fsync/commit latency, leader changes, and DB size. Expect WAL/commit latency to drop and leader changes to remain stable/low after moving to a dedicated disk. 
+Red Hat Customer Portal
+Capture comparable time windows before/after and embed in your change record.
+If you used fio, re-run it on /var/lib/etcd to show improved write characteristics.
+Safety & operations notes
+The official docs explicitly call out supported device patterns and that the procedure is intended to separate etcd from the root disk using MCO. (We do exactly that here.)
+docs.redhat.com
+OKD Documentation
+The “backend requirements” KCS lists the classic slow-I/O errors you might have observed in logs; faster dedicated media removes those bottlenecks. 
+Red Hat Customer Portal
+For ongoing storage tuning/benchmarking guidance, Red Hat’s storage optimization section points back to the “Recommended etcd practices” doc set. 
+docs.openshift.com
+
+
+
+rollback
+
+
+# Apply
+oc apply -f etcd-tuning-bundle.yaml
+oc get mcp master -w
+
+# If you need to roll back ONLY the etcd disk change (keep kubelet reservation):
+oc delete mc 99-master-etcd-dedicated-disk
+oc get mcp master -w
+
+
+
+#!/usr/bin/env python3
+# ocp416-etcd-promql-report.py
+# Generate baseline/post PromQL evidence (CSV + PNG) for OpenShift control plane (etcd/API).
+#
+# Usage examples:
+#   # Baseline: last 2h, 1m step
+#   python3 ocp416-etcd-promql-report.py run --label baseline --duration 2h --step 1m
+#
+#   # Post: last 2h, 1m step
+#   python3 ocp416-etcd-promql-report.py run --label post --duration 2h --step 1m
+#
+#   # Compare the two runs (prints PASS/FAIL and a small table)
+#   python3 ocp416-etcd-promql-report.py compare --baseline out/baseline/summary.json --post out/post/summary.json
+#
+# Requirements:
+#   - oc (logged in)
+#   - Python 3.8+
+#   - pip install requests pandas matplotlib
+#
+# Notes:
+#   - Charts use matplotlib with default style and no explicit colors (compat requirement).
+#   - The script auto-discovers Thanos route and bearer token via `oc`.
+
+import argparse, os, sys, json, math, time, subprocess, re, datetime as dt
+from urllib.parse import urlencode
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------- helpers ----------
+def sh(cmd):
+    return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+def get_thanos_route():
+    return sh("oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}'").strip("'")
+
+def get_token():
+    return sh("oc whoami -t")
+
+def parse_duration(d):
+    # "2h", "30m", "1d" -> seconds
+    m = re.match(r"^(\d+)([smhd])$", d)
+    if not m: raise ValueError("Bad duration: use Ns/Nm/Nh/Nd (e.g. 2h)")
+    n, u = int(m.group(1)), m.group(2)
+    return n * {"s":1,"m":60,"h":3600,"d":86400}[u]
+
+def now_utc():
+    return int(time.time())
+
+def to_rfc3339(ts):
+    return dt.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+def prom_get(url, params, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def q_range(base, query, start, end, step, token):
+    url = f"https://{base}/api/v1/query_range"
+    params = {"query": query, "start": to_rfc3339(start), "end": to_rfc3339(end), "step": step}
+    return prom_get(url, params, token)
+
+def prom_series_to_df(resp, value_name):
+    # resp.data.result = [ {metric:{...}, values:[[ts,val],...]}, ... ]
+    results = resp.get("data", {}).get("result", [])
+    frames = []
+    for series in results:
+        labels = series.get("metric", {})
+        vals = series.get("values", [])
+        if not vals: continue
+        df = pd.DataFrame(vals, columns=["ts","val"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+        df["val"] = pd.to_numeric(df["val"], errors="coerce")
+        # make a readable label: verb/resource/instance etc when present
+        label = ",".join([f"{k}={v}" for k,v in sorted(labels.items()) if k not in ("job","namespace")])
+        if not label: label = value_name
+        df = df.set_index("ts").rename(columns={"val": label})
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=[value_name])
+    out = pd.concat(frames, axis=1)
+    return out
+
+def plot_ts(df, title, out_png):
+    if df.empty:
+        print(f"[WARN] No data for {title}, skipping chart.")
+        return
+    plt.figure()
+    # NOTE: do NOT set custom colors or style
+    for col in df.columns:
+        plt.plot(df.index, df[col], label=col)
+    plt.title(title)
+    plt.xlabel("time (UTC)")
+    plt.ylabel("value")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=140)
+    plt.close()
+
+def write_csv(df, out_csv):
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    df.to_csv(out_csv, index=True)
+
+def summarize_window(df, agg="mean"):
+    if df.empty: return math.nan
+    # For API p99 we pass already the "max across series" frame; here overall mean across time
+    s = df.mean(axis=1).mean() if agg == "mean" else df.mean(axis=1).max()
+    return float(s)
+
+# ---------- queries ----------
+QUERIES = {
+    # Lower is better
+    "fsync_p99_s": r'histogram_quantile(0.99, sum(rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) by (le))',
+    "backend_commit_p99_s": r'histogram_quantile(0.99, sum(rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])) by (le))',
+    # API p99 by (verb,resource) => we’ll take a max across columns before charting/summarizing
+    "apiserver_p99_s_by_verb_resource": r'histogram_quantile(0.99, sum by (le,resource,verb) (rate(apiserver_request_duration_seconds_bucket{verb=~"GET|LIST|WATCH"}[5m])))',
+    # Leader changes per hour (should be ~0 during steady state)
+    "leader_changes_per_h": r'increase(etcd_server_leader_changes_seen_total[1h])',
+    # DB size (bytes)
+    "db_total_size_bytes": r'max(etcd_mvcc_db_total_size_in_bytes)',
+}
+
+def max_across_columns(df):
+    if df.empty: return df
+    # per timestamp, take max across series
+    return pd.DataFrame({"max": df.max(axis=1)})
+
+def run_once(label, duration, step, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    start = now_utc() - parse_duration(duration)
+    end   = now_utc()
+    thanos = get_thanos_route()
+    token  = get_token()
+    print(f"[INFO] Thanos: https://{thanos}  window: {to_rfc3339(start)} .. {to_rfc3339(end)} step={step}")
+
+    # 1) fsync p99
+    fsync_json = q_range(thanos, QUERIES["fsync_p99_s"], start, end, step, token)
+    fsync_df = prom_series_to_df(fsync_json, "fsync_p99_s")
+    write_csv(fsync_df, os.path.join(outdir, "fsync_p99.csv"))
+    plot_ts(fsync_df, "etcd WAL fsync p99 (s) — lower is better", os.path.join(outdir, "fsync_p99.png"))
+
+    # 2) backend commit p99
+    back_json = q_range(thanos, QUERIES["backend_commit_p99_s"], start, end, step, token)
+    back_df = prom_series_to_df(back_json, "backend_commit_p99_s")
+    write_csv(back_df, os.path.join(outdir, "backend_commit_p99.csv"))
+    plot_ts(back_df, "etcd backend commit p99 (s) — lower is better", os.path.join(outdir, "backend_commit_p99.png"))
+
+    # 3) API p99 by verb/resource, also produce a "max" rollup
+    api_json = q_range(thanos, QUERIES["apiserver_p99_s_by_verb_resource"], start, end, step, token)
+    api_df = prom_series_to_df(api_json, "apiserver_p99_by_vr")
+    write_csv(api_df, os.path.join(outdir, "apiserver_p99_by_verb_resource.csv"))
+    api_max = max_across_columns(api_df)
+    write_csv(api_max, os.path.join(outdir, "apiserver_p99_MAX.csv"))
+    plot_ts(api_max, "API server p99 (s) — MAX across GET/LIST/WATCH", os.path.join(outdir, "apiserver_p99_MAX.png"))
+
+    # 4) Leader changes per hour
+    lead_json = q_range(thanos, QUERIES["leader_changes_per_h"], start, end, step, token)
+    lead_df = prom_series_to_df(lead_json, "leader_changes_per_h")
+    write_csv(lead_df, os.path.join(outdir, "leader_changes_per_h.csv"))
+    plot_ts(lead_df, "Leader changes / 1h — lower/≈0 is better", os.path.join(outdir, "leader_changes_per_h.png"))
+
+    # 5) DB size
+    db_json = q_range(thanos, QUERIES["db_total_size_bytes"], start, end, step, token)
+    db_df = prom_series_to_df(db_json, "db_total_size_bytes")
+    write_csv(db_df, os.path.join(outdir, "db_total_size_bytes.csv"))
+    plot_ts(db_df, "etcd DB total size (bytes)", os.path.join(outdir, "db_total_size_bytes.png"))
+
+    # Summary (averages over window; API uses the max rollup)
+    summary = {
+        "label": label,
+        "window_start": to_rfc3339(start),
+        "window_end":   to_rfc3339(end),
+        "step": step,
+        "metrics": {
+            "fsync_p99_s_mean": summarize_window(fsync_df, "mean"),
+            "backend_commit_p99_s_mean": summarize_window(back_df, "mean"),
+            "apiserver_p99_s_MAX_mean": summarize_window(api_max, "mean"),
+            "leader_changes_per_h_mean": summarize_window(lead_df, "mean"),
+            "db_total_size_bytes_mean": summarize_window(db_df, "mean"),
+        }
+    }
+    with open(os.path.join(outdir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Wrote CSV/PNG and summary.json under: {outdir}")
+
+def pct(old, new):
+    try:
+        if old == 0 or any(math.isnan(x) for x in [old, new]): return "n/a"
+        return f"{((new-old)/old)*100:.2f}%"
+    except Exception:
+        return "n/a"
+
+def compare(baseline_path, post_path):
+    with open(baseline_path) as f: base = json.load(f)
+    with open(post_path) as f: post = json.load(f)
+    bm, pm = base["metrics"], post["metrics"]
+
+    rows = []
+    defs = [
+        ("fsync_p99_s_mean", "etcd WAL fsync p99 (s)", "≤ 0.010 or ↓"),
+        ("backend_commit_p99_s_mean", "etcd backend commit p99 (s)", "↓"),
+        ("apiserver_p99_s_MAX_mean", "API server p99 (s, MAX)", "↓"),
+        ("leader_changes_per_h_mean", "Leader changes / h", "≈ 0"),
+        ("db_total_size_bytes_mean", "DB size (bytes)", "flat or ↓"),
+    ]
+    def passfail(k, b, p):
+        if any([isinstance(v,float) and math.isnan(v) for v in [b,p]]):
+            return "N/A"
+        if k=="fsync_p99_s_mean":
+            return "PASS" if (p <= 0.010) or (p < b) else "FAIL"
+        if k=="backend_commit_p99_s_mean":
+            return "PASS" if (p < b) else "FAIL"
+        if k=="apiserver_p99_s_MAX_mean":
+            return "PASS" if (p <= b) else "FAIL"
+        if k=="leader_changes_per_h_mean":
+            return "PASS" if p <= 0.5 else "FAIL"  # ~0 over steady periods
+        if k=="db_total_size_bytes_mean":
+            return "PASS" if (p <= b) else "FAIL"
+        return "N/A"
+
+    print("")
+    print("OpenShift Control-plane Performance — Baseline vs Post")
+    print(f"  Baseline window: {base['window_start']} .. {base['window_end']}")
+    print(f"  Post window:     {post['window_start']} .. {post['window_end']}")
+    print("")
+    print(f"{'Metric':40} {'Baseline':>14} {'Post':>14} {'Δ %':>10}  Result")
+    print("-"*86)
+    for key, label, rule in defs:
+        b = bm.get(key, float("nan")); p = pm.get(key, float("nan"))
+        pct_s = pct(b,p)
+        res = passfail(key, b, p)
+        print(f"{label:40} {b:14.6f} {p:14.6f} {pct_s:>10}  {res}")
+
+# ---------- CLI ----------
+def main():
+    parser = argparse.ArgumentParser(description="OCP 4.16 etcd/API PromQL report tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="collect a report window and save CSV/PNG + summary.json")
+    p_run.add_argument("--label", required=True, help="baseline | post | any tag")
+    p_run.add_argument("--duration", default="2h", help="window size (e.g., 30m, 2h, 1d)")
+    p_run.add_argument("--step", default="1m", help="PromQL step (e.g., 30s, 1m)")
+    p_run.add_argument("--outdir", default=None, help="output dir (default: out/<label>)")
+
+    p_cmp = sub.add_parser("compare", help="compare two summary.json files")
+    p_cmp.add_argument("--baseline", required=True, help="path to baseline summary.json")
+    p_cmp.add_argument("--post", required=True, help="path to post summary.json")
+
+    args = parser.parse_args()
+
+    if args.cmd == "run":
+        outdir = args.outdir or os.path.join("out", args.label)
+        run_once(args.label, args.duration, args.step, outdir)
+    elif args.cmd == "compare":
+        compare(args.baseline, args.post)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+
+
+
+#!/usr/bin/env python3
+# ocp416-etcd-promql-report.py
+# Generate baseline/post PromQL evidence (CSV + PNG) for OpenShift control plane (etcd/API).
+#
+# Usage examples:
+#   # Baseline: last 2h, 1m step
+#   python3 ocp416-etcd-promql-report.py run --label baseline --duration 2h --step 1m
+#
+#   # Post: last 2h, 1m step
+#   python3 ocp416-etcd-promql-report.py run --label post --duration 2h --step 1m
+#
+#   # Compare the two runs (prints PASS/FAIL and a small table)
+#   python3 ocp416-etcd-promql-report.py compare --baseline out/baseline/summary.json --post out/post/summary.json
+#
+# Requirements:
+#   - oc (logged in)
+#   - Python 3.8+
+#   - pip install requests pandas matplotlib
+#
+# Notes:
+#   - Charts use matplotlib with default style and no explicit colors (compat requirement).
+#   - The script auto-discovers Thanos route and bearer token via `oc`.
+
+import argparse, os, sys, json, math, time, subprocess, re, datetime as dt
+from urllib.parse import urlencode
+import requests
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------- helpers ----------
+def sh(cmd):
+    return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+def get_thanos_route():
+    return sh("oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}'").strip("'")
+
+def get_token():
+    return sh("oc whoami -t")
+
+def parse_duration(d):
+    # "2h", "30m", "1d" -> seconds
+    m = re.match(r"^(\d+)([smhd])$", d)
+    if not m: raise ValueError("Bad duration: use Ns/Nm/Nh/Nd (e.g. 2h)")
+    n, u = int(m.group(1)), m.group(2)
+    return n * {"s":1,"m":60,"h":3600,"d":86400}[u]
+
+def now_utc():
+    return int(time.time())
+
+def to_rfc3339(ts):
+    return dt.datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+def prom_get(url, params, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def q_range(base, query, start, end, step, token):
+    url = f"https://{base}/api/v1/query_range"
+    params = {"query": query, "start": to_rfc3339(start), "end": to_rfc3339(end), "step": step}
+    return prom_get(url, params, token)
+
+def prom_series_to_df(resp, value_name):
+    # resp.data.result = [ {metric:{...}, values:[[ts,val],...]}, ... ]
+    results = resp.get("data", {}).get("result", [])
+    frames = []
+    for series in results:
+        labels = series.get("metric", {})
+        vals = series.get("values", [])
+        if not vals: continue
+        df = pd.DataFrame(vals, columns=["ts","val"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+        df["val"] = pd.to_numeric(df["val"], errors="coerce")
+        # make a readable label: verb/resource/instance etc when present
+        label = ",".join([f"{k}={v}" for k,v in sorted(labels.items()) if k not in ("job","namespace")])
+        if not label: label = value_name
+        df = df.set_index("ts").rename(columns={"val": label})
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=[value_name])
+    out = pd.concat(frames, axis=1)
+    return out
+
+def plot_ts(df, title, out_png):
+    if df.empty:
+        print(f"[WARN] No data for {title}, skipping chart.")
+        return
+    plt.figure()
+    # NOTE: do NOT set custom colors or style
+    for col in df.columns:
+        plt.plot(df.index, df[col], label=col)
+    plt.title(title)
+    plt.xlabel("time (UTC)")
+    plt.ylabel("value")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=140)
+    plt.close()
+
+def write_csv(df, out_csv):
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    df.to_csv(out_csv, index=True)
+
+def summarize_window(df, agg="mean"):
+    if df.empty: return math.nan
+    # For API p99 we pass already the "max across series" frame; here overall mean across time
+    s = df.mean(axis=1).mean() if agg == "mean" else df.mean(axis=1).max()
+    return float(s)
+
+# ---------- queries ----------
+QUERIES = {
+    # Lower is better
+    "fsync_p99_s": r'histogram_quantile(0.99, sum(rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) by (le))',
+    "backend_commit_p99_s": r'histogram_quantile(0.99, sum(rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])) by (le))',
+    # API p99 by (verb,resource) => we’ll take a max across columns before charting/summarizing
+    "apiserver_p99_s_by_verb_resource": r'histogram_quantile(0.99, sum by (le,resource,verb) (rate(apiserver_request_duration_seconds_bucket{verb=~"GET|LIST|WATCH"}[5m])))',
+    # Leader changes per hour (should be ~0 during steady state)
+    "leader_changes_per_h": r'increase(etcd_server_leader_changes_seen_total[1h])',
+    # DB size (bytes)
+    "db_total_size_bytes": r'max(etcd_mvcc_db_total_size_in_bytes)',
+}
+
+def max_across_columns(df):
+    if df.empty: return df
+    # per timestamp, take max across series
+    return pd.DataFrame({"max": df.max(axis=1)})
+
+def run_once(label, duration, step, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    start = now_utc() - parse_duration(duration)
+    end   = now_utc()
+    thanos = get_thanos_route()
+    token  = get_token()
+    print(f"[INFO] Thanos: https://{thanos}  window: {to_rfc3339(start)} .. {to_rfc3339(end)} step={step}")
+
+    # 1) fsync p99
+    fsync_json = q_range(thanos, QUERIES["fsync_p99_s"], start, end, step, token)
+    fsync_df = prom_series_to_df(fsync_json, "fsync_p99_s")
+    write_csv(fsync_df, os.path.join(outdir, "fsync_p99.csv"))
+    plot_ts(fsync_df, "etcd WAL fsync p99 (s) — lower is better", os.path.join(outdir, "fsync_p99.png"))
+
+    # 2) backend commit p99
+    back_json = q_range(thanos, QUERIES["backend_commit_p99_s"], start, end, step, token)
+    back_df = prom_series_to_df(back_json, "backend_commit_p99_s")
+    write_csv(back_df, os.path.join(outdir, "backend_commit_p99.csv"))
+    plot_ts(back_df, "etcd backend commit p99 (s) — lower is better", os.path.join(outdir, "backend_commit_p99.png"))
+
+    # 3) API p99 by verb/resource, also produce a "max" rollup
+    api_json = q_range(thanos, QUERIES["apiserver_p99_s_by_verb_resource"], start, end, step, token)
+    api_df = prom_series_to_df(api_json, "apiserver_p99_by_vr")
+    write_csv(api_df, os.path.join(outdir, "apiserver_p99_by_verb_resource.csv"))
+    api_max = max_across_columns(api_df)
+    write_csv(api_max, os.path.join(outdir, "apiserver_p99_MAX.csv"))
+    plot_ts(api_max, "API server p99 (s) — MAX across GET/LIST/WATCH", os.path.join(outdir, "apiserver_p99_MAX.png"))
+
+    # 4) Leader changes per hour
+    lead_json = q_range(thanos, QUERIES["leader_changes_per_h"], start, end, step, token)
+    lead_df = prom_series_to_df(lead_json, "leader_changes_per_h")
+    write_csv(lead_df, os.path.join(outdir, "leader_changes_per_h.csv"))
+    plot_ts(lead_df, "Leader changes / 1h — lower/≈0 is better", os.path.join(outdir, "leader_changes_per_h.png"))
+
+    # 5) DB size
+    db_json = q_range(thanos, QUERIES["db_total_size_bytes"], start, end, step, token)
+    db_df = prom_series_to_df(db_json, "db_total_size_bytes")
+    write_csv(db_df, os.path.join(outdir, "db_total_size_bytes.csv"))
+    plot_ts(db_df, "etcd DB total size (bytes)", os.path.join(outdir, "db_total_size_bytes.png"))
+
+    # Summary (averages over window; API uses the max rollup)
+    summary = {
+        "label": label,
+        "window_start": to_rfc3339(start),
+        "window_end":   to_rfc3339(end),
+        "step": step,
+        "metrics": {
+            "fsync_p99_s_mean": summarize_window(fsync_df, "mean"),
+            "backend_commit_p99_s_mean": summarize_window(back_df, "mean"),
+            "apiserver_p99_s_MAX_mean": summarize_window(api_max, "mean"),
+            "leader_changes_per_h_mean": summarize_window(lead_df, "mean"),
+            "db_total_size_bytes_mean": summarize_window(db_df, "mean"),
+        }
+    }
+    with open(os.path.join(outdir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Wrote CSV/PNG and summary.json under: {outdir}")
+
+def pct(old, new):
+    try:
+        if old == 0 or any(math.isnan(x) for x in [old, new]): return "n/a"
+        return f"{((new-old)/old)*100:.2f}%"
+    except Exception:
+        return "n/a"
+
+def compare(baseline_path, post_path):
+    with open(baseline_path) as f: base = json.load(f)
+    with open(post_path) as f: post = json.load(f)
+    bm, pm = base["metrics"], post["metrics"]
+
+    rows = []
+    defs = [
+        ("fsync_p99_s_mean", "etcd WAL fsync p99 (s)", "≤ 0.010 or ↓"),
+        ("backend_commit_p99_s_mean", "etcd backend commit p99 (s)", "↓"),
+        ("apiserver_p99_s_MAX_mean", "API server p99 (s, MAX)", "↓"),
+        ("leader_changes_per_h_mean", "Leader changes / h", "≈ 0"),
+        ("db_total_size_bytes_mean", "DB size (bytes)", "flat or ↓"),
+    ]
+    def passfail(k, b, p):
+        if any([isinstance(v,float) and math.isnan(v) for v in [b,p]]):
+            return "N/A"
+        if k=="fsync_p99_s_mean":
+            return "PASS" if (p <= 0.010) or (p < b) else "FAIL"
+        if k=="backend_commit_p99_s_mean":
+            return "PASS" if (p < b) else "FAIL"
+        if k=="apiserver_p99_s_MAX_mean":
+            return "PASS" if (p <= b) else "FAIL"
+        if k=="leader_changes_per_h_mean":
+            return "PASS" if p <= 0.5 else "FAIL"  # ~0 over steady periods
+        if k=="db_total_size_bytes_mean":
+            return "PASS" if (p <= b) else "FAIL"
+        return "N/A"
+
+    print("")
+    print("OpenShift Control-plane Performance — Baseline vs Post")
+    print(f"  Baseline window: {base['window_start']} .. {base['window_end']}")
+    print(f"  Post window:     {post['window_start']} .. {post['window_end']}")
+    print("")
+    print(f"{'Metric':40} {'Baseline':>14} {'Post':>14} {'Δ %':>10}  Result")
+    print("-"*86)
+    for key, label, rule in defs:
+        b = bm.get(key, float("nan")); p = pm.get(key, float("nan"))
+        pct_s = pct(b,p)
+        res = passfail(key, b, p)
+        print(f"{label:40} {b:14.6f} {p:14.6f} {pct_s:>10}  {res}")
+
+# ---------- CLI ----------
+def main():
+    parser = argparse.ArgumentParser(description="OCP 4.16 etcd/API PromQL report tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run", help="collect a report window and save CSV/PNG + summary.json")
+    p_run.add_argument("--label", required=True, help="baseline | post | any tag")
+    p_run.add_argument("--duration", default="2h", help="window size (e.g., 30m, 2h, 1d)")
+    p_run.add_argument("--step", default="1m", help="PromQL step (e.g., 30s, 1m)")
+    p_run.add_argument("--outdir", default=None, help="output dir (default: out/<label>)")
+
+    p_cmp = sub.add_parser("compare", help="compare two summary.json files")
+    p_cmp.add_argument("--baseline", required=True, help="path to baseline summary.json")
+    p_cmp.add_argument("--post", required=True, help="path to post summary.json")
+
+    args = parser.parse_args()
+
+    if args.cmd == "run":
+        outdir = args.outdir or os.path.join("out", args.label)
+        run_once(args.label, args.duration, args.step, outdir)
+    elif args.cmd == "compare":
+        compare(args.baseline, args.post)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
