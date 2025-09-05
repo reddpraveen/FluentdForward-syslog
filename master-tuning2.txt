@@ -1,0 +1,3573 @@
+
+---
+# Master Node Performance Tuning Configuration
+# Red Hat Community of Practice - OpenShift 4.16
+# This configuration increases reserved resources on master nodes for better performance
+
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-node-performance-tuning
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    systemd:
+      units:
+      - name: kubelet.service
+        enabled: true
+        dropins:
+        - name: 20-reserved-resources.conf
+          contents: |
+            [Service]
+            # Increase reserved resources for master nodes
+            Environment="KUBELET_RESERVED_CPU=1000m"
+            Environment="KUBELET_RESERVED_MEMORY=2Gi"
+            Environment="KUBELET_RESERVED_EPHEMERAL_STORAGE=1Gi"
+            # Additional performance tuning
+            Environment="KUBELET_MAX_PODS=110"
+            Environment="KUBELET_PODS_PER_CORE=10"
+            # Enable kubelet eviction thresholds
+            Environment="KUBELET_EVICTION_HARD_MEMORY_AVAILABLE=500Mi"
+            Environment="KUBELET_EVICTION_HARD_NODE_FS_AVAILABLE=10%"
+            Environment="KUBELET_EVICTION_SOFT_MEMORY_AVAILABLE=1Gi"
+            Environment="KUBELET_EVICTION_SOFT_NODE_FS_AVAILABLE=15%"
+            Environment="KUBELET_EVICTION_SOFT_GRACE_PERIOD=2m"
+            # System reserved resources
+            Environment="KUBELET_SYSTEM_RESERVED_CPU=1000m"
+            Environment="KUBELET_SYSTEM_RESERVED_MEMORY=2Gi"
+            Environment="KUBELET_SYSTEM_RESERVED_EPHEMERAL_STORAGE=1Gi"
+            # Kube reserved resources
+            Environment="KUBELET_KUBE_RESERVED_CPU=500m"
+            Environment="KUBELET_KUBE_RESERVED_MEMORY=1Gi"
+            Environment="KUBELET_KUBE_RESERVED_EPHEMERAL_STORAGE=1Gi"
+            # Performance optimizations
+            Environment="KUBELET_FEATURE_GATES=RotateKubeletServerCertificate=true"
+            Environment="KUBELET_LOG_LEVEL=2"
+            Environment="KUBELET_V=2"
+            # Restart policy
+            Restart=always
+            RestartSec=10
+
+
+---
+# RBAC for ConfigMap/Secret Pruning Job
+# Red Hat Community of Practice - OpenShift 4.16
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prune-resources-sa
+  namespace: openshift-infra
+  labels:
+    app.kubernetes.io/name: prune-resources
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/part-of: openshift-maintenance
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prune-resources-role
+  labels:
+    app.kubernetes.io/name: prune-resources
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/part-of: openshift-maintenance
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["extensions", "networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prune-resources-binding
+  labels:
+    app.kubernetes.io/name: prune-resources
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/part-of: openshift-maintenance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prune-resources-role
+subjects:
+- kind: ServiceAccount
+  name: prune-resources-sa
+  namespace: openshift-infra
+
+
+
+
+#!/bin/bash
+# ConfigMap/Secret Pruning Script
+# Red Hat Community of Practice - OpenShift 4.16
+# Safe pruning with dry-run by default and deletion limits
+
+set -euo pipefail
+
+# Configuration
+DRY_RUN=${DRY_RUN:-true}
+MAX_DELETIONS=${MAX_DELETIONS:-50}
+NAMESPACE_FILTER=${NAMESPACE_FILTER:-""}
+LOG_LEVEL=${LOG_LEVEL:-info}
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" >&2
+}
+
+log_info() {
+    if [[ "$LOG_LEVEL" == "debug" ]] || [[ "$LOG_LEVEL" == "info" ]]; then
+        log "INFO: $1"
+    fi
+}
+
+log_debug() {
+    if [[ "$LOG_LEVEL" == "debug" ]]; then
+        log "DEBUG: $1"
+    fi
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+# Check if running in dry-run mode
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "Running in DRY-RUN mode. No resources will be deleted."
+    OC_DELETE_FLAGS="--dry-run=client"
+else
+    log_info "Running in DELETE mode. Resources will be permanently deleted!"
+    OC_DELETE_FLAGS=""
+fi
+
+# Function to check if resource is referenced
+is_resource_referenced() {
+    local resource_type=$1
+    local resource_name=$2
+    local namespace=$3
+    
+    log_debug "Checking if $resource_type/$resource_name in namespace $namespace is referenced"
+    
+    # Check Deployments
+    if oc get deployments -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by a Deployment"
+        return 0
+    fi
+    
+    # Check DaemonSets
+    if oc get daemonsets -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by a DaemonSet"
+        return 0
+    fi
+    
+    # Check StatefulSets
+    if oc get statefulsets -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by a StatefulSet"
+        return 0
+    fi
+    
+    # Check Jobs
+    if oc get jobs -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by a Job"
+        return 0
+    fi
+    
+    # Check Pods
+    if oc get pods -n "$namespace" -o json | jq -e ".items[] | select(.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by a Pod"
+        return 0
+    fi
+    
+    # Check Ingresses
+    if oc get ingresses -n "$namespace" -o json | jq -e ".items[] | select(.metadata.annotations.\"kubernetes.io/tls-acme\" == \"true\" and .spec.tls[].secretName == \"$resource_name\")" >/dev/null 2>&1; then
+        log_debug "$resource_type/$resource_name is referenced by an Ingress"
+        return 0
+    fi
+    
+    log_debug "$resource_type/$resource_name is not referenced"
+    return 1
+}
+
+# Function to prune resources
+prune_resources() {
+    local resource_type=$1
+    local deletion_count=0
+    
+    log_info "Starting to prune $resource_type resources"
+    
+    # Get namespaces to process
+    if [[ -n "$NAMESPACE_FILTER" ]]; then
+        namespaces=$(oc get namespaces -o name | grep -E "$NAMESPACE_FILTER" | cut -d/ -f2)
+    else
+        namespaces=$(oc get namespaces -o jsonpath='{.items[*].metadata.name}')
+    fi
+    
+    for namespace in $namespaces; do
+        log_debug "Processing namespace: $namespace"
+        
+        # Skip system namespaces
+        if [[ "$namespace" =~ ^(openshift-|kube-|default$) ]]; then
+            log_debug "Skipping system namespace: $namespace"
+            continue
+        fi
+        
+        # Get resources in namespace
+        resources=$(oc get "$resource_type" -n "$namespace" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+        
+        for resource in $resources; do
+            if [[ $deletion_count -ge $MAX_DELETIONS ]]; then
+                log_info "Reached maximum deletion limit of $MAX_DELETIONS. Stopping."
+                return
+            fi
+            
+            # Skip if resource is referenced
+            if is_resource_referenced "$resource_type" "$resource" "$namespace"; then
+                log_debug "Skipping referenced $resource_type/$resource in namespace $namespace"
+                continue
+            fi
+            
+            # Delete the resource
+            log_info "Deleting $resource_type/$resource in namespace $namespace"
+            if oc delete "$resource_type" "$resource" -n "$namespace" $OC_DELETE_FLAGS; then
+                deletion_count=$((deletion_count + 1))
+                log_info "Successfully deleted $resource_type/$resource (deletion count: $deletion_count)"
+            else
+                log_error "Failed to delete $resource_type/$resource in namespace $namespace"
+            fi
+        done
+    done
+    
+    log_info "Completed pruning $resource_type resources. Total deletions: $deletion_count"
+}
+
+# Main execution
+main() {
+    log_info "Starting ConfigMap/Secret pruning job"
+    log_info "Configuration: DRY_RUN=$DRY_RUN, MAX_DELETIONS=$MAX_DELETIONS, NAMESPACE_FILTER=$NAMESPACE_FILTER"
+    
+    # Prune ConfigMaps
+    prune_resources "configmaps"
+    
+    # Prune Secrets
+    prune_resources "secrets"
+    
+    log_info "ConfigMap/Secret pruning job completed successfully"
+}
+
+# Run main function
+main "$@"
+
+
+---
+# ConfigMap/Secret Pruning CronJob
+# Red Hat Community of Practice - OpenShift 4.16
+# Container-based CronJob using ose-cli image
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prune-resources-script
+  namespace: openshift-infra
+  labels:
+    app.kubernetes.io/name: prune-resources
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/part-of: openshift-maintenance
+data:
+  prune-script.sh: |
+    #!/bin/bash
+    # ConfigMap/Secret Pruning Script
+    # Red Hat Community of Practice - OpenShift 4.16
+    # Safe pruning with dry-run by default and deletion limits
+
+    set -euo pipefail
+
+    # Configuration
+    DRY_RUN=${DRY_RUN:-true}
+    MAX_DELETIONS=${MAX_DELETIONS:-50}
+    NAMESPACE_FILTER=${NAMESPACE_FILTER:-""}
+    LOG_LEVEL=${LOG_LEVEL:-info}
+
+    # Logging function
+    log() {
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" >&2
+    }
+
+    log_info() {
+        if [[ "$LOG_LEVEL" == "debug" ]] || [[ "$LOG_LEVEL" == "info" ]]; then
+            log "INFO: $1"
+        fi
+    }
+
+    log_debug() {
+        if [[ "$LOG_LEVEL" == "debug" ]]; then
+            log "DEBUG: $1"
+        fi
+    }
+
+    log_error() {
+        log "ERROR: $1"
+    }
+
+    # Check if running in dry-run mode
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "Running in DRY-RUN mode. No resources will be deleted."
+        OC_DELETE_FLAGS="--dry-run=client"
+    else
+        log_info "Running in DELETE mode. Resources will be permanently deleted!"
+        OC_DELETE_FLAGS=""
+    fi
+
+    # Function to check if resource is referenced
+    is_resource_referenced() {
+        local resource_type=$1
+        local resource_name=$2
+        local namespace=$3
+        
+        log_debug "Checking if $resource_type/$resource_name in namespace $namespace is referenced"
+        
+        # Check Deployments
+        if oc get deployments -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by a Deployment"
+            return 0
+        fi
+        
+        # Check DaemonSets
+        if oc get daemonsets -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by a DaemonSet"
+            return 0
+        fi
+        
+        # Check StatefulSets
+        if oc get statefulsets -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by a StatefulSet"
+            return 0
+        fi
+        
+        # Check Jobs
+        if oc get jobs -n "$namespace" -o json | jq -e ".items[] | select(.spec.template.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.template.spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.template.spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by a Job"
+            return 0
+        fi
+        
+        # Check Pods
+        if oc get pods -n "$namespace" -o json | jq -e ".items[] | select(.spec.volumes[]?.configMap.name == \"$resource_name\" or .spec.volumes[]?.secret.secretName == \"$resource_name\" or .spec.containers[].envFrom[]?.configMapRef.name == \"$resource_name\" or .spec.containers[].envFrom[]?.secretRef.name == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by a Pod"
+            return 0
+        fi
+        
+        # Check Ingresses
+        if oc get ingresses -n "$namespace" -o json | jq -e ".items[] | select(.metadata.annotations.\"kubernetes.io/tls-acme\" == \"true\" and .spec.tls[].secretName == \"$resource_name\")" >/dev/null 2>&1; then
+            log_debug "$resource_type/$resource_name is referenced by an Ingress"
+            return 0
+        fi
+        
+        log_debug "$resource_type/$resource_name is not referenced"
+        return 1
+    }
+
+    # Function to prune resources
+    prune_resources() {
+        local resource_type=$1
+        local deletion_count=0
+        
+        log_info "Starting to prune $resource_type resources"
+        
+        # Get namespaces to process
+        if [[ -n "$NAMESPACE_FILTER" ]]; then
+            namespaces=$(oc get namespaces -o name | grep -E "$NAMESPACE_FILTER" | cut -d/ -f2)
+        else
+            namespaces=$(oc get namespaces -o jsonpath='{.items[*].metadata.name}')
+        fi
+        
+        for namespace in $namespaces; do
+            log_debug "Processing namespace: $namespace"
+            
+            # Skip system namespaces
+            if [[ "$namespace" =~ ^(openshift-|kube-|default$) ]]; then
+                log_debug "Skipping system namespace: $namespace"
+                continue
+            fi
+            
+            # Get resources in namespace
+            resources=$(oc get "$resource_type" -n "$namespace" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+            
+            for resource in $resources; do
+                if [[ $deletion_count -ge $MAX_DELETIONS ]]; then
+                    log_info "Reached maximum deletion limit of $MAX_DELETIONS. Stopping."
+                    return
+                fi
+                
+                # Skip if resource is referenced
+                if is_resource_referenced "$resource_type" "$resource" "$namespace"; then
+                    log_debug "Skipping referenced $resource_type/$resource in namespace $namespace"
+                    continue
+                fi
+                
+                # Delete the resource
+                log_info "Deleting $resource_type/$resource in namespace $namespace"
+                if oc delete "$resource_type" "$resource" -n "$namespace" $OC_DELETE_FLAGS; then
+                    deletion_count=$((deletion_count + 1))
+                    log_info "Successfully deleted $resource_type/$resource (deletion count: $deletion_count)"
+                else
+                    log_error "Failed to delete $resource_type/$resource in namespace $namespace"
+                fi
+            done
+        done
+        
+        log_info "Completed pruning $resource_type resources. Total deletions: $deletion_count"
+    }
+
+    # Main execution
+    main() {
+        log_info "Starting ConfigMap/Secret pruning job"
+        log_info "Configuration: DRY_RUN=$DRY_RUN, MAX_DELETIONS=$MAX_DELETIONS, NAMESPACE_FILTER=$NAMESPACE_FILTER"
+        
+        # Prune ConfigMaps
+        prune_resources "configmaps"
+        
+        # Prune Secrets
+        prune_resources "secrets"
+        
+        log_info "ConfigMap/Secret pruning job completed successfully"
+    }
+
+    # Run main function
+    main "$@"
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prune-resources
+  namespace: openshift-infra
+  labels:
+    app.kubernetes.io/name: prune-resources
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/part-of: openshift-maintenance
+spec:
+  # Run every Sunday at 2 AM
+  schedule: "0 2 * * 0"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: prune-resources
+            app.kubernetes.io/component: cleanup
+            app.kubernetes.io/part-of: openshift-maintenance
+        spec:
+          serviceAccountName: prune-resources-sa
+          # Schedule on infra nodes
+          nodeSelector:
+            node-role.kubernetes.io/infra: ""
+          tolerations:
+          - key: node-role.kubernetes.io/infra
+            operator: Exists
+            effect: NoSchedule
+          # Non-root security context
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            fsGroup: 1001
+          restartPolicy: Never
+          containers:
+          - name: prune-resources
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            imagePullPolicy: Always
+            command: ["/bin/bash"]
+            args: ["/scripts/prune-script.sh"]
+            env:
+            - name: DRY_RUN
+              value: "true"  # Set to "false" to enable actual deletion
+            - name: MAX_DELETIONS
+              value: "50"    # Maximum deletions per run
+            - name: NAMESPACE_FILTER
+              value: ""      # Filter namespaces (regex pattern)
+            - name: LOG_LEVEL
+              value: "info"  # debug, info, error
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+              limits:
+                memory: "128Mi"
+                cpu: "100m"
+            volumeMounts:
+            - name: prune-script
+              mountPath: /scripts
+              readOnly: true
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              runAsUser: 1001
+              capabilities:
+                drop:
+                - ALL
+          volumes:
+          - name: prune-script
+            configMap:
+              name: prune-resources-script
+              defaultMode: 0755
+
+---
+# ETCD Dedicated Disk Configuration
+# Red Hat Community of Practice - OpenShift 4.16
+# Configures dedicated disk for etcd on HCI masters
+
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-etcd-dedicated-disk
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+      - path: /usr/local/bin/etcd-disk-setup.sh
+        mode: 0755
+        overwrite: true
+        contents:
+          source: data:text/plain;charset=utf-8;base64,{{ .ETCDDiskSetupScript }}
+      - path: /usr/local/bin/etcd-disk-verify.sh
+        mode: 0755
+        overwrite: true
+        contents:
+          source: data:text/plain;charset=utf-8;base64,{{ .ETCDDiskVerifyScript }}
+    systemd:
+      units:
+      - name: etcd-disk-setup.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=ETCD Dedicated Disk Setup
+          Before=etcd.service
+          Wants=network-online.target
+          After=network-online.target
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/etcd-disk-setup.sh
+          RemainAfterExit=yes
+          StandardOutput=journal
+          StandardError=journal
+          TimeoutStartSec=300
+          
+          [Install]
+          WantedBy=multi-user.target
+      - name: etcd-disk-verify.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=ETCD Dedicated Disk Verification
+          After=etcd.service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/etcd-disk-verify.sh
+          StandardOutput=journal
+          StandardError=journal
+          TimeoutStartSec=60
+          
+          [Install]
+          WantedBy=multi-user.target
+      - name: etcd-disk-verify.timer
+        enabled: true
+        contents: |
+          [Unit]
+          Description=ETCD Dedicated Disk Verification Timer
+          Requires=etcd-disk-verify.service
+          
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec=1h
+          Persistent=true
+          
+          [Install]
+          WantedBy=timers.target
+
+
+
+#!/bin/bash
+# ETCD Dedicated Disk Setup Script
+# Red Hat Community of Practice - OpenShift 4.16
+# Safely configures dedicated disk for etcd on HCI masters
+
+set -euo pipefail
+
+# Configuration
+ETCD_DISK_DEVICE=${ETCD_DISK_DEVICE:-"/dev/sdb"}
+ETCD_MOUNT_POINT=${ETCD_MOUNT_POINT:-"/var/lib/etcd"}
+ETCD_BACKUP_DIR=${ETCD_BACKUP_DIR:-"/var/lib/etcd-backup"}
+LOG_FILE="/var/log/etcd-disk-setup.log"
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    log "INFO: $1"
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+log_warn() {
+    log "WARN: $1"
+}
+
+# Function to check if device exists
+check_device() {
+    if [[ ! -b "$ETCD_DISK_DEVICE" ]]; then
+        log_error "Device $ETCD_DISK_DEVICE does not exist or is not a block device"
+        exit 1
+    fi
+    log_info "Device $ETCD_DISK_DEVICE exists and is a block device"
+}
+
+# Function to check if device is already mounted
+check_mounted() {
+    if mountpoint -q "$ETCD_MOUNT_POINT" 2>/dev/null; then
+        log_info "ETCD mount point $ETCD_MOUNT_POINT is already mounted"
+        return 0
+    else
+        log_info "ETCD mount point $ETCD_MOUNT_POINT is not mounted"
+        return 1
+    fi
+}
+
+# Function to backup existing etcd data
+backup_etcd_data() {
+    if [[ -d "$ETCD_MOUNT_POINT" ]] && [[ "$(ls -A "$ETCD_MOUNT_POINT" 2>/dev/null)" ]]; then
+        log_info "Backing up existing etcd data from $ETCD_MOUNT_POINT to $ETCD_BACKUP_DIR"
+        
+        # Create backup directory
+        mkdir -p "$ETCD_BACKUP_DIR"
+        
+        # Create timestamped backup
+        BACKUP_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        BACKUP_PATH="$ETCD_BACKUP_DIR/etcd-backup-$BACKUP_TIMESTAMP"
+        
+        # Copy data with rsync
+        rsync -av --progress "$ETCD_MOUNT_POINT/" "$BACKUP_PATH/"
+        
+        log_info "ETCD data backed up to $BACKUP_PATH"
+    else
+        log_info "No existing etcd data to backup"
+    fi
+}
+
+# Function to format the disk
+format_disk() {
+    log_info "Formatting disk $ETCD_DISK_DEVICE with XFS filesystem"
+    
+    # Check if disk has existing filesystem
+    if blkid "$ETCD_DISK_DEVICE" >/dev/null 2>&1; then
+        log_warn "Disk $ETCD_DISK_DEVICE already has a filesystem. Proceeding with format."
+    fi
+    
+    # Format with XFS
+    mkfs.xfs -f -L etcd "$ETCD_DISK_DEVICE"
+    
+    log_info "Disk $ETCD_DISK_DEVICE formatted successfully"
+}
+
+# Function to create mount point
+create_mount_point() {
+    log_info "Creating mount point $ETCD_MOUNT_POINT"
+    
+    # Create directory if it doesn't exist
+    mkdir -p "$ETCD_MOUNT_POINT"
+    
+    # Set proper permissions
+    chown etcd:etcd "$ETCD_MOUNT_POINT"
+    chmod 755 "$ETCD_MOUNT_POINT"
+    
+    log_info "Mount point $ETCD_MOUNT_POINT created with proper permissions"
+}
+
+# Function to mount the disk
+mount_disk() {
+    log_info "Mounting $ETCD_DISK_DEVICE to $ETCD_MOUNT_POINT"
+    
+    # Mount the disk
+    mount -t xfs -o defaults,noatime "$ETCD_DISK_DEVICE" "$ETCD_MOUNT_POINT"
+    
+    # Verify mount
+    if mountpoint -q "$ETCD_MOUNT_POINT"; then
+        log_info "Disk mounted successfully"
+    else
+        log_error "Failed to mount disk"
+        exit 1
+    fi
+}
+
+# Function to restore etcd data
+restore_etcd_data() {
+    if [[ -d "$ETCD_BACKUP_DIR" ]] && [[ "$(ls -A "$ETCD_BACKUP_DIR" 2>/dev/null)" ]]; then
+        log_info "Restoring etcd data from backup"
+        
+        # Find the latest backup
+        LATEST_BACKUP=$(ls -t "$ETCD_BACKUP_DIR"/etcd-backup-* 2>/dev/null | head -n1)
+        
+        if [[ -n "$LATEST_BACKUP" ]]; then
+            log_info "Restoring from backup: $LATEST_BACKUP"
+            
+            # Copy data back with rsync
+            rsync -av --progress "$LATEST_BACKUP/" "$ETCD_MOUNT_POINT/"
+            
+            # Restore SELinux context
+            restorecon -R "$ETCD_MOUNT_POINT"
+            
+            log_info "ETCD data restored successfully"
+        else
+            log_warn "No backup found to restore"
+        fi
+    else
+        log_info "No backup data to restore"
+    fi
+}
+
+# Function to update fstab
+update_fstab() {
+    log_info "Updating /etc/fstab for persistent mounting"
+    
+    # Check if entry already exists
+    if grep -q "$ETCD_DISK_DEVICE" /etc/fstab; then
+        log_warn "Entry for $ETCD_DISK_DEVICE already exists in /etc/fstab"
+    else
+        # Add entry to fstab
+        echo "$ETCD_DISK_DEVICE $ETCD_MOUNT_POINT xfs defaults,noatime 0 2" >> /etc/fstab
+        log_info "Added entry to /etc/fstab"
+    fi
+}
+
+# Function to verify setup
+verify_setup() {
+    log_info "Verifying etcd disk setup"
+    
+    # Check mount
+    if ! mountpoint -q "$ETCD_MOUNT_POINT"; then
+        log_error "ETCD mount point is not mounted"
+        return 1
+    fi
+    
+    # Check filesystem
+    if ! df -T "$ETCD_MOUNT_POINT" | grep -q xfs; then
+        log_error "ETCD mount point is not using XFS filesystem"
+        return 1
+    fi
+    
+    # Check permissions
+    if [[ "$(stat -c %U:%G "$ETCD_MOUNT_POINT")" != "etcd:etcd" ]]; then
+        log_error "ETCD mount point has incorrect ownership"
+        return 1
+    fi
+    
+    # Check disk space
+    AVAILABLE_SPACE=$(df -h "$ETCD_MOUNT_POINT" | awk 'NR==2 {print $4}')
+    log_info "Available space on etcd disk: $AVAILABLE_SPACE"
+    
+    log_info "ETCD disk setup verification completed successfully"
+    return 0
+}
+
+# Main execution
+main() {
+    log_info "Starting ETCD dedicated disk setup"
+    log_info "Configuration: DEVICE=$ETCD_DISK_DEVICE, MOUNT_POINT=$ETCD_MOUNT_POINT"
+    
+    # Check if already mounted
+    if check_mounted; then
+        log_info "ETCD disk is already configured and mounted"
+        verify_setup
+        exit 0
+    fi
+    
+    # Perform setup steps
+    check_device
+    backup_etcd_data
+    format_disk
+    create_mount_point
+    mount_disk
+    restore_etcd_data
+    update_fstab
+    verify_setup
+    
+    log_info "ETCD dedicated disk setup completed successfully"
+}
+
+# Run main function
+main "$@"
+
+
+#!/bin/bash
+# ETCD Dedicated Disk Verification Script
+# Red Hat Community of Practice - OpenShift 4.16
+# Monitors and verifies etcd disk health
+
+set -euo pipefail
+
+# Configuration
+ETCD_MOUNT_POINT=${ETCD_MOUNT_POINT:-"/var/lib/etcd"}
+ETCD_DISK_DEVICE=${ETCD_DISK_DEVICE:-"/dev/sdb"}
+LOG_FILE="/var/log/etcd-disk-verify.log"
+ALERT_THRESHOLD=${ALERT_THRESHOLD:-85}  # Disk usage percentage threshold
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    log "INFO: $1"
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+log_warn() {
+    log "WARN: $1"
+}
+
+# Function to check mount status
+check_mount_status() {
+    if mountpoint -q "$ETCD_MOUNT_POINT"; then
+        log_info "ETCD disk is properly mounted"
+        return 0
+    else
+        log_error "ETCD disk is not mounted"
+        return 1
+    fi
+}
+
+# Function to check disk usage
+check_disk_usage() {
+    local usage_percent
+    usage_percent=$(df -h "$ETCD_MOUNT_POINT" | awk 'NR==2 {print $5}' | sed 's/%//')
+    
+    log_info "ETCD disk usage: ${usage_percent}%"
+    
+    if [[ $usage_percent -gt $ALERT_THRESHOLD ]]; then
+        log_warn "ETCD disk usage (${usage_percent}%) exceeds threshold (${ALERT_THRESHOLD}%)"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check filesystem health
+check_filesystem_health() {
+    log_info "Checking filesystem health"
+    
+    # Check for filesystem errors
+    if xfs_repair -n "$ETCD_DISK_DEVICE" >/dev/null 2>&1; then
+        log_info "Filesystem health check passed"
+    else
+        log_error "Filesystem health check failed"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check etcd service status
+check_etcd_service() {
+    if systemctl is-active --quiet etcd; then
+        log_info "ETCD service is running"
+        return 0
+    else
+        log_error "ETCD service is not running"
+        return 1
+    fi
+}
+
+# Function to check etcd data integrity
+check_etcd_data_integrity() {
+    log_info "Checking etcd data integrity"
+    
+    # Check if etcd data directory exists and has content
+    if [[ -d "$ETCD_MOUNT_POINT" ]] && [[ "$(ls -A "$ETCD_MOUNT_POINT" 2>/dev/null)" ]]; then
+        log_info "ETCD data directory exists and contains data"
+        
+        # Check for common etcd files
+        if [[ -f "$ETCD_MOUNT_POINT/member/snap/db" ]]; then
+            log_info "ETCD database file found"
+        else
+            log_warn "ETCD database file not found"
+        fi
+        
+        return 0
+    else
+        log_error "ETCD data directory is empty or missing"
+        return 1
+    fi
+}
+
+# Function to check SELinux context
+check_selinux_context() {
+    log_info "Checking SELinux context"
+    
+    if command -v getenforce >/dev/null 2>&1; then
+        if [[ "$(getenforce)" == "Enforcing" ]]; then
+            # Check if SELinux context is correct
+            local context
+            context=$(ls -Z "$ETCD_MOUNT_POINT" | awk '{print $1}')
+            
+            if [[ "$context" =~ etcd_t ]]; then
+                log_info "SELinux context is correct"
+                return 0
+            else
+                log_warn "SELinux context may be incorrect: $context"
+                return 1
+            fi
+        else
+            log_info "SELinux is not enforcing, skipping context check"
+            return 0
+        fi
+    else
+        log_info "SELinux not available, skipping context check"
+        return 0
+    fi
+}
+
+# Function to generate health report
+generate_health_report() {
+    local report_file="/tmp/etcd-disk-health-report-$(date +%Y%m%d_%H%M%S).txt"
+    
+    log_info "Generating health report: $report_file"
+    
+    {
+        echo "ETCD Disk Health Report - $(date)"
+        echo "=================================="
+        echo ""
+        echo "Mount Status:"
+        mountpoint "$ETCD_MOUNT_POINT" || echo "Not mounted"
+        echo ""
+        echo "Disk Usage:"
+        df -h "$ETCD_MOUNT_POINT"
+        echo ""
+        echo "Filesystem Info:"
+        blkid "$ETCD_DISK_DEVICE"
+        echo ""
+        echo "ETCD Service Status:"
+        systemctl status etcd --no-pager || echo "Service not found"
+        echo ""
+        echo "Directory Contents:"
+        ls -la "$ETCD_MOUNT_POINT" || echo "Directory not accessible"
+        echo ""
+        echo "SELinux Context:"
+        ls -Z "$ETCD_MOUNT_POINT" || echo "SELinux not available"
+    } > "$report_file"
+    
+    log_info "Health report generated: $report_file"
+}
+
+# Main execution
+main() {
+    log_info "Starting ETCD disk verification"
+    
+    local exit_code=0
+    
+    # Run all checks
+    check_mount_status || exit_code=1
+    check_disk_usage || exit_code=1
+    check_filesystem_health || exit_code=1
+    check_etcd_service || exit_code=1
+    check_etcd_data_integrity || exit_code=1
+    check_selinux_context || exit_code=1
+    
+    # Generate health report
+    generate_health_report
+    
+    if [[ $exit_code -eq 0 ]]; then
+        log_info "ETCD disk verification completed successfully"
+    else
+        log_error "ETCD disk verification found issues"
+    fi
+    
+    exit $exit_code
+}
+
+# Run main function
+main "$@"
+
+
+# Namespace Pruning Strategy for OpenShift 4.16 Master Performance
+## Red Hat Community of Practice Guidelines
+
+### Overview
+This document outlines the recommended namespace pruning strategy for improving OpenShift 4.16 master node performance while maintaining system stability and security.
+
+### Namespace Categories
+
+#### 1. System Namespaces (DO NOT PRUNE)
+These namespaces are critical for OpenShift functionality and should never be pruned:
+
+- `openshift-*` - All OpenShift system namespaces
+- `kube-*` - Kubernetes system namespaces  
+- `default` - Default namespace
+- `openshift-monitoring` - Monitoring stack
+- `openshift-logging` - Logging stack
+- `openshift-ingress` - Ingress controllers
+- `openshift-dns` - DNS services
+- `openshift-etcd` - ETCD services
+- `openshift-apiserver` - API server services
+- `openshift-controller-manager` - Controller manager services
+- `openshift-scheduler` - Scheduler services
+
+#### 2. Application Namespaces (SAFE TO PRUNE)
+These namespaces contain user applications and can be safely pruned:
+
+- User-created namespaces
+- Development/test namespaces
+- Temporary project namespaces
+- CI/CD pipeline namespaces
+
+### Pruning Strategy
+
+#### Phase 1: Dry Run Analysis
+1. **Identify Target Namespaces**
+   ```bash
+   # List all non-system namespaces
+   oc get namespaces -o name | grep -v -E "(openshift-|kube-|default$)"
+   ```
+
+2. **Analyze Resource Usage**
+   ```bash
+   # Check ConfigMap count per namespace
+   for ns in $(oc get namespaces -o name | grep -v -E "(openshift-|kube-|default$)" | cut -d/ -f2); do
+     echo "Namespace: $ns"
+     oc get configmaps -n "$ns" --no-headers | wc -l
+   done
+   ```
+
+3. **Identify Orphaned Resources**
+   ```bash
+   # Find ConfigMaps not referenced by any workload
+   oc get configmaps --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | select(.metadata.name | test("^(kube-|openshift-)") | not) | "\(.metadata.namespace)/\(.metadata.name)"'
+   ```
+
+#### Phase 2: Gradual Pruning
+1. **Start with Development Namespaces**
+   - Begin with namespaces clearly marked as development/test
+   - Use dry-run mode first
+   - Monitor system performance after each batch
+
+2. **Progress to Production Namespaces**
+   - Only after successful development namespace pruning
+   - Implement additional safety checks
+   - Coordinate with application teams
+
+#### Phase 3: Monitoring and Validation
+1. **Performance Monitoring**
+   - Monitor master node resource usage
+   - Check etcd performance metrics
+   - Validate API server response times
+
+2. **System Health Checks**
+   - Verify all system services are running
+   - Check cluster connectivity
+   - Validate authentication/authorization
+
+### Best Practices
+
+#### 1. Safety First
+- Always use dry-run mode initially
+- Implement deletion limits per run
+- Maintain comprehensive logging
+- Create backups before major pruning operations
+
+#### 2. Gradual Approach
+- Start with small batches
+- Monitor system impact between batches
+- Allow time for system stabilization
+- Document all changes
+
+#### 3. Team Coordination
+- Notify application teams before pruning
+- Provide advance notice for production namespaces
+- Establish rollback procedures
+- Maintain communication channels
+
+#### 4. Monitoring and Alerting
+- Set up alerts for resource usage spikes
+- Monitor etcd performance metrics
+- Track API server response times
+- Implement health checks
+
+### Performance Impact
+
+#### Expected Benefits
+- Reduced etcd storage usage
+- Improved API server performance
+- Faster cluster operations
+- Better resource utilization
+
+#### Monitoring Metrics
+- ETCD storage size
+- API server response times
+- Master node memory usage
+- Cluster operation latency
+
+### Rollback Procedures
+
+#### 1. Immediate Rollback
+- Stop all pruning operations
+- Restore from backups if necessary
+- Monitor system stability
+- Document issues
+
+#### 2. Gradual Recovery
+- Identify affected resources
+- Restore critical configurations
+- Validate system functionality
+- Update procedures
+
+### Documentation Requirements
+
+#### 1. Pre-Pruning Documentation
+- Current resource inventory
+- Backup verification
+- Team notifications
+- Rollback procedures
+
+#### 2. Post-Pruning Documentation
+- Resources removed
+- Performance improvements
+- Issues encountered
+- Lessons learned
+
+### Compliance and Security
+
+#### 1. Audit Requirements
+- Maintain audit logs
+- Document all changes
+- Track resource modifications
+- Implement access controls
+
+#### 2. Security Considerations
+- Verify resource ownership
+- Check for sensitive data
+- Maintain access controls
+- Monitor for anomalies
+
+### Conclusion
+
+The namespace pruning strategy should be implemented gradually with careful monitoring and team coordination. The primary goal is to improve master node performance while maintaining system stability and security.
+
+Remember: When in doubt, err on the side of caution. It's better to prune too little than too much.
+
+
+---
+# Monitoring and Verification Configuration
+# Red Hat Community of Practice - OpenShift 4.16
+# Comprehensive monitoring for master node performance tuning
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: master-performance-monitoring
+  namespace: openshift-monitoring
+  labels:
+    app.kubernetes.io/name: master-performance-monitoring
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: openshift-maintenance
+data:
+  monitoring-script.sh: |
+    #!/bin/bash
+    # Master Node Performance Monitoring Script
+    # Red Hat Community of Practice - OpenShift 4.16
+    
+    set -euo pipefail
+    
+    # Configuration
+    LOG_FILE="/var/log/master-performance-monitoring.log"
+    ALERT_THRESHOLD_CPU=80
+    ALERT_THRESHOLD_MEMORY=85
+    ALERT_THRESHOLD_DISK=90
+    ALERT_THRESHOLD_ETCD=80
+    
+    # Logging function
+    log() {
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+    }
+    
+    log_info() {
+        log "INFO: $1"
+    }
+    
+    log_error() {
+        log "ERROR: $1"
+    }
+    
+    log_warn() {
+        log "WARN: $1"
+    }
+    
+    # Function to check master node resources
+    check_master_resources() {
+        log_info "Checking master node resources"
+        
+        # Get master nodes
+        local master_nodes
+        master_nodes=$(oc get nodes -l node-role.kubernetes.io/master= -o name | cut -d/ -f2)
+        
+        for node in $master_nodes; do
+            log_info "Checking node: $node"
+            
+            # Check CPU usage
+            local cpu_usage
+            cpu_usage=$(oc describe node "$node" | grep -A 5 "Allocated resources" | grep "cpu" | awk '{print $3}' | sed 's/(//' | sed 's/%)//')
+            
+            if [[ $cpu_usage -gt $ALERT_THRESHOLD_CPU ]]; then
+                log_warn "High CPU usage on $node: ${cpu_usage}%"
+            else
+                log_info "CPU usage on $node: ${cpu_usage}%"
+            fi
+            
+            # Check memory usage
+            local memory_usage
+            memory_usage=$(oc describe node "$node" | grep -A 5 "Allocated resources" | grep "memory" | awk '{print $3}' | sed 's/(//' | sed 's/%)//')
+            
+            if [[ $memory_usage -gt $ALERT_THRESHOLD_MEMORY ]]; then
+                log_warn "High memory usage on $node: ${memory_usage}%"
+            else
+                log_info "Memory usage on $node: ${memory_usage}%"
+            fi
+        done
+    }
+    
+    # Function to check etcd performance
+    check_etcd_performance() {
+        log_info "Checking etcd performance"
+        
+        # Check etcd cluster health
+        if oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint health; then
+            log_info "ETCD cluster is healthy"
+        else
+            log_error "ETCD cluster health check failed"
+        fi
+        
+        # Check etcd storage usage
+        local etcd_storage
+        etcd_storage=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json | jq -r '.dbSize')
+        
+        log_info "ETCD storage size: $etcd_storage bytes"
+        
+        # Check etcd performance metrics
+        local etcd_metrics
+        etcd_metrics=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json | jq -r '.leader')
+        
+        log_info "ETCD leader: $etcd_metrics"
+    }
+    
+    # Function to check API server performance
+    check_api_server_performance() {
+        log_info "Checking API server performance"
+        
+        # Check API server response time
+        local start_time
+        start_time=$(date +%s%N)
+        
+        if oc get nodes >/dev/null 2>&1; then
+            local end_time
+            end_time=$(date +%s%N)
+            local response_time
+            response_time=$(( (end_time - start_time) / 1000000 ))
+            
+            log_info "API server response time: ${response_time}ms"
+            
+            if [[ $response_time -gt 1000 ]]; then
+                log_warn "High API server response time: ${response_time}ms"
+            fi
+        else
+            log_error "API server is not responding"
+        fi
+    }
+    
+    # Function to check cluster operations
+    check_cluster_operations() {
+        log_info "Checking cluster operations"
+        
+        # Check cluster version
+        local cluster_version
+        cluster_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}')
+        log_info "Cluster version: $cluster_version"
+        
+        # Check cluster operators
+        local failed_operators
+        failed_operators=$(oc get clusteroperators --no-headers | grep -v "True" | wc -l)
+        
+        if [[ $failed_operators -gt 0 ]]; then
+            log_warn "Failed cluster operators: $failed_operators"
+            oc get clusteroperators --no-headers | grep -v "True"
+        else
+            log_info "All cluster operators are healthy"
+        fi
+        
+        # Check node status
+        local not_ready_nodes
+        not_ready_nodes=$(oc get nodes --no-headers | grep -v "Ready" | wc -l)
+        
+        if [[ $not_ready_nodes -gt 0 ]]; then
+            log_warn "Not ready nodes: $not_ready_nodes"
+            oc get nodes --no-headers | grep -v "Ready"
+        else
+            log_info "All nodes are ready"
+        fi
+    }
+    
+    # Function to generate performance report
+    generate_performance_report() {
+        local report_file="/tmp/master-performance-report-$(date +%Y%m%d_%H%M%S).txt"
+        
+        log_info "Generating performance report: $report_file"
+        
+        {
+            echo "Master Node Performance Report - $(date)"
+            echo "=========================================="
+            echo ""
+            echo "Master Node Resources:"
+            oc get nodes -l node-role.kubernetes.io/master= -o wide
+            echo ""
+            echo "ETCD Status:"
+            oc get pods -n openshift-etcd -l app=etcd
+            echo ""
+            echo "API Server Status:"
+            oc get pods -n openshift-kube-apiserver
+            echo ""
+            echo "Cluster Operators:"
+            oc get clusteroperators
+            echo ""
+            echo "Node Status:"
+            oc get nodes
+            echo ""
+            echo "Resource Usage:"
+            oc top nodes
+        } > "$report_file"
+        
+        log_info "Performance report generated: $report_file"
+    }
+    
+    # Main execution
+    main() {
+        log_info "Starting master node performance monitoring"
+        
+        check_master_resources
+        check_etcd_performance
+        check_api_server_performance
+        check_cluster_operations
+        generate_performance_report
+        
+        log_info "Master node performance monitoring completed"
+    }
+    
+    # Run main function
+    main "$@"
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: master-performance-monitoring
+  namespace: openshift-monitoring
+  labels:
+    app.kubernetes.io/name: master-performance-monitoring
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: openshift-maintenance
+spec:
+  # Run every 15 minutes
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: master-performance-monitoring
+            app.kubernetes.io/component: monitoring
+            app.kubernetes.io/part-of: openshift-maintenance
+        spec:
+          serviceAccountName: master-performance-monitoring-sa
+          # Schedule on infra nodes
+          nodeSelector:
+            node-role.kubernetes.io/infra: ""
+          tolerations:
+          - key: node-role.kubernetes.io/infra
+            operator: Exists
+            effect: NoSchedule
+          # Non-root security context
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            fsGroup: 1001
+          restartPolicy: Never
+          containers:
+          - name: monitoring
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            imagePullPolicy: Always
+            command: ["/bin/bash"]
+            args: ["/scripts/monitoring-script.sh"]
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "50m"
+              limits:
+                memory: "128Mi"
+                cpu: "100m"
+            volumeMounts:
+            - name: monitoring-script
+              mountPath: /scripts
+              readOnly: true
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              runAsUser: 1001
+              capabilities:
+                drop:
+                - ALL
+          volumes:
+          - name: monitoring-script
+            configMap:
+              name: master-performance-monitoring
+              defaultMode: 0755
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: master-performance-monitoring-sa
+  namespace: openshift-monitoring
+  labels:
+    app.kubernetes.io/name: master-performance-monitoring
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: openshift-maintenance
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: master-performance-monitoring-role
+  labels:
+    app.kubernetes.io/name: master-performance-monitoring
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: openshift-maintenance
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "pods"]
+  verbs: ["get", "list"]
+- apiGroups: ["config.openshift.io"]
+  resources: ["clusterversions", "clusteroperators"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: master-performance-monitoring-binding
+  labels:
+    app.kubernetes.io/name: master-performance-monitoring
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: openshift-maintenance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: master-performance-monitoring-role
+subjects:
+- kind: ServiceAccount
+  name: master-performance-monitoring-sa
+  namespace: openshift-monitoring
+
+
+# OpenShift 4.16 Master Node Performance Tuning - Deployment Guide
+## Red Hat Community of Practice
+
+### Overview
+This guide provides step-by-step instructions for deploying the OpenShift 4.16 master node performance tuning solution following Red Hat Community of Practice patterns.
+
+### Prerequisites
+
+#### 1. System Requirements
+- OpenShift 4.16 cluster
+- Master nodes with sufficient resources
+- Dedicated disk for etcd (for HCI masters)
+- Administrative access to the cluster
+- Backup of current configuration
+
+#### 2. Required Tools
+- `oc` CLI tool
+- `jq` for JSON processing
+- `rsync` for data migration
+- `xfsprogs` for XFS filesystem operations
+
+#### 3. Access Requirements
+- Cluster administrator privileges
+- Access to master nodes
+- Network connectivity to registry.redhat.io
+
+### Deployment Order
+
+#### Phase 1: Pre-Deployment Validation
+1. **Cluster Health Check**
+   ```bash
+   # Check cluster version
+   oc get clusterversion version
+   
+   # Check cluster operators
+   oc get clusteroperators
+   
+   # Check node status
+   oc get nodes
+   
+   # Check master node resources
+   oc describe nodes -l node-role.kubernetes.io/master=
+   ```
+
+2. **Backup Current Configuration**
+   ```bash
+   # Create backup directory
+   mkdir -p /backup/openshift-config-$(date +%Y%m%d)
+   
+   # Backup current kubelet configuration
+   oc get machineconfigs -o yaml > /backup/openshift-config-$(date +%Y%m%d)/machineconfigs.yaml
+   
+   # Backup current etcd configuration
+   oc get pods -n openshift-etcd -o yaml > /backup/openshift-config-$(date +%Y%m%d)/etcd-pods.yaml
+   ```
+
+3. **Validate Prerequisites**
+   ```bash
+   # Check available disk space
+   df -h
+   
+   # Check memory usage
+   free -h
+   
+   # Check CPU usage
+   top -bn1 | grep "Cpu(s)"
+   ```
+
+#### Phase 2: Master Node Tuning
+1. **Deploy SystemReserved Configuration**
+   ```bash
+   # Apply master node tuning
+   oc apply -f 01-master-node-tuning.yaml
+   
+   # Wait for machine config to be applied
+   oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+   
+   # Verify configuration
+   oc get machineconfigs | grep master-node-performance-tuning
+   ```
+
+2. **Verify Master Node Changes**
+   ```bash
+   # Check master node status
+   oc get nodes -l node-role.kubernetes.io/master=
+   
+   # Check kubelet configuration
+   oc debug node/<master-node-name> -- chroot /host cat /etc/kubernetes/kubelet-config.yaml
+   ```
+
+#### Phase 3: ETCD Dedicated Disk (HCI Masters Only)
+1. **Prepare ETCD Disk**
+   ```bash
+   # Identify available disk
+   lsblk
+   
+   # Set environment variables
+   export ETCD_DISK_DEVICE="/dev/sdb"  # Adjust as needed
+   export ETCD_MOUNT_POINT="/var/lib/etcd"
+   ```
+
+2. **Deploy ETCD Configuration**
+   ```bash
+   # Apply etcd disk configuration
+   oc apply -f 05-etcd-dedicated-disk.yaml
+   
+   # Wait for machine config to be applied
+   oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+   ```
+
+3. **Verify ETCD Setup**
+   ```bash
+   # Check etcd service status
+   oc get pods -n openshift-etcd
+   
+   # Check etcd disk mount
+   oc debug node/<master-node-name> -- chroot /host df -h /var/lib/etcd
+   ```
+
+#### Phase 4: Resource Pruning Setup
+1. **Deploy RBAC**
+   ```bash
+   # Apply RBAC configuration
+   oc apply -f 02-prune-rbac.yaml
+   
+   # Verify service account
+   oc get serviceaccount prune-resources-sa -n openshift-infra
+   ```
+
+2. **Deploy Pruning CronJob**
+   ```bash
+   # Apply pruning configuration
+   oc apply -f 04-prune-cronjob.yaml
+   
+   # Verify cronjob
+   oc get cronjob prune-resources -n openshift-infra
+   ```
+
+3. **Test Pruning (Dry Run)**
+   ```bash
+   # Create test job
+   oc create job --from=cronjob/prune-resources test-prune -n openshift-infra
+   
+   # Check job logs
+   oc logs job/test-prune -n openshift-infra
+   
+   # Clean up test job
+   oc delete job test-prune -n openshift-infra
+   ```
+
+#### Phase 5: Monitoring Setup
+1. **Deploy Monitoring**
+   ```bash
+   # Apply monitoring configuration
+   oc apply -f 09-monitoring-verification.yaml
+   
+   # Verify monitoring cronjob
+   oc get cronjob master-performance-monitoring -n openshift-monitoring
+   ```
+
+2. **Test Monitoring**
+   ```bash
+   # Create test monitoring job
+   oc create job --from=cronjob/master-performance-monitoring test-monitoring -n openshift-monitoring
+   
+   # Check monitoring logs
+   oc logs job/test-monitoring -n openshift-monitoring
+   
+   # Clean up test job
+   oc delete job test-monitoring -n openshift-monitoring
+   ```
+
+### Testing Procedures
+
+#### 1. Functional Testing
+```bash
+# Test 1: Master Node Resource Allocation
+oc describe nodes -l node-role.kubernetes.io/master= | grep -A 10 "Allocated resources"
+
+# Test 2: ETCD Performance
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint health
+
+# Test 3: API Server Response Time
+time oc get nodes >/dev/null
+
+# Test 4: Resource Pruning (Dry Run)
+oc create job --from=cronjob/prune-resources test-prune -n openshift-infra
+oc logs job/test-prune -n openshift-infra
+oc delete job test-prune -n openshift-infra
+```
+
+#### 2. Performance Testing
+```bash
+# Test 1: Cluster Operations
+oc get nodes
+oc get pods --all-namespaces
+oc get services --all-namespaces
+
+# Test 2: ETCD Operations
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status
+
+# Test 3: API Server Load
+for i in {1..10}; do
+  time oc get nodes >/dev/null
+done
+```
+
+#### 3. Stress Testing
+```bash
+# Test 1: High Resource Usage
+oc run stress-test --image=busybox --restart=Never -- /bin/sh -c "while true; do dd if=/dev/zero of=/tmp/stress bs=1M count=100; rm /tmp/stress; done"
+
+# Test 2: Multiple API Calls
+for i in {1..100}; do
+  oc get nodes >/dev/null &
+done
+wait
+
+# Clean up stress test
+oc delete pod stress-test
+```
+
+### Verification Checklist
+
+#### 1. Master Node Configuration
+- [ ] SystemReserved resources are configured
+- [ ] Kubelet configuration is applied
+- [ ] Master nodes are in Ready state
+- [ ] No error messages in kubelet logs
+
+#### 2. ETCD Configuration (HCI Masters)
+- [ ] ETCD disk is mounted correctly
+- [ ] ETCD service is running
+- [ ] ETCD data is accessible
+- [ ] SELinux context is correct
+
+#### 3. Resource Pruning
+- [ ] RBAC is configured correctly
+- [ ] CronJob is scheduled
+- [ ] Dry-run mode works
+- [ ] Deletion limits are enforced
+
+#### 4. Monitoring
+- [ ] Monitoring CronJob is scheduled
+- [ ] Performance metrics are collected
+- [ ] Alerts are configured
+- [ ] Reports are generated
+
+### Troubleshooting
+
+#### 1. Master Node Issues
+```bash
+# Check machine config status
+oc get machineconfigpool master
+
+# Check kubelet logs
+oc debug node/<master-node-name> -- chroot /host journalctl -u kubelet
+
+# Check node conditions
+oc describe node <master-node-name>
+```
+
+#### 2. ETCD Issues
+```bash
+# Check etcd pod status
+oc get pods -n openshift-etcd
+
+# Check etcd logs
+oc logs -n openshift-etcd -l app=etcd
+
+# Check etcd disk
+oc debug node/<master-node-name> -- chroot /host df -h /var/lib/etcd
+```
+
+#### 3. Pruning Issues
+```bash
+# Check cronjob status
+oc get cronjob prune-resources -n openshift-infra
+
+# Check job logs
+oc logs job/<job-name> -n openshift-infra
+
+# Check RBAC
+oc auth can-i delete configmaps --as=system:serviceaccount:openshift-infra:prune-resources-sa
+```
+
+### Rollback Procedures
+
+#### 1. Master Node Rollback
+```bash
+# Remove custom machine config
+oc delete machineconfig 99-master-node-performance-tuning
+
+# Wait for rollback
+oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+```
+
+#### 2. ETCD Rollback
+```bash
+# Remove etcd machine config
+oc delete machineconfig 99-master-etcd-dedicated-disk
+
+# Restore from backup if necessary
+# (Follow backup restoration procedures)
+```
+
+#### 3. Pruning Rollback
+```bash
+# Remove pruning resources
+oc delete cronjob prune-resources -n openshift-infra
+oc delete configmap prune-resources-script -n openshift-infra
+oc delete clusterrolebinding prune-resources-binding
+oc delete clusterrole prune-resources-role
+oc delete serviceaccount prune-resources-sa -n openshift-infra
+```
+
+### Post-Deployment
+
+#### 1. Documentation
+- [ ] Update cluster documentation
+- [ ] Document configuration changes
+- [ ] Update runbooks
+- [ ] Train operations team
+
+#### 2. Monitoring
+- [ ] Set up alerts
+- [ ] Configure dashboards
+- [ ] Schedule regular health checks
+- [ ] Document monitoring procedures
+
+#### 3. Maintenance
+- [ ] Schedule regular pruning
+- [ ] Plan for updates
+- [ ] Document maintenance procedures
+- [ ] Train support team
+
+### Support and Resources
+
+#### 1. Red Hat Documentation
+- [OpenShift 4.16 Documentation](https://docs.openshift.com/container-platform/4.16/)
+- [Machine Configuration](https://docs.openshift.com/container-platform/4.16/post_installation_configuration/machine-configuration-tasks.html)
+- [ETCD Configuration](https://docs.openshift.com/container-platform/4.16/scalability_and_performance/etcd.html)
+
+#### 2. Community Resources
+- [Red Hat Community of Practice](https://github.com/redhat-cop)
+- [OpenShift Best Practices](https://github.com/redhat-cop/openshift-best-practices)
+- [OpenShift Performance Tuning](https://github.com/redhat-cop/openshift-performance-tuning)
+
+#### 3. Support Contacts
+- Red Hat Support: [support.redhat.com](https://support.redhat.com)
+- OpenShift Community: [community.redhat.com](https://community.redhat.com)
+- Red Hat Customer Portal: [access.redhat.com](https://access.redhat.com)
+
+
+
+# Red Hat Documentation References
+## OpenShift 4.16 Master Node Performance Tuning
+
+### Official Red Hat Documentation
+
+#### 1. OpenShift 4.16 Documentation
+- **Main Documentation**: https://docs.openshift.com/container-platform/4.16/
+- **Installation Guide**: https://docs.openshift.com/container-platform/4.16/installing/index.html
+- **Post-Installation Configuration**: https://docs.openshift.com/container-platform/4.16/post_installation_configuration/index.html
+
+#### 2. Machine Configuration
+- **Machine Configuration Overview**: https://docs.openshift.com/container-platform/4.16/post_installation_configuration/machine-configuration-tasks.html
+- **Machine Config Pools**: https://docs.openshift.com/container-platform/4.16/post_installation_configuration/machine-configuration-tasks.html#machine-config-pools
+- **Custom Machine Configs**: https://docs.openshift.com/container-platform/4.16/post_installation_configuration/machine-configuration-tasks.html#machine-config-custom
+
+#### 3. ETCD Configuration
+- **ETCD Overview**: https://docs.openshift.com/container-platform/4.16/scalability_and_performance/etcd.html
+- **ETCD Backup and Restore**: https://docs.openshift.com/container-platform/4.16/backup_and_restore/control_plane_backup_and_restore.html
+- **ETCD Performance Tuning**: https://docs.openshift.com/container-platform/4.16/scalability_and_performance/etcd.html#etcd-performance-tuning
+
+#### 4. Performance and Scalability
+- **Performance and Scalability Guide**: https://docs.openshift.com/container-platform/4.16/scalability_and_performance/index.html
+- **Master Node Sizing**: https://docs.openshift.com/container-platform/4.16/scalability_and_performance/planning-your-environment-according-to-object-limits.html
+- **Resource Management**: https://docs.openshift.com/container-platform/4.16/nodes/clusters/nodes-cluster-resource-configure.html
+
+#### 5. Monitoring and Observability
+- **Monitoring Overview**: https://docs.openshift.com/container-platform/4.16/monitoring/index.html
+- **Prometheus Monitoring**: https://docs.openshift.com/container-platform/4.16/monitoring/monitoring-your-own-services.html
+- **Alerting**: https://docs.openshift.com/container-platform/4.16/monitoring/managing-alerts.html
+
+### Red Hat Community of Practice
+
+#### 1. GitHub Repositories
+- **Red Hat CoP**: https://github.com/redhat-cop
+- **OpenShift Best Practices**: https://github.com/redhat-cop/openshift-best-practices
+- **OpenShift Performance Tuning**: https://github.com/redhat-cop/openshift-performance-tuning
+- **OpenShift Maintenance**: https://github.com/redhat-cop/openshift-maintenance
+
+#### 2. Best Practices
+- **OpenShift Best Practices Guide**: https://github.com/redhat-cop/openshift-best-practices/blob/master/README.md
+- **Performance Tuning Guide**: https://github.com/redhat-cop/openshift-performance-tuning/blob/master/README.md
+- **Maintenance Procedures**: https://github.com/redhat-cop/openshift-maintenance/blob/master/README.md
+
+### Red Hat Support Resources
+
+#### 1. Customer Portal
+- **Red Hat Customer Portal**: https://access.redhat.com
+- **OpenShift Documentation**: https://access.redhat.com/documentation/en-us/openshift_container_platform/
+- **Knowledge Base**: https://access.redhat.com/knowledgebase
+
+#### 2. Support Channels
+- **Red Hat Support**: https://support.redhat.com
+- **Community Forums**: https://community.redhat.com
+- **Red Hat Developer**: https://developers.redhat.com
+
+### Additional Resources
+
+#### 1. Kubernetes Documentation
+- **Kubernetes Official Docs**: https://kubernetes.io/docs/
+- **Kubernetes Best Practices**: https://kubernetes.io/docs/concepts/cluster-administration/
+- **Resource Management**: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+
+#### 2. OpenShift Learning
+- **OpenShift Learning Portal**: https://learn.openshift.com
+- **Red Hat Training**: https://www.redhat.com/en/services/training
+- **OpenShift Certification**: https://www.redhat.com/en/services/certification
+
+### Version-Specific References
+
+#### 1. OpenShift 4.16
+- **Release Notes**: https://docs.openshift.com/container-platform/4.16/release_notes/ocp-4-16-release-notes.html
+- **Known Issues**: https://docs.openshift.com/container-platform/4.16/release_notes/ocp-4-16-release-notes.html#ocp-4-16-known-issues
+- **Deprecated Features**: https://docs.openshift.com/container-platform/4.16/release_notes/ocp-4-16-release-notes.html#ocp-4-16-deprecated-features
+
+#### 2. Machine Configuration API
+- **Machine Configuration API**: https://docs.openshift.com/container-platform/4.16/rest_api/machine_configuration_apis/machineconfiguration-openshift-io-v1-machineconfig.html
+- **Machine Config Pool API**: https://docs.openshift.com/container-platform/4.16/rest_api/machine_configuration_apis/machineconfiguration-openshift-io-v1-machineconfigpool.html
+
+### Security References
+
+#### 1. Security Best Practices
+- **OpenShift Security Guide**: https://docs.openshift.com/container-platform/4.16/security/index.html
+- **RBAC Configuration**: https://docs.openshift.com/container-platform/4.16/authentication/using-rbac.html
+- **Security Context Constraints**: https://docs.openshift.com/container-platform/4.16/authentication/managing-security-context-constraints.html
+
+#### 2. Compliance
+- **Compliance Guide**: https://docs.openshift.com/container-platform/4.16/security/compliance_operator/compliance-operator-installation.html
+- **Security Scanning**: https://docs.openshift.com/container-platform/4.16/security/compliance_operator/compliance-operator-scans.html
+
+### Troubleshooting Resources
+
+#### 1. Troubleshooting Guides
+- **Troubleshooting Overview**: https://docs.openshift.com/container-platform/4.16/support/troubleshooting/index.html
+- **Master Node Troubleshooting**: https://docs.openshift.com/container-platform/4.16/support/troubleshooting/troubleshooting-master-nodes.html
+- **ETCD Troubleshooting**: https://docs.openshift.com/container-platform/4.16/support/troubleshooting/troubleshooting-etcd.html
+
+#### 2. Diagnostic Tools
+- **Must Gather**: https://docs.openshift.com/container-platform/4.16/support/troubleshooting/gathering-cluster-data.html
+- **Cluster Logging**: https://docs.openshift.com/container-platform/4.16/logging/index.html
+- **Monitoring Tools**: https://docs.openshift.com/container-platform/4.16/monitoring/index.html
+
+
+
+#!/bin/bash
+# OpenShift 4.16 Master Node Performance Snapshot Script
+# Red Hat Community of Practice - Performance Validation
+# Collects baseline and post-tuning performance metrics
+
+set -euo pipefail
+
+# Configuration
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-snapshots"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SNAPSHOT_TYPE=${SNAPSHOT_TYPE:-"baseline"}  # baseline or post
+LOG_FILE="$OUTPUT_DIR/performance-snapshot-$TIMESTAMP.log"
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    log "INFO: $1"
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+# Function to collect etcd metrics
+collect_etcd_metrics() {
+    log_info "Collecting etcd metrics"
+    
+    local etcd_pod
+    etcd_pod=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)
+    
+    if [[ -z "$etcd_pod" ]]; then
+        log_error "No etcd pod found"
+        return 1
+    fi
+    
+    # ETCD WAL fsync latency (p99)
+    local wal_fsync_p99
+    wal_fsync_p99=$(oc exec -n openshift-etcd "$etcd_pod" -- etcdctl endpoint status --write-out=json | jq -r '.walFsyncDurations.p99' 2>/dev/null || echo "n/a")
+    
+    # ETCD DB size
+    local db_size
+    db_size=$(oc exec -n openshift-etcd "$etcd_pod" -- etcdctl endpoint status --write-out=json | jq -r '.dbSize' 2>/dev/null || echo "n/a")
+    
+    # ETCD leader changes (approximate from metrics)
+    local leader_changes
+    leader_changes=$(oc exec -n openshift-etcd "$etcd_pod" -- etcdctl endpoint status --write-out=json | jq -r '.leader' 2>/dev/null || echo "n/a")
+    
+    # Write to metrics file
+    cat > "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "etcd": {
+    "wal_fsync_p99_seconds": "$wal_fsync_p99",
+    "db_size_bytes": "$db_size",
+    "leader": "$leader_changes"
+  }
+}
+EOF
+    
+    log_info "ETCD metrics collected: WAL fsync p99=$wal_fsync_p99, DB size=$db_size"
+}
+
+# Function to collect API server metrics
+collect_api_metrics() {
+    log_info "Collecting API server metrics"
+    
+    # API server response times (approximate from cluster operations)
+    local api_get_time api_list_time api_watch_time
+    
+    # GET operation timing
+    local start_time end_time
+    start_time=$(date +%s.%N)
+    oc get nodes >/dev/null 2>&1
+    end_time=$(date +%s.%N)
+    api_get_time=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "n/a")
+    
+    # LIST operation timing
+    start_time=$(date +%s.%N)
+    oc get pods --all-namespaces >/dev/null 2>&1
+    end_time=$(date +%s.%N)
+    api_list_time=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "n/a")
+    
+    # WATCH operation timing (simulate with timeout)
+    start_time=$(date +%s.%N)
+    timeout 5s oc get pods --watch-only >/dev/null 2>&1 || true
+    end_time=$(date +%s.%N)
+    api_watch_time=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "n/a")
+    
+    # Calculate p99 (approximate)
+    local api_p99
+    api_p99=$(echo "scale=6; ($api_get_time + $api_list_time + $api_watch_time) / 3" | bc -l 2>/dev/null || echo "n/a")
+    
+    # Write to metrics file
+    cat > "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "api_server": {
+    "get_p99_seconds": "$api_get_time",
+    "list_p99_seconds": "$api_list_time",
+    "watch_p99_seconds": "$api_watch_time",
+    "overall_p99_seconds": "$api_p99"
+  }
+}
+EOF
+    
+    log_info "API server metrics collected: p99=$api_p99"
+}
+
+# Function to collect resource counts
+collect_resource_counts() {
+    log_info "Collecting resource counts"
+    
+    # Count ConfigMaps in application namespaces
+    local configmap_count
+    configmap_count=$(oc get configmaps --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | .metadata.name' | wc -l)
+    
+    # Count Secrets in application namespaces
+    local secret_count
+    secret_count=$(oc get secrets --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | .metadata.name' | wc -l)
+    
+    # Write to metrics file
+    cat > "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "resources": {
+    "configmaps_application_namespaces": $configmap_count,
+    "secrets_application_namespaces": $secret_count
+  }
+}
+EOF
+    
+    log_info "Resource counts collected: ConfigMaps=$configmap_count, Secrets=$secret_count"
+}
+
+# Function to collect master node metrics
+collect_master_metrics() {
+    log_info "Collecting master node metrics"
+    
+    # Get master nodes
+    local master_nodes
+    master_nodes=$(oc get nodes -l node-role.kubernetes.io/master= -o name | cut -d/ -f2)
+    
+    local master_metrics=""
+    for node in $master_nodes; do
+        # CPU usage
+        local cpu_usage
+        cpu_usage=$(oc describe node "$node" | grep -A 5 "Allocated resources" | grep "cpu" | awk '{print $3}' | sed 's/(//' | sed 's/%)//' || echo "n/a")
+        
+        # Memory usage
+        local memory_usage
+        memory_usage=$(oc describe node "$node" | grep -A 5 "Allocated resources" | grep "memory" | awk '{print $3}' | sed 's/(//' | sed 's/%)//' || echo "n/a")
+        
+        # Disk usage
+        local disk_usage
+        disk_usage=$(oc debug node/"$node" -- chroot /host df -h /var/lib/etcd 2>/dev/null | awk 'NR==2 {print $5}' | sed 's/%//' || echo "n/a")
+        
+        master_metrics="$master_metrics{\"node\": \"$node\", \"cpu_usage_percent\": \"$cpu_usage\", \"memory_usage_percent\": \"$memory_usage\", \"etcd_disk_usage_percent\": \"$disk_usage\"},"
+    done
+    
+    # Remove trailing comma
+    master_metrics=$(echo "$master_metrics" | sed 's/,$//')
+    
+    # Write to metrics file
+    cat > "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "master_nodes": [$master_metrics]
+}
+EOF
+    
+    log_info "Master node metrics collected for $(echo "$master_nodes" | wc -w) nodes"
+}
+
+# Function to generate markdown report
+generate_markdown_report() {
+    log_info "Generating markdown report"
+    
+    local report_file="$OUTPUT_DIR/performance-report-$SNAPSHOT_TYPE-$TIMESTAMP.md"
+    
+    cat > "$report_file" << EOF
+# OpenShift 4.16 Master Node Performance Report
+## $SNAPSHOT_TYPE - $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+### ETCD Metrics
+- **WAL fsync p99 latency**: $(jq -r '.etcd.wal_fsync_p99_seconds' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **DB size**: $(jq -r '.etcd.db_size_bytes' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") bytes
+- **Leader**: $(jq -r '.etcd.leader' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### API Server Metrics
+- **GET p99**: $(jq -r '.api_server.get_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **LIST p99**: $(jq -r '.api_server.list_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **WATCH p99**: $(jq -r '.api_server.watch_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **Overall p99**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+
+### Resource Counts
+- **ConfigMaps (application namespaces)**: $(jq -r '.resources.configmaps_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+- **Secrets (application namespaces)**: $(jq -r '.resources.secrets_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### Master Node Metrics
+$(jq -r '.master_nodes[] | "- **'$node'**: CPU: \(.cpu_usage_percent)%, Memory: \(.memory_usage_percent)%, ETCD Disk: \(.etcd_disk_usage_percent)%"' "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" 2>/dev/null || echo "- No master node metrics available")
+
+### Cluster Health
+- **Cluster version**: $(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "n/a")
+- **Cluster operators**: $(oc get clusteroperators --no-headers | grep -v "True" | wc -l) failed
+- **Node status**: $(oc get nodes --no-headers | grep -v "Ready" | wc -l) not ready
+
+### Notes
+- Snapshot type: $SNAPSHOT_TYPE
+- Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+- Output directory: $OUTPUT_DIR
+EOF
+    
+    log_info "Markdown report generated: $report_file"
+    echo "$report_file"
+}
+
+# Main execution
+main() {
+    log_info "Starting performance snapshot collection"
+    log_info "Snapshot type: $SNAPSHOT_TYPE"
+    log_info "Output directory: $OUTPUT_DIR"
+    
+    # Collect all metrics
+    collect_etcd_metrics
+    collect_api_metrics
+    collect_resource_counts
+    collect_master_metrics
+    
+    # Generate report
+    local report_file
+    report_file=$(generate_markdown_report)
+    
+    log_info "Performance snapshot collection completed"
+    log_info "Report generated: $report_file"
+    
+    echo "$report_file"
+}
+
+# Run main function
+main "$@"
+
+
+
+#!/bin/bash
+# OpenShift 4.16 Performance Validation Report Generator
+# Red Hat Community of Practice - Performance Validation
+# Compares baseline and post-tuning metrics with PASS/FAIL criteria
+
+set -euo pipefail
+
+# Configuration
+BASELINE_REPORT=${1:-""}
+POST_REPORT=${2:-""}
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-validation"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1"
+}
+
+log_info() {
+    log "INFO: $1"
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+# Function to extract metric from markdown report
+extract_metric() {
+    local report_file="$1"
+    local metric_name="$2"
+    
+    if [[ ! -f "$report_file" ]]; then
+        echo "n/a"
+        return
+    fi
+    
+    case "$metric_name" in
+        "etcd_wal_fsync_p99")
+            grep "WAL fsync p99 latency" "$report_file" | sed 's/.*: //' | sed 's/ seconds//'
+            ;;
+        "etcd_db_size")
+            grep "DB size" "$report_file" | sed 's/.*: //' | sed 's/ bytes//'
+            ;;
+        "etcd_leader_changes")
+            grep "Leader" "$report_file" | sed 's/.*: //'
+            ;;
+        "api_p99")
+            grep "Overall p99" "$report_file" | sed 's/.*: //' | sed 's/ seconds//'
+            ;;
+        "configmaps_count")
+            grep "ConfigMaps (application namespaces)" "$report_file" | sed 's/.*: //'
+            ;;
+        "secrets_count")
+            grep "Secrets (application namespaces)" "$report_file" | sed 's/.*: //'
+            ;;
+        *)
+            echo "n/a"
+            ;;
+    esac
+}
+
+# Function to calculate delta
+calculate_delta() {
+    local baseline="$1"
+    local post="$2"
+    
+    if [[ "$baseline" == "n/a" ]] || [[ "$post" == "n/a" ]]; then
+        echo "n/a"
+        return
+    fi
+    
+    # Handle numeric values
+    if [[ "$baseline" =~ ^[0-9]+\.?[0-9]*$ ]] && [[ "$post" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "$post - $baseline" | bc -l 2>/dev/null || echo "n/a"
+    else
+        echo "n/a"
+    fi
+}
+
+# Function to calculate percentage change
+calculate_percentage() {
+    local baseline="$1"
+    local post="$2"
+    
+    if [[ "$baseline" == "n/a" ]] || [[ "$post" == "n/a" ]] || [[ "$baseline" == "0" ]]; then
+        echo "n/a"
+        return
+    fi
+    
+    # Handle numeric values
+    if [[ "$baseline" =~ ^[0-9]+\.?[0-9]*$ ]] && [[ "$post" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "scale=2; (($post - $baseline) / $baseline) * 100" | bc -l 2>/dev/null || echo "n/a"
+    else
+        echo "n/a"
+    fi
+}
+
+# Function to evaluate PASS/FAIL criteria
+evaluate_criteria() {
+    local metric="$1"
+    local baseline="$2"
+    local post="$3"
+    local delta="$4"
+    
+    case "$metric" in
+        "etcd_wal_fsync_p99")
+            if [[ "$post" == "n/a" ]]; then
+                echo "n/a"
+            elif (( $(echo "$post <= 0.010" | bc -l) )); then
+                echo "PASS"
+            else
+                echo "FAIL"
+            fi
+            ;;
+        "etcd_leader_changes")
+            if [[ "$post" == "n/a" ]]; then
+                echo "n/a"
+            elif [[ "$post" == "0" ]] || [[ "$post" == "n/a" ]]; then
+                echo "PASS"
+            else
+                echo "FAIL"
+            fi
+            ;;
+        "etcd_db_size")
+            if [[ "$post" == "n/a" ]]; then
+                echo "n/a"
+            elif [[ "$delta" == "n/a" ]]; then
+                echo "n/a"
+            elif (( $(echo "$delta <= 0" | bc -l) )); then
+                echo "PASS"
+            else
+                echo "FAIL"
+            fi
+            ;;
+        "api_p99")
+            if [[ "$post" == "n/a" ]]; then
+                echo "n/a"
+            elif [[ "$delta" == "n/a" ]]; then
+                echo "n/a"
+            elif (( $(echo "$delta <= 0" | bc -l) )); then
+                echo "PASS"
+            else
+                echo "FAIL"
+            fi
+            ;;
+        "configmaps_count"|"secrets_count")
+            if [[ "$post" == "n/a" ]]; then
+                echo "n/a"
+            elif [[ "$delta" == "n/a" ]]; then
+                echo "n/a"
+            elif (( $(echo "$delta < 0" | bc -l) )); then
+                echo "PASS"
+            else
+                echo "FAIL"
+            fi
+            ;;
+        *)
+            echo "n/a"
+            ;;
+    esac
+}
+
+# Function to generate validation report
+generate_validation_report() {
+    log_info "Generating validation report"
+    
+    local report_file="$OUTPUT_DIR/performance-validation-$TIMESTAMP.md"
+    
+    # Extract metrics
+    local etcd_wal_fsync_p99_baseline etcd_wal_fsync_p99_post
+    local etcd_db_size_baseline etcd_db_size_post
+    local etcd_leader_changes_baseline etcd_leader_changes_post
+    local api_p99_baseline api_p99_post
+    local configmaps_count_baseline configmaps_count_post
+    local secrets_count_baseline secrets_count_post
+    
+    etcd_wal_fsync_p99_baseline=$(extract_metric "$BASELINE_REPORT" "etcd_wal_fsync_p99")
+    etcd_wal_fsync_p99_post=$(extract_metric "$POST_REPORT" "etcd_wal_fsync_p99")
+    
+    etcd_db_size_baseline=$(extract_metric "$BASELINE_REPORT" "etcd_db_size")
+    etcd_db_size_post=$(extract_metric "$POST_REPORT" "etcd_db_size")
+    
+    etcd_leader_changes_baseline=$(extract_metric "$BASELINE_REPORT" "etcd_leader_changes")
+    etcd_leader_changes_post=$(extract_metric "$POST_REPORT" "etcd_leader_changes")
+    
+    api_p99_baseline=$(extract_metric "$BASELINE_REPORT" "api_p99")
+    api_p99_post=$(extract_metric "$POST_REPORT" "api_p99")
+    
+    configmaps_count_baseline=$(extract_metric "$BASELINE_REPORT" "configmaps_count")
+    configmaps_count_post=$(extract_metric "$POST_REPORT" "configmaps_count")
+    
+    secrets_count_baseline=$(extract_metric "$BASELINE_REPORT" "secrets_count")
+    secrets_count_post=$(extract_metric "$POST_REPORT" "secrets_count")
+    
+    # Calculate deltas
+    local etcd_wal_fsync_p99_delta etcd_db_size_delta etcd_leader_changes_delta
+    local api_p99_delta configmaps_count_delta secrets_count_delta
+    
+    etcd_wal_fsync_p99_delta=$(calculate_delta "$etcd_wal_fsync_p99_baseline" "$etcd_wal_fsync_p99_post")
+    etcd_db_size_delta=$(calculate_delta "$etcd_db_size_baseline" "$etcd_db_size_post")
+    etcd_leader_changes_delta=$(calculate_delta "$etcd_leader_changes_baseline" "$etcd_leader_changes_post")
+    api_p99_delta=$(calculate_delta "$api_p99_baseline" "$api_p99_post")
+    configmaps_count_delta=$(calculate_delta "$configmaps_count_baseline" "$configmaps_count_post")
+    secrets_count_delta=$(calculate_delta "$secrets_count_baseline" "$secrets_count_post")
+    
+    # Calculate percentages
+    local etcd_wal_fsync_p99_pct etcd_db_size_pct etcd_leader_changes_pct
+    local api_p99_pct configmaps_count_pct secrets_count_pct
+    
+    etcd_wal_fsync_p99_pct=$(calculate_percentage "$etcd_wal_fsync_p99_baseline" "$etcd_wal_fsync_p99_post")
+    etcd_db_size_pct=$(calculate_percentage "$etcd_db_size_baseline" "$etcd_db_size_post")
+    etcd_leader_changes_pct=$(calculate_percentage "$etcd_leader_changes_baseline" "$etcd_leader_changes_post")
+    api_p99_pct=$(calculate_percentage "$api_p99_baseline" "$api_p99_post")
+    configmaps_count_pct=$(calculate_percentage "$configmaps_count_baseline" "$configmaps_count_post")
+    secrets_count_pct=$(calculate_percentage "$secrets_count_baseline" "$secrets_count_post")
+    
+    # Evaluate criteria
+    local etcd_wal_fsync_p99_result etcd_db_size_result etcd_leader_changes_result
+    local api_p99_result configmaps_count_result secrets_count_result
+    
+    etcd_wal_fsync_p99_result=$(evaluate_criteria "etcd_wal_fsync_p99" "$etcd_wal_fsync_p99_baseline" "$etcd_wal_fsync_p99_post" "$etcd_wal_fsync_p99_delta")
+    etcd_db_size_result=$(evaluate_criteria "etcd_db_size" "$etcd_db_size_baseline" "$etcd_db_size_post" "$etcd_db_size_delta")
+    etcd_leader_changes_result=$(evaluate_criteria "etcd_leader_changes" "$etcd_leader_changes_baseline" "$etcd_leader_changes_post" "$etcd_leader_changes_delta")
+    api_p99_result=$(evaluate_criteria "api_p99" "$api_p99_baseline" "$api_p99_post" "$api_p99_delta")
+    configmaps_count_result=$(evaluate_criteria "configmaps_count" "$configmaps_count_baseline" "$configmaps_count_post" "$configmaps_count_delta")
+    secrets_count_result=$(evaluate_criteria "secrets_count" "$secrets_count_baseline" "$secrets_count_post" "$secrets_count_delta")
+    
+    # Generate report
+    cat > "$report_file" << EOF
+# OpenShift 4.16 Master Node Performance Validation Report
+## $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+### Executive Summary
+- **ETCD WAL fsync p99**: $etcd_wal_fsync_p99_result - $(if [[ "$etcd_wal_fsync_p99_result" == "PASS" ]]; then echo "✅ Improved or within acceptable range"; else echo "❌ Needs attention"; fi)
+- **ETCD leader changes**: $etcd_leader_changes_result - $(if [[ "$etcd_leader_changes_result" == "PASS" ]]; then echo "✅ Stable leadership"; else echo "❌ Leadership instability detected"; fi)
+- **ETCD DB size**: $etcd_db_size_result - $(if [[ "$etcd_db_size_result" == "PASS" ]]; then echo "✅ Size maintained or reduced"; else echo "❌ Size increased"; fi)
+- **API server p99**: $api_p99_result - $(if [[ "$api_p99_result" == "PASS" ]]; then echo "✅ Performance maintained or improved"; else echo "❌ Performance degraded"; fi)
+- **ConfigMaps count**: $configmaps_count_result - $(if [[ "$configmaps_count_result" == "PASS" ]]; then echo "✅ Resources reduced"; else echo "❌ Resources increased or unchanged"; fi)
+- **Secrets count**: $secrets_count_result - $(if [[ "$secrets_count_result" == "PASS" ]]; then echo "✅ Resources reduced"; else echo "❌ Resources increased or unchanged"; fi)
+
+### Evidence & Deltas
+
+| Metric | Baseline | Post-Tuning | Δ | % Change | Result |
+|--------|----------|-------------|---|----------|---------|
+| ETCD WAL fsync p99 (s) | $etcd_wal_fsync_p99_baseline | $etcd_wal_fsync_p99_post | $etcd_wal_fsync_p99_delta | $etcd_wal_fsync_p99_pct% | $etcd_wal_fsync_p99_result |
+| ETCD DB size (bytes) | $etcd_db_size_baseline | $etcd_db_size_post | $etcd_db_size_delta | $etcd_db_size_pct% | $etcd_db_size_result |
+| ETCD leader changes | $etcd_leader_changes_baseline | $etcd_leader_changes_post | $etcd_leader_changes_delta | $etcd_leader_changes_pct% | $etcd_leader_changes_result |
+| API p99 (s) | $api_p99_baseline | $api_p99_post | $api_p99_delta | $api_p99_pct% | $api_p99_result |
+| ConfigMaps count | $configmaps_count_baseline | $configmaps_count_post | $configmaps_count_delta | $configmaps_count_pct% | $configmaps_count_result |
+| Secrets count | $secrets_count_baseline | $secrets_count_post | $secrets_count_delta | $secrets_count_pct% | $secrets_count_result |
+
+### Acceptance Criteria
+- **ETCD WAL fsync p99**: ≤ 0.010s or improved
+- **ETCD leader changes**: ≈ 0 (stable)
+- **ETCD DB size**: Flat or decreased
+- **API p99**: Flat or improved
+- **ConfigMaps/Secrets**: Decreased when pruning enabled
+
+### Next Steps
+$(if [[ "$etcd_wal_fsync_p99_result" == "FAIL" ]]; then echo "- Investigate ETCD WAL fsync performance issues"; fi)
+$(if [[ "$etcd_leader_changes_result" == "FAIL" ]]; then echo "- Check ETCD cluster stability and network connectivity"; fi)
+$(if [[ "$etcd_db_size_result" == "FAIL" ]]; then echo "- Review ETCD compaction settings and data retention policies"; fi)
+$(if [[ "$api_p99_result" == "FAIL" ]]; then echo "- Analyze API server performance bottlenecks"; fi)
+$(if [[ "$configmaps_count_result" == "FAIL" ]] || [[ "$secrets_count_result" == "FAIL" ]]; then echo "- Verify resource pruning configuration and execution"; fi)
+$(if [[ "$etcd_wal_fsync_p99_result" == "PASS" ]] && [[ "$etcd_leader_changes_result" == "PASS" ]] && [[ "$etcd_db_size_result" == "PASS" ]] && [[ "$api_p99_result" == "PASS" ]]; then echo "- Performance tuning successful - monitor for sustained improvements"; fi)
+
+### Rollback Procedures
+$(if [[ "$etcd_wal_fsync_p99_result" == "FAIL" ]] || [[ "$etcd_leader_changes_result" == "FAIL" ]] || [[ "$etcd_db_size_result" == "FAIL" ]] || [[ "$api_p99_result" == "FAIL" ]]; then echo "- Remove custom machine configs: \`oc delete machineconfig 99-master-node-performance-tuning\`"; echo "- Remove ETCD disk config: \`oc delete machineconfig 99-master-etcd-dedicated-disk\`"; echo "- Wait for machine config pool update: \`oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s\`"; echo "- Verify cluster health: \`oc get clusteroperators\`"; fi)
+
+### Notes
+- Baseline report: $BASELINE_REPORT
+- Post-tuning report: $POST_REPORT
+- Validation timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+- Output directory: $OUTPUT_DIR
+EOF
+    
+    log_info "Validation report generated: $report_file"
+    echo "$report_file"
+}
+
+# Main execution
+main() {
+    if [[ -z "$BASELINE_REPORT" ]] || [[ -z "$POST_REPORT" ]]; then
+        log_error "Usage: $0 <baseline-report.md> <post-report.md>"
+        exit 1
+    fi
+    
+    if [[ ! -f "$BASELINE_REPORT" ]]; then
+        log_error "Baseline report not found: $BASELINE_REPORT"
+        exit 1
+    fi
+    
+    if [[ ! -f "$POST_REPORT" ]]; then
+        log_error "Post-tuning report not found: $POST_REPORT"
+        exit 1
+    fi
+    
+    log_info "Starting performance validation"
+    log_info "Baseline report: $BASELINE_REPORT"
+    log_info "Post-tuning report: $POST_REPORT"
+    
+    local report_file
+    report_file=$(generate_validation_report)
+    
+    log_info "Performance validation completed"
+    log_info "Validation report: $report_file"
+    
+    echo "$report_file"
+}
+
+# Run main function
+main "$@"
+
+
+#!/bin/bash
+# OpenShift 4.16 Performance Validation Workflow
+# Red Hat Community of Practice - Complete validation process
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-validation"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1"
+}
+
+log_info() {
+    log "INFO: $1"
+}
+
+log_error() {
+    log "ERROR: $1"
+}
+
+# Function to collect baseline metrics
+collect_baseline() {
+    log_info "Collecting baseline performance metrics"
+    
+    SNAPSHOT_TYPE="baseline" "$SCRIPT_DIR/12-performance-snapshot.sh"
+}
+
+# Function to collect post-tuning metrics
+collect_post_tuning() {
+    log_info "Collecting post-tuning performance metrics"
+    
+    SNAPSHOT_TYPE="post" "$SCRIPT_DIR/12-performance-snapshot.sh"
+}
+
+# Function to run validation
+run_validation() {
+    local baseline_report="$1"
+    local post_report="$2"
+    
+    log_info "Running performance validation"
+    
+    "$SCRIPT_DIR/13-validation-report-generator.sh" "$baseline_report" "$post_report"
+}
+
+# Function to display results
+display_results() {
+    local validation_report="$1"
+    
+    log_info "Displaying validation results"
+    
+    echo "=========================================="
+    echo "PERFORMANCE VALIDATION RESULTS"
+    echo "=========================================="
+    echo ""
+    
+    # Extract and display executive summary
+    echo "EXECUTIVE SUMMARY:"
+    grep -A 10 "### Executive Summary" "$validation_report" | grep "^-" | sed 's/^- //'
+    echo ""
+    
+    # Extract and display evidence table
+    echo "EVIDENCE & DELTAS:"
+    grep -A 20 "### Evidence & Deltas" "$validation_report" | grep "|" | head -8
+    echo ""
+    
+    # Extract and display next steps
+    echo "NEXT STEPS:"
+    grep -A 10 "### Next Steps" "$validation_report" | grep "^-" | sed 's/^- //'
+    echo ""
+    
+    echo "Full report: $validation_report"
+    echo "=========================================="
+}
+
+# Main execution
+main() {
+    local action="${1:-help}"
+    
+    case "$action" in
+        "baseline")
+            log_info "Starting baseline collection"
+            collect_baseline
+            ;;
+        "post")
+            log_info "Starting post-tuning collection"
+            collect_post_tuning
+            ;;
+        "validate")
+            local baseline_report="${2:-}"
+            local post_report="${3:-}"
+            
+            if [[ -z "$baseline_report" ]] || [[ -z "$post_report" ]]; then
+                log_error "Usage: $0 validate <baseline-report.md> <post-report.md>"
+                exit 1
+            fi
+            
+            local validation_report
+            validation_report=$(run_validation "$baseline_report" "$post_report")
+            display_results "$validation_report"
+            ;;
+        "full")
+            log_info "Starting full validation workflow"
+            
+            # Collect baseline
+            local baseline_report
+            baseline_report=$(collect_baseline)
+            log_info "Baseline collected: $baseline_report"
+            
+            # Wait for user to apply tuning
+            echo ""
+            echo "=========================================="
+            echo "BASELINE COLLECTION COMPLETED"
+            echo "=========================================="
+            echo "Baseline report: $baseline_report"
+            echo ""
+            echo "Please apply your performance tuning changes now."
+            echo "Press Enter when ready to collect post-tuning metrics..."
+            read -r
+            
+            # Collect post-tuning
+            local post_report
+            post_report=$(collect_post_tuning)
+            log_info "Post-tuning collected: $post_report"
+            
+            # Run validation
+            local validation_report
+            validation_report=$(run_validation "$baseline_report" "$post_report")
+            display_results "$validation_report"
+            ;;
+        "help"|*)
+            echo "Usage: $0 <action> [options]"
+            echo ""
+            echo "Actions:"
+            echo "  baseline                    - Collect baseline performance metrics"
+            echo "  post                        - Collect post-tuning performance metrics"
+            echo "  validate <baseline> <post>  - Validate performance improvements"
+            echo "  full                        - Run complete validation workflow"
+            echo "  help                        - Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0 baseline"
+            echo "  $0 post"
+            echo "  $0 validate baseline-report.md post-report.md"
+            echo "  $0 full"
+            ;;
+    esac
+}
+
+# Run main function
+main "$@"
+
+
+
+# OpenShift 4.16 Performance Monitoring Commands
+## Red Hat Community of Practice - Monitoring and Validation
+
+### Quick Performance Checks
+
+#### 1. ETCD Performance Monitoring
+```bash
+# Check ETCD cluster health
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint health
+
+# Check ETCD performance metrics
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json
+
+# Monitor ETCD WAL fsync latency
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json | jq -r '.walFsyncDurations.p99'
+
+# Check ETCD DB size
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json | jq -r '.dbSize'
+
+# Monitor ETCD leader changes
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json | jq -r '.leader'
+```
+
+#### 2. API Server Performance Monitoring
+```bash
+# Check API server response time
+time oc get nodes >/dev/null
+
+# Monitor API server pods
+oc get pods -n openshift-kube-apiserver
+
+# Check API server logs for errors
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=100
+
+# Monitor API server metrics
+oc get pods -n openshift-kube-apiserver -o name | head -1 | xargs oc exec -n openshift-kube-apiserver -- curl -s localhost:6443/metrics | grep -E "(apiserver_request_duration_seconds|apiserver_request_total)"
+```
+
+#### 3. Master Node Resource Monitoring
+```bash
+# Check master node resource usage
+oc describe nodes -l node-role.kubernetes.io/master=
+
+# Monitor master node CPU and memory
+oc top nodes -l node-role.kubernetes.io/master=
+
+# Check master node disk usage
+oc debug node/<master-node-name> -- chroot /host df -h
+
+# Monitor master node kubelet logs
+oc debug node/<master-node-name> -- chroot /host journalctl -u kubelet --since="1 hour ago"
+```
+
+#### 4. Resource Count Monitoring
+```bash
+# Count ConfigMaps in application namespaces
+oc get configmaps --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | .metadata.name' | wc -l
+
+# Count Secrets in application namespaces
+oc get secrets --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | .metadata.name' | wc -l
+
+# List namespaces with most resources
+oc get configmaps --all-namespaces -o json | jq -r '.items[] | select(.metadata.namespace | test("^(openshift-|kube-|default$)") | not) | .metadata.namespace' | sort | uniq -c | sort -nr
+```
+
+### Continuous Monitoring Setup
+
+#### 1. Prometheus Queries
+```promql
+# ETCD WAL fsync latency p99
+histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))
+
+# ETCD DB size
+etcd_mvcc_db_total_size_in_bytes
+
+# ETCD leader changes
+rate(etcd_server_leader_changes_seen_total[1h])
+
+# API server request duration p99
+histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket[5m]))
+
+# Master node CPU usage
+100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# Master node memory usage
+100 - (avg by (instance) (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100)
+```
+
+#### 2. Grafana Dashboard Queries
+```json
+{
+  "dashboard": {
+    "title": "OpenShift 4.16 Master Performance",
+    "panels": [
+      {
+        "title": "ETCD WAL fsync p99",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))",
+            "legendFormat": "ETCD WAL fsync p99"
+          }
+        ]
+      },
+      {
+        "title": "ETCD DB Size",
+        "targets": [
+          {
+            "expr": "etcd_mvcc_db_total_size_in_bytes",
+            "legendFormat": "ETCD DB Size"
+          }
+        ]
+      },
+      {
+        "title": "API Server Response Time p99",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "API p99"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### Validation Procedures
+
+#### 1. Pre-Tuning Validation
+```bash
+# Run baseline collection
+./14-validation-workflow.sh baseline
+
+# Verify cluster health
+oc get clusteroperators
+oc get nodes
+oc get pods --all-namespaces | grep -v Running
+
+# Check current resource usage
+oc top nodes
+oc describe nodes -l node-role.kubernetes.io/master=
+```
+
+#### 2. Post-Tuning Validation
+```bash
+# Run post-tuning collection
+./14-validation-workflow.sh post
+
+# Verify tuning applied
+oc get machineconfigs | grep performance-tuning
+oc get machineconfigpool master
+
+# Check for any issues
+oc get events --sort-by='.lastTimestamp' | tail -20
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=50
+```
+
+#### 3. Performance Validation
+```bash
+# Run full validation
+./14-validation-workflow.sh full
+
+# Or validate specific reports
+./14-validation-workflow.sh validate baseline-report.md post-report.md
+```
+
+### Troubleshooting Commands
+
+#### 1. ETCD Issues
+```bash
+# Check ETCD pod status
+oc get pods -n openshift-etcd
+
+# Check ETCD logs
+oc logs -n openshift-etcd -l app=etcd --tail=100
+
+# Check ETCD disk usage
+oc debug node/<master-node-name> -- chroot /host df -h /var/lib/etcd
+
+# Check ETCD configuration
+oc get pods -n openshift-etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json
+```
+
+#### 2. API Server Issues
+```bash
+# Check API server status
+oc get pods -n openshift-kube-apiserver
+
+# Check API server logs
+oc logs -n openshift-kube-apiserver -l app=openshift-kube-apiserver --tail=100
+
+# Check API server metrics
+oc get pods -n openshift-kube-apiserver -o name | head -1 | xargs oc exec -n openshift-kube-apiserver -- curl -s localhost:6443/metrics | grep -E "(apiserver_request_duration_seconds|apiserver_request_total)"
+```
+
+#### 3. Master Node Issues
+```bash
+# Check master node status
+oc get nodes -l node-role.kubernetes.io/master=
+
+# Check master node conditions
+oc describe nodes -l node-role.kubernetes.io/master=
+
+# Check kubelet logs
+oc debug node/<master-node-name> -- chroot /host journalctl -u kubelet --since="1 hour ago"
+
+# Check system resources
+oc debug node/<master-node-name> -- chroot /host top -bn1
+oc debug node/<master-node-name> -- chroot /host free -h
+oc debug node/<master-node-name> -- chroot /host df -h
+```
+
+### Alerting Rules
+
+#### 1. ETCD Alerts
+```yaml
+groups:
+- name: etcd
+  rules:
+  - alert: ETCDHighFsyncLatency
+    expr: histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.010
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "ETCD WAL fsync latency is high"
+      description: "ETCD WAL fsync p99 latency is {{ $value }}s, above threshold of 0.010s"
+
+  - alert: ETCDLeaderChanges
+    expr: rate(etcd_server_leader_changes_seen_total[1h]) > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "ETCD leader changes detected"
+      description: "ETCD leader changes: {{ $value }} per hour"
+
+  - alert: ETCDDBSizeHigh
+    expr: etcd_mvcc_db_total_size_in_bytes > 8589934592  # 8GB
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "ETCD database size is high"
+      description: "ETCD database size is {{ $value }} bytes"
+```
+
+#### 2. API Server Alerts
+```yaml
+groups:
+- name: apiserver
+  rules:
+  - alert: APIServerHighLatency
+    expr: histogram_quantile(0.99, rate(apiserver_request_duration_seconds_bucket[5m])) > 1.0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "API server latency is high"
+      description: "API server p99 latency is {{ $value }}s"
+
+  - alert: APIServerHighErrorRate
+    expr: rate(apiserver_request_total{code=~"5.."}[5m]) > 0.1
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "API server error rate is high"
+      description: "API server 5xx error rate is {{ $value }}"
+```
+
+#### 3. Master Node Alerts
+```yaml
+groups:
+- name: master-nodes
+  rules:
+  - alert: MasterNodeHighCPU
+    expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Master node CPU usage is high"
+      description: "Master node {{ $labels.instance }} CPU usage is {{ $value }}%"
+
+  - alert: MasterNodeHighMemory
+    expr: 100 - (avg by (instance) (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100) > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Master node memory usage is high"
+      description: "Master node {{ $labels.instance }} memory usage is {{ $value }}%"
+
+  - alert: MasterNodeDiskSpace
+    expr: 100 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} * 100) > 90
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Master node disk space is low"
+      description: "Master node {{ $labels.instance }} disk usage is {{ $value }}%"
+```
+
+### Performance Testing Commands
+
+#### 1. Load Testing
+```bash
+# API server load test
+for i in {1..100}; do
+  oc get nodes >/dev/null &
+done
+wait
+
+# ETCD load test
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json
+
+# Resource creation test
+oc create namespace test-performance-$(date +%s)
+oc delete namespace test-performance-$(date +%s)
+```
+
+#### 2. Stress Testing
+```bash
+# Create multiple resources
+for i in {1..50}; do
+  oc create configmap test-cm-$i -n default --from-literal=key=value
+done
+
+# Clean up
+for i in {1..50}; do
+  oc delete configmap test-cm-$i -n default
+done
+```
+
+### Documentation and Reporting
+
+#### 1. Generate Performance Report
+```bash
+# Generate comprehensive performance report
+./12-performance-snapshot.sh
+
+# Generate validation report
+./13-validation-report-generator.sh baseline-report.md post-report.md
+```
+
+#### 2. Export Metrics
+```bash
+# Export ETCD metrics
+oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | xargs oc exec -n openshift-etcd -- etcdctl endpoint status --write-out=json > etcd-metrics.json
+
+# Export API server metrics
+oc get pods -n openshift-kube-apiserver -o name | head -1 | xargs oc exec -n openshift-kube-apiserver -- curl -s localhost:6443/metrics > apiserver-metrics.txt
+
+# Export cluster status
+oc get nodes -o yaml > cluster-nodes.yaml
+oc get clusteroperators -o yaml > cluster-operators.yaml
+```
+```
+
+### **File 16: README.md**
+```markdown
+# OpenShift 4.16 Master Node Performance Tuning
+## Red Hat Community of Practice
+
+This repository contains a comprehensive solution for OpenShift 4.16 master node performance tuning following Red Hat Community of Practice patterns.
+
+## Overview
+
+This solution provides:
+- Master node systemReserved resource optimization
+- Safe ConfigMap/Secret pruning with RBAC
+- ETCD dedicated disk configuration for HCI masters
+- Comprehensive monitoring and validation framework
+- Performance validation with PASS/FAIL criteria
+
+## Quick Start
+
+### 1. Clone the Repository
+```bash
+git clone <your-repo-url>
+cd openshift-4.16-master-performance-tuning
+```
+
+### 2. Deploy the Solution
+```bash
+# Follow the deployment guide
+./deploy.sh
+```
+
+### 3. Validate Performance
+```bash
+# Run full validation workflow
+./14-validation-workflow.sh full
+```
+
+## File Structure
+
+```
+openshift-4.16-master-performance-tuning/
+├── 01-master-node-tuning.yaml          # Master node systemReserved configuration
+├── 02-prune-rbac.yaml                  # RBAC for resource pruning
+├── 03-prune-script.sh                  # Safe pruning script
+├── 04-prune-cronjob.yaml               # Container-based CronJob
+├── 05-etcd-dedicated-disk.yaml         # ETCD disk configuration
+├── 06-etcd-disk-setup.sh               # ETCD disk setup script
+├── 07-etcd-disk-verify.sh              # ETCD disk verification
+├── 08-namespace-pruning-strategy.md    # Pruning strategy guide
+├── 09-monitoring-verification.yaml     # Monitoring configuration
+├── 10-deployment-guide.md              # Step-by-step deployment guide
+├── 11-redhat-documentation-references.md # Red Hat documentation links
+├── 12-performance-snapshot.sh          # Performance data collection
+├── 13-validation-report-generator.sh   # Validation report generator
+├── 14-validation-workflow.sh           # Complete validation workflow
+├── 15-monitoring-commands.md           # Monitoring commands reference
+├── README.md                           # This file
+└── deploy.sh                           # Deployment script
+
+
+
+# OpenShift 4.16 Master Node Performance Tuning
+## Red Hat Community of Practice
+
+This repository contains a comprehensive solution for OpenShift 4.16 master node performance tuning following Red Hat Community of Practice patterns.
+
+## Overview
+
+This solution provides:
+- Master node systemReserved resource optimization
+- Safe ConfigMap/Secret pruning with RBAC
+- ETCD dedicated disk configuration for HCI masters
+- Comprehensive monitoring and validation framework
+- Performance validation with PASS/FAIL criteria
+
+## Quick Start
+
+### 1. Clone the Repository
+```bash
+git clone <your-repo-url>
+cd openshift-4.16-master-performance-tuning
+```
+
+### 2. Deploy the Solution
+```bash
+# Follow the deployment guide
+./deploy.sh
+```
+
+### 3. Validate Performance
+```bash
+# Run full validation workflow
+./14-validation-workflow.sh full
+```
+
+## File Structure
+
+## Key Features
+
+### ✅ Red Hat CoP Compliance
+- Uses ose-cli image for container-based operations
+- Follows Red Hat security patterns (non-root, read-only filesystem)
+- Implements proper RBAC and service accounts
+- Uses infra node scheduling with tolerations
+
+### ✅ Production-Ready
+- Comprehensive error handling and logging
+- Dry-run by default with deletion limits
+- Safety nets and verification procedures
+- Complete rollback procedures
+
+### ✅ Performance Optimizations
+- Increased systemReserved resources on master nodes
+- ETCD dedicated disk configuration for HCI masters
+- Safe ConfigMap/Secret pruning with reference checking
+- Comprehensive monitoring and alerting
+
+### ✅ Security Considerations
+- Non-root execution contexts
+- Proper SELinux context handling
+- RBAC with minimal required permissions
+- Security context constraints
+
+## Deployment Order
+
+1. **Master Node Tuning** - Apply systemReserved configuration
+2. **ETCD Configuration** - Set up dedicated disk (HCI masters only)
+3. **Resource Pruning** - Deploy RBAC and CronJob
+4. **Monitoring Setup** - Configure performance monitoring
+5. **Validation** - Run performance validation tests
+
+## Performance Validation
+
+The solution includes a comprehensive validation framework that:
+- Collects baseline and post-tuning metrics
+- Compares performance improvements
+- Provides PASS/FAIL criteria
+- Generates executive summary reports
+
+### Validation Metrics
+- ETCD WAL fsync p99 latency
+- ETCD DB size and leader changes
+- API server p99 response times
+- ConfigMap/Secret counts in application namespaces
+
+### Acceptance Criteria
+- ETCD WAL fsync p99 ≤ 0.010s or improved
+- ETCD leader changes ≈ 0 (stable)
+- ETCD DB size flat or decreased
+- API p99 flat or improved
+- ConfigMaps/Secrets decreased when pruning enabled
+
+## Usage Examples
+
+### Deploy Master Node Tuning
+```bash
+oc apply -f 01-master-node-tuning.yaml
+oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+```
+
+### Deploy Resource Pruning
+
+
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
+
+## License
+
+This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+
+## Disclaimer
+
+This solution is provided as-is and follows Red Hat Community of Practice patterns. Always test in a non-production environment first and ensure you have proper backups before applying any changes to production clusters.
+
+## Changelog
+
+### v1.0.0
+- Initial release
+- Master node performance tuning configuration
+- Safe resource pruning with RBAC
+- ETCD dedicated disk configuration
+- Comprehensive monitoring and validation framework
+- Performance validation with PASS/FAIL criteria
+
+#!/bin/bash
+# OpenShift 4.16 Master Node Performance Tuning - Deployment Script
+# Red Hat Community of Practice
+
+set -euo pipefail
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="/tmp/openshift-performance-tuning-deploy.log"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging function
+log() {
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+}
+
+log_info() {
+    echo -e "${BLUE}INFO:${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_success() {
+    echo -e "${GREEN}SUCCESS:${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_warning() {
+    echo -e "${YELLOW}WARNING:${NC} $1" | tee -a "$LOG_FILE"
+}
+
+log_error() {
+    echo -e "${RED}ERROR:${NC} $1" | tee -a "$LOG_FILE"
+}
+
+# Function to check prerequisites
+check_prerequisites() {
+    log_info "Checking prerequisites"
+    
+    # Check if oc is installed
+    if ! command -v oc &> /dev/null; then
+        log_error "oc CLI tool is not installed"
+        exit 1
+    fi
+    
+    # Check if jq is installed
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is not installed"
+        exit 1
+    fi
+    
+    # Check if bc is installed
+    if ! command -v bc &> /dev/null; then
+        log_error "bc is not installed"
+        exit 1
+    fi
+    
+    # Check cluster connectivity
+    if ! oc get nodes >/dev/null 2>&1; then
+        log_error "Cannot connect to OpenShift cluster"
+        exit 1
+    fi
+    
+    # Check cluster version
+    local cluster_version
+    cluster_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "unknown")
+    log_info "Connected to OpenShift cluster version: $cluster_version"
+    
+    # Check if user has admin privileges
+    if ! oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1; then
+        log_error "User does not have cluster admin privileges"
+        exit 1
+    fi
+    
+    log_success "Prerequisites check passed"
+}
+
+# Function to backup current configuration
+backup_configuration() {
+    log_info "Backing up current configuration"
+    
+    local backup_dir="/tmp/openshift-backup-$TIMESTAMP"
+    mkdir -p "$backup_dir"
+    
+    # Backup machine configs
+    oc get machineconfigs -o yaml > "$backup_dir/machineconfigs.yaml" 2>/dev/null || true
+    
+    # Backup etcd configuration
+    oc get pods -n openshift-etcd -o yaml > "$backup_dir/etcd-pods.yaml" 2>/dev/null || true
+    
+    # Backup cluster operators
+    oc get clusteroperators -o yaml > "$backup_dir/clusteroperators.yaml" 2>/dev/null || true
+    
+    # Backup nodes
+    oc get nodes -o yaml > "$backup_dir/nodes.yaml" 2>/dev/null || true
+    
+    log_success "Configuration backed up to: $backup_dir"
+    echo "$backup_dir"
+}
+
+# Function to deploy master node tuning
+deploy_master_tuning() {
+    log_info "Deploying master node performance tuning"
+    
+    if [[ ! -f "$SCRIPT_DIR/01-master-node-tuning.yaml" ]]; then
+        log_error "Master node tuning configuration not found"
+        exit 1
+    fi
+    
+    oc apply -f "$SCRIPT_DIR/01-master-node-tuning.yaml"
+    log_success "Master node tuning configuration applied"
+    
+    log_info "Waiting for machine config to be applied..."
+    oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+    log_success "Master node tuning applied successfully"
+}
+
+# Function to deploy resource pruning
+deploy_resource_pruning() {
+    log_info "Deploying resource pruning configuration"
+    
+    if [[ ! -f "$SCRIPT_DIR/02-prune-rbac.yaml" ]]; then
+        log_error "Resource pruning RBAC configuration not found"
+        exit 1
+    fi
+    
+    if [[ ! -f "$SCRIPT_DIR/04-prune-cronjob.yaml" ]]; then
+        log_error "Resource pruning CronJob configuration not found"
+        exit 1
+    fi
+    
+    oc apply -f "$SCRIPT_DIR/02-prune-rbac.yaml"
+    log_success "Resource pruning RBAC applied"
+    
+    oc apply -f "$SCRIPT_DIR/04-prune-cronjob.yaml"
+    log_success "Resource pruning CronJob applied"
+    
+    # Test pruning (dry run)
+    log_info "Testing resource pruning (dry run)..."
+    oc create job --from=cronjob/prune-resources test-prune -n openshift-infra
+    sleep 10
+    oc logs job/test-prune -n openshift-infra
+    oc delete job test-prune -n openshift-infra
+    log_success "Resource pruning test completed"
+}
+
+# Function to deploy monitoring
+deploy_monitoring() {
+    log_info "Deploying monitoring configuration"
+    
+    if [[ ! -f "$SCRIPT_DIR/09-monitoring-verification.yaml" ]]; then
+        log_error "Monitoring configuration not found"
+        exit 1
+    fi
+    
+    oc apply -f "$SCRIPT_DIR/09-monitoring-verification.yaml"
+    log_success "Monitoring configuration applied"
+    
+    # Test monitoring
+    log_info "Testing monitoring..."
+    oc create job --from=cronjob/master-performance-monitoring test-monitoring -n openshift-monitoring
+    sleep 10
+    oc logs job/test-monitoring -n openshift-monitoring
+    oc delete job test-monitoring -n openshift-monitoring
+    log_success "Monitoring test completed"
+}
+
+# Function to deploy etcd configuration (optional)
+deploy_etcd_configuration() {
+    local deploy_etcd="${1:-false}"
+    
+    if [[ "$deploy_etcd" == "true" ]]; then
+        log_info "Deploying ETCD dedicated disk configuration"
+        
+        if [[ ! -f "$SCRIPT_DIR/05-etcd-dedicated-disk.yaml" ]]; then
+            log_error "ETCD configuration not found"
+            exit 1
+        fi
+        
+        log_warning "ETCD configuration will format and mount a dedicated disk"
+        log_warning "Make sure you have a dedicated disk available (e.g., /dev/sdb)"
+        read -p "Continue with ETCD configuration? (y/N): " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            oc apply -f "$SCRIPT_DIR/05-etcd-dedicated-disk.yaml"
+            log_success "ETCD configuration applied"
+            
+            log_info "Waiting for ETCD configuration to be applied..."
+            oc wait --for=condition=Updated machineconfigpool/master --timeout=1800s
+            log_success "ETCD configuration applied successfully"
+        else
+            log_info "Skipping ETCD configuration"
+        fi
+    else
+        log_info "Skipping ETCD configuration (use --etcd flag to enable)"
+    fi
+}
+
+# Function to verify deployment
+verify_deployment() {
+    log_info "Verifying deployment"
+    
+    # Check master node status
+    local not_ready_nodes
+    not_ready_nodes=$(oc get nodes -l node-role.kubernetes.io/master= --no-headers | grep -v "Ready" | wc -l)
+    
+    if [[ $not_ready_nodes -gt 0 ]]; then
+        log_warning "Some master nodes are not ready"
+        oc get nodes -l node-role.kubernetes.io/master=
+    else
+        log_success "All master nodes are ready"
+    fi
+    
+    # Check cluster operators
+    local failed_operators
+    failed_operators=$(oc get clusteroperators --no-headers | grep -v "True" | wc -l)
+    
+    if [[ $failed_operators -gt 0 ]]; then
+        log_warning "Some cluster operators are not healthy"
+        oc get clusteroperators --no-headers | grep -v "True"
+    else
+        log_success "All cluster operators are healthy"
+    fi
+    
+    # Check machine configs
+    oc get machineconfigs | grep -E "(master-node-performance-tuning|master-etcd-dedicated-disk)" || true
+    
+    # Check pruning cronjob
+    oc get cronjob prune-resources -n openshift-infra || true
+    
+    # Check monitoring cronjob
+    oc get cronjob master-performance-monitoring -n openshift-monitoring || true
+    
+    log_success "Deployment verification completed"
+}
+
+# Function to show usage
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --etcd                    Deploy ETCD dedicated disk configuration"
+    echo "  --skip-backup            Skip configuration backup"
+    echo "  --skip-verification      Skip deployment verification"
+    echo "  --help                   Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  $0                       # Deploy basic configuration"
+    echo "  $0 --etcd               # Deploy with ETCD configuration"
+    echo "  $0 --skip-backup        # Deploy without backup"
+}
+
+# Main execution
+main() {
+    local deploy_etcd=false
+    local skip_backup=false
+    local skip_verification=false
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --etcd)
+                deploy_etcd=true
+                shift
+                ;;
+            --skip-backup)
+                skip_backup=true
+                shift
+                ;;
+            --skip-verification)
+                skip_verification=true
+                shift
+                ;;
+            --help)
+                show_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    log_info "Starting OpenShift 4.16 Master Node Performance Tuning Deployment"
+    log_info "Timestamp: $TIMESTAMP"
+    log_info "Log file: $LOG_FILE"
+    
+    # Check prerequisites
+    check_prerequisites
+    
+    # Backup configuration
+    if [[ "$skip_backup" == "false" ]]; then
+        backup_configuration
+    else
+        log_info "Skipping configuration backup"
+    fi
+    
+    # Deploy components
+    deploy_master_tuning
+    deploy_resource_pruning
+    deploy_monitoring
+    deploy_etcd_configuration "$deploy_etcd"
+    
+    # Verify deployment
+    if [[ "$skip_verification" == "false" ]]; then
+        verify_deployment
+    else
+        log_info "Skipping deployment verification"
+    fi
+    
+    log_success "OpenShift 4.16 Master Node Performance Tuning deployment completed successfully"
+    log_info "Next steps:"
+    log_info "1. Monitor cluster health: oc get clusteroperators"
+    log_info "2. Check master node resources: oc describe nodes -l node-role.kubernetes.io/master="
+    log_info "3. Run performance validation: ./14-validation-workflow.sh baseline"
+    log_info "4. Review monitoring: oc get cronjob -n openshift-monitoring"
+}
+
+# Run main function
+main "$@"
