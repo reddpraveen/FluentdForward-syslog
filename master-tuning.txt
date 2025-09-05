@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+# ocp416-perf-setup.sh — One-shot creator for OCP 4.16 master performance pack
+# Creates:
+#  - ocp416-master-perf.yaml
+#  - ocp416-perf-snapshot.sh
+#  - ocp416-perf-diff.sh
+# Then prints step-by-step instructions.
+
+set -euo pipefail
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required tool: $1" >&2; exit 1; }; }
+need oc; need jq; need curl
+
+PACK_DIR="ocp416-master-perf-pack"
+YAML="${PACK_DIR}/ocp416-master-perf.yaml"
+SNAP="${PACK_DIR}/ocp416-perf-snapshot.sh"
+DIFF="${PACK_DIR}/ocp416-perf-diff.sh"
+
+mkdir -p "${PACK_DIR}"
+
+echo
+echo "=== OpenShift 4.16 Master Performance Pack ==="
+echo "This will create three files under: ${PACK_DIR}"
+echo
+
+# Prompt for etcd device (default /dev/sdb)
+read -r -p "Device for dedicated etcd disk on masters (default: /dev/sdb): " ETCD_DEVICE
+ETCD_DEVICE="${ETCD_DEVICE:-/dev/sdb}"
+echo "Using ETCD_DEVICE=${ETCD_DEVICE}"
+echo
+
+# --------------------------------------------------------------------
+# Write the combined YAML (KubeletConfig + Pruner + MachineConfig)
+# --------------------------------------------------------------------
+cat > "${YAML}.tmpl" <<'EOF'
+# =========================================
+# OpenShift 4.16 – Master Node Performance Pack (single file)
+# =========================================
+# 1) KubeletConfig (masters): fixed reservations + eviction thresholds
+# 2) Pruner (CoP style): RBAC + script + CronJob (dry-run by default)
+# 3) MachineConfig (masters): dedicate /var/lib/etcd to a device
+#
+# Notes:
+# - Review the ETCD_DEVICE value in setup script; it's embedded below.
+# - Pruner excludes system namespaces; enable deletion by flipping DRY_RUN=false.
+
+# -----------------------------------------
+# 1) KubeletConfig — reservations + eviction
+# -----------------------------------------
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: master-kubelet-fixed-reserve
+  annotations:
+    purpose: "Increase systemReserved/kubeReserved on masters; enforce allocatable & evictions"
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/master: ""
+  kubeletConfig:
+    systemReserved:
+      cpu: "2000m"
+      memory: "4Gi"
+      ephemeral-storage: "10Gi"
+    kubeReserved:
+      cpu: "1000m"
+      memory: "2Gi"
+      ephemeral-storage: "5Gi"
+    enforceNodeAllocatable: ["pods","system-reserved","kube-reserved"]
+    maxPods: 250
+    podPidsLimit: 4096
+    evictionHard:
+      memory.available: "500Mi"
+      nodefs.available: "5%"
+      imagefs.available: "10%"
+      pid.available: "5%"
+    evictionSoft:
+      memory.available: "1Gi"
+      nodefs.available: "10%"
+      imagefs.available: "15%"
+      pid.available: "10%"
+    evictionSoftGracePeriod:
+      memory.available: "90s"
+      nodefs.available: "2m"
+      imagefs.available: "2m"
+      pid.available: "1m"
+---
+# -----------------------------------------
+# 2) Pruner (CoP style) — RBAC + script + CronJob
+#    Dry-run by default; caps deletions; skips referenced objects; infra-only; restricted-v2; Forbid
+# -----------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: resource-pruner
+  namespace: openshift-config
+  labels: { app.kubernetes.io/name: resource-pruner }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: resource-pruner
+rules:
+- apiGroups: [""]
+  resources: ["configmaps","secrets","pods","replicationcontrollers","namespaces"]
+  verbs: ["get","list","delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments","daemonsets","statefulsets","replicasets"]
+  verbs: ["get","list"]
+- apiGroups: ["batch"]
+  resources: ["jobs","cronjobs"]
+  verbs: ["get","list"]
+- apiGroups: ["apps.openshift.io"]
+  resources: ["deploymentconfigs"]
+  verbs: ["get","list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: resource-pruner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: resource-pruner
+subjects:
+- kind: ServiceAccount
+  name: resource-pruner
+  namespace: openshift-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-pruner-script
+  namespace: openshift-config
+  labels: { app.kubernetes.io/name: resource-pruner }
+data:
+  prune-resources.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    DRY_RUN="${DRY_RUN:-true}"
+    MAX_DELETIONS="${MAX_DELETIONS:-50}"
+    AGE_THRESHOLD_DAYS="${AGE_THRESHOLD_DAYS:-30}"
+    EXCLUDE_SYSTEM_NS="${EXCLUDE_SYSTEM_NS:-true}"
+    LOG_LEVEL="${LOG_LEVEL:-INFO}"
+
+    SYSTEM_NAMESPACES=("default" "kube-system" "kube-public" "kube-node-lease" "openshift" "openshift-.*" "redhat-.*")
+
+    log(){ ts=$(date '+%F %T'); echo "[$ts][$LOG_LEVEL] $*"; }
+    is_system_namespace(){ [[ "$EXCLUDE_SYSTEM_NS" != "true" ]] && return 1; for p in "${SYSTEM_NAMESPACES[@]}"; do [[ "$1" =~ ^${p}$ ]] && return 0; done; return 1; }
+    THRESHOLD_DATE=$(date -d "${AGE_THRESHOLD_DAYS} days ago" --iso-8601=seconds 2>/dev/null || date -v-"${AGE_THRESHOLD_DAYS}"d '+%Y-%m-%dT%H:%M:%SZ')
+
+    ref_query(){ # $1=name $2=kind
+      local name="$1" kind="$2" q='(.spec.template.spec.volumes[]?'
+      if [[ "$kind" == "configmap" ]]; then
+        q+='|select(.configMap?.name==$name)) or (.spec.template.spec.containers[]?|.env[]? // empty | select(.valueFrom?.configMapKeyRef?.name==$name)) or (.envFrom[]? // empty | select(.configMapRef?.name==$name)) or (.spec.template.spec.initContainers[]?|.env[]? // empty | select(.valueFrom?.configMapKeyRef?.name==$name)) or (.envFrom[]? // empty | select(.configMapRef?.name==$name))'
+      else
+        q+='|select(.secret?.secretName==$name)) or (.spec.template.spec.containers[]?|.env[]? // empty | select(.valueFrom?.secretKeyRef?.name==$name)) or (.envFrom[]? // empty | select(.secretRef?.name==$name)) or (.spec.template.spec.initContainers[]?|.env[]? // empty | select(.valueFrom?.secretKeyRef?.name==$name)) or (.envFrom[]? // empty | select(.secretRef?.name==$name)) or (.spec.template.spec.imagePullSecrets[]?|select(.name==$name))'
+      fi
+      echo "$q"
+    }
+
+    referenced_in_ns(){ # $1=kind $2=name $3=ns
+      local kind="$1" name="$2" ns="$3" jqq
+      jqq=$(ref_query "$name" "$kind")
+      for r in deployments daemonsets statefulsets jobs cronjobs; do
+        oc get "$r" -n "$ns" -o json | jq -e --arg name "$name" ".items[] | select($jqq)" >/dev/null && return 0 || true
+      done
+      if [[ "$kind" == "configmap" ]]; then
+        oc get pods -n "$ns" -o json | jq -e --arg name "$name" '.items[] | select(.status.phase=="Running") | select((.spec.volumes[]?.configMap?.name==$name) or (.spec.containers[]?.env[]? // empty | select(.valueFrom?.configMapKeyRef?.name==$name)) or (.spec.containers[]?.envFrom[]? // empty | select(.configMapRef?.name==$name)) or (.spec.initContainers[]?.env[]? // empty | select(.valueFrom?.configMapKeyRef?.name==$name)) or (.spec.initContainers[]?.envFrom[]? // empty | select(.configMapRef?.name==$name)))' >/dev/null && return 0 || true
+      else
+        oc get pods -n "$ns" -o json | jq -e --arg name "$name" '.items[] | select(.status.phase=="Running") | select((.spec.volumes[]?.secret?.secretName==$name) or (.spec.containers[]?.env[]? // empty | select(.valueFrom?.secretKeyRef?.name==$name)) or (.spec.containers[]?.envFrom[]? // empty | select(.secretRef?.name==$name)) or (.spec.initContainers[]?.env[]? // empty | select(.valueFrom?.secretKeyRef?.name==$name)) or (.spec.initContainers[]?.envFrom[]? // empty | select(.secretRef?.name==$name)) or (.spec.imagePullSecrets[]?.name==$name))' >/dev/null && return 0 || true
+      fi
+      return 1
+    }
+
+    prune_kind(){ # $1=kind
+      local kind="$1" deleted=0
+      for ns in $(oc get ns -o jsonpath='{.items[*].metadata.name}'); do
+        is_system_namespace "$ns" && continue
+        for name in $(oc get "$kind" -n "$ns" -o json | jq -r --arg t "$THRESHOLD_DATE" '.items[] | select(.metadata.creationTimestamp < $t) | .metadata.name'); do
+          referenced_in_ns "$kind" "$name" "$ns" && { echo "SKIP $kind/$name in $ns (referenced)"; continue; }
+          if (( deleted >= MAX_DELETIONS )); then echo "Hit MAX_DELETIONS=$MAX_DELETIONS"; return 0; fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "DRY-RUN delete $kind/$name in $ns"
+          else
+            oc delete "$kind" "$name" -n "$ns" --ignore-not-found
+          fi
+          ((deleted++)); sleep 0.1
+        done
+      done
+    }
+
+    oc whoami >/dev/null || { echo "Cannot auth to cluster"; exit 1; }
+    command -v jq >/dev/null || { echo "jq not found in image"; exit 1; }
+
+    echo "=== PRUNER start (DRY_RUN=$DRY_RUN, MAX_DELETIONS=$MAX_DELETIONS, THRESHOLD=$THRESHOLD_DATE) ==="
+    prune_kind configmap
+    prune_kind secret
+    echo "=== PRUNER complete ==="
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: resource-pruner
+  namespace: openshift-config
+  labels: { app.kubernetes.io/name: resource-pruner }
+spec:
+  schedule: "0 2 * * 0"
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          annotations: { openshift.io/scc: restricted-v2 }
+        spec:
+          serviceAccountName: resource-pruner
+          restartPolicy: Never
+          nodeSelector: { node-role.kubernetes.io/infra: "" }
+          tolerations:
+          - { key: node-role.kubernetes.io/infra, operator: Exists, effect: NoSchedule }
+          - { key: node-role.kubernetes.io/infra, operator: Exists, effect: NoExecute }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            runAsGroup: 1001
+            fsGroup: 1001
+            seccompProfile: { type: RuntimeDefault }
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/bash","/scripts/prune-resources.sh"]
+            env:
+            - { name: DRY_RUN, value: "true" }           # flip to "false" to enable deletion
+            - { name: MAX_DELETIONS, value: "50" }
+            - { name: AGE_THRESHOLD_DAYS, value: "30" }
+            - { name: EXCLUDE_SYSTEM_NS, value: "true" } # application namespaces only
+            - { name: LOG_LEVEL, value: "INFO" }
+            resources:
+              requests: { cpu: 100m, memory: 256Mi }
+              limits:   { cpu: 500m, memory: 512Mi }
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              capabilities: { drop: ["ALL"] }
+            volumeMounts:
+            - { name: script, mountPath: /scripts, readOnly: true }
+            - { name: tmp,    mountPath: /tmp }
+          volumes:
+          - name: script
+            configMap: { name: resource-pruner-script, defaultMode: 0755 }
+          - name: tmp
+            emptyDir: { sizeLimit: 100Mi }
+---
+# -----------------------------------------
+# 3) MachineConfig — dedicate /var/lib/etcd to its own disk
+#    ETCD_DEVICE placeholder is replaced by the installer.
+# -----------------------------------------
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-master-etcd-dedicated-disk
+  labels: { machineconfiguration.openshift.io/role: master }
+spec:
+  config:
+    ignition: { version: 3.2.0 }
+    systemd:
+      units:
+      - name: etcd-disk-setup.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Setup dedicated etcd disk (format/mount/restore)
+          Before=var-lib-etcd.mount kubelet.service etcd.service
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/setup-etcd-disk.sh
+          TimeoutStartSec=1800
+          [Install]
+          WantedBy=multi-user.target
+      - name: var-lib-etcd.mount
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Mount dedicated etcd disk
+          After=etcd-disk-setup.service
+          Requires=etcd-disk-setup.service
+          [Mount]
+          What=/dev/disk/by-label/etcd-disk
+          Where=/var/lib/etcd
+          Type=xfs
+          Options=defaults,noatime,inode64,largeio,swalloc
+          [Install]
+          WantedBy=multi-user.target
+      - name: etcd-disk-verify.service
+        enabled: true
+        contents: |
+          [Unit]
+          Description=Verify etcd disk
+          After=var-lib-etcd.mount
+          Requires=var-lib-etcd.mount
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/verify-etcd-disk.sh
+          [Install]
+          WantedBy=multi-user.target
+    storage:
+      files:
+      - path: /usr/local/bin/setup-etcd-disk.sh
+        mode: 0755
+        contents:
+          inline: |
+            #!/bin/bash
+            set -euo pipefail
+            ETCD_DEVICE="___ETCD_DEVICE___"   # injected by installer
+            ETCD_MOUNT="/var/lib/etcd"
+            LABEL="etcd-disk"
+            LOG="/var/log/etcd-disk-setup.log"
+            exec >>"$LOG" 2>&1
+            echo "[INFO] $(date) starting setup: device=$ETCD_DEVICE"
+            [[ -b "$ETCD_DEVICE" ]] || { echo "[ERR] no block device $ETCD_DEVICE"; exit 1; }
+
+            if ! blkid "$ETCD_DEVICE" | grep -q "LABEL=\"$LABEL\""; then
+              echo "[INFO] formatting XFS on $ETCD_DEVICE"
+              mkfs.xfs -f -L "$LABEL" "$ETCD_DEVICE"
+            else
+              echo "[INFO] device already labeled $LABEL"
+            fi
+
+            mkdir -p "$ETCD_MOUNT"
+            if ! mountpoint -q "$ETCD_MOUNT"; then
+              echo "[INFO] mounting $ETCD_DEVICE at $ETCD_MOUNT"
+              mount -t xfs -o defaults,noatime,inode64,largeio,swalloc "$ETCD_DEVICE" "$ETCD_MOUNT"
+            fi
+
+            chown -R etcd:etcd "$ETCD_MOUNT" || true
+            chmod 700 "$ETCD_MOUNT" || true
+            command -v restorecon && restorecon -R "$ETCD_MOUNT" || true
+            echo "[INFO] setup complete"
+      - path: /usr/local/bin/verify-etcd-disk.sh
+        mode: 0755
+        contents:
+          inline: |
+            #!/bin/bash
+            set -euo pipefail
+            M="/var/lib/etcd"
+            echo "[VERIFY] $(date) start"
+            findmnt "$M" || { echo "[ERR] not mounted"; exit 1; }
+            df -h "$M"
+            xfs_info "$M" || true
+            DEV=$(findmnt -n -o SOURCE "$M" | sed 's/[0-9]*$//'); DN=$(basename "$DEV")
+            testfile="$M/iotest.$RANDOM"
+            dd if=/dev/zero of="$testfile" bs=1M count=50 oflag=direct 2>&1 || true
+            rm -f "$testfile"
+            [[ -f "/sys/block/$DN/queue/scheduler" ]] && cat "/sys/block/$DN/queue/scheduler" || true
+            echo "[VERIFY] done"
+EOF
+
+# replace the placeholder with chosen device
+sed "s|___ETCD_DEVICE___|${ETCD_DEVICE}|g" "${YAML}.tmpl" > "${YAML}"
+rm -f "${YAML}.tmpl"
+
+# --------------------------------------------------------------------
+# Write the snapshot script
+# --------------------------------------------------------------------
+cat > "${SNAP}" <<'EOF'
+#!/usr/bin/env bash
+# ocp416-perf-snapshot.sh — collect before/after evidence into a Markdown report
+set -euo pipefail
+LABEL="${1:-baseline}"   # baseline | post | after-etcd | after-prune
+TS="$(date +%Y%m%d-%H%M%S)"
+OUT="ocp416-master-perf-${LABEL}-${TS}.md"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing tool: $1" >&2; exit 1; }; }
+need oc; need jq; need curl
+log(){ echo "[$(date '+%F %T')] $*"; }
+
+log "Discovering thanos-querier..."
+THANOS_ROUTE="$(oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}')"
+[[ -n "$THANOS_ROUTE" ]] || { echo "No thanos-querier route"; exit 1; }
+TOKEN="$(oc whoami -t)"
+
+prom(){ curl -sS -G "https://${THANOS_ROUTE}/api/v1/query" --data-urlencode "query=$1" -H "Authorization: Bearer ${TOKEN}" --retry 3 --retry-delay 1; }
+prom_val(){ prom "$1" | jq -r 'if .status!="success" then "ERR" else (.data.result[]? | [.metric|to_entries|map("\(.key)=\(.value)")|join(","), .value[1]] | @tsv) end'; }
+prom_scalar(){ prom "$1" | jq -r 'if .status!="success" or (.data.result|length==0) then "NaN" else .data.result[0].value[1] end'; }
+
+{
+echo "# OpenShift 4.16 Master Performance Snapshot"
+echo "- **Label:** \`${LABEL}\`"
+echo "- **Timestamp:** \`$(date -Is)\`"
+echo "- **Cluster:** \`$(oc config current-context 2>/dev/null)\`"
+echo
+} > "$OUT"
+
+# etcd health/status
+echo "## etcd health & status" >> "$OUT"
+for p in $(oc -n openshift-etcd get pod -l app=etcd -o jsonpath='{.items[*].metadata.name}'); do
+  echo "### $p" >> "$OUT"
+  echo '```' >> "$OUT"
+  oc -n openshift-etcd exec "$p" -c etcd -- etcdctl endpoint health --write-out=table || true >> "$OUT"
+  oc -n openshift-etcd exec "$p" -c etcd -- etcdctl endpoint status --write-out=table || true >> "$OUT"
+  echo '```' >> "$OUT"
+done
+echo >> "$OUT"
+
+# etcd SLOs
+echo "## etcd performance SLOs (PromQL)" >> "$OUT"
+Q_FSYNCP99='histogram_quantile(0.99, sum(rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) by (le))'
+echo "- **p99 fsync latency (s, 5m):** \`$(prom_scalar "$Q_FSYNCP99")\`" >> "$OUT"
+echo >> "$OUT"
+echo "### Leader changes / 1h" >> "$OUT"
+Q_LEADERS='increase(etcd_server_leader_changes_seen_total[1h])'
+echo '```' >> "$OUT"; prom_val "$Q_LEADERS" >> "$OUT"; echo '```' >> "$OUT"
+echo >> "$OUT"
+echo "- **DB size (bytes):** \`$(prom_scalar 'max(etcd_mvcc_db_total_size_in_bytes)')\`" >> "$OUT"
+echo >> "$OUT"
+
+# API p99
+echo "## API server p99 latency (GET/LIST/WATCH; s)" >> "$OUT"
+Q_APIP99='histogram_quantile(0.99, sum by (le,resource,verb) (rate(apiserver_request_duration_seconds_bucket{verb=~"GET|LIST|WATCH"}[5m])))'
+echo '```' >> "$OUT"; prom_val "$Q_APIP99" >> "$OUT"; echo '```' >> "$OUT"; echo >> "$OUT"
+
+# Master node usage
+echo "## Master node CPU/Memory" >> "$OUT"
+echo '```' >> "$OUT"; oc adm top nodes -l node-role.kubernetes.io/master || true >> "$OUT"; echo '```' >> "$OUT"; echo >> "$OUT"
+
+# Object counts (app namespaces)
+echo "## App namespace object counts (ConfigMaps/Secrets)" >> "$OUT"
+APPL_NS=($(oc get ns -o json | jq -r '.items[].metadata.name' | grep -Ev '^(openshift|kube|redhat)-|^default$' || true))
+TOTAL_CM=0; TOTAL_SEC=0
+for ns in "${APPL_NS[@]}"; do
+  CM=$(oc get configmaps -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  SEC=$(oc get secrets    -n "$ns" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  TOTAL_CM=$((TOTAL_CM+CM)); TOTAL_SEC=$((TOTAL_SEC+SEC))
+done
+echo "- Namespaces: ${#APPL_NS[@]}  |  ConfigMaps: ${TOTAL_CM}  |  Secrets: ${TOTAL_SEC}" >> "$OUT"
+echo >> "$OUT"
+
+# etcd disk sanity
+echo "## etcd disk mount & XFS info (masters)" >> "$OUT"
+for n in $(oc get node -l node-role.kubernetes.io/master -o jsonpath='{.items[*].metadata.name}'); do
+  echo "### $n" >> "$OUT"
+  echo '```' >> "$OUT"
+  oc debug "node/${n}" --quiet -- chroot /host bash -c 'findmnt /var/lib/etcd && df -h /var/lib/etcd && (xfs_info /var/lib/etcd 2>/dev/null || true)' 2>/dev/null || true >> "$OUT"
+  echo '```' >> "$OUT"
+done
+echo >> "$OUT"
+
+echo "---" >> "$OUT"
+echo "Report written: $OUT"
+echo "$OUT"
+EOF
+chmod +x "${SNAP}"
+
+# --------------------------------------------------------------------
+# Write the diff script
+# --------------------------------------------------------------------
+cat > "${DIFF}" <<'EOF'
+#!/usr/bin/env bash
+# ocp416-perf-diff.sh — compare two snapshot .md files and print deltas
+set -euo pipefail
+[[ $# -eq 2 ]] || { echo "Usage: $0 <baseline.md> <post.md>"; exit 1; }
+B="$1"; P="$2"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
+need awk; need sed; need grep; need tr; need bc
+
+extract_scalar(){ grep -E "$2" "$1" | sed -E "s/$2/\\1/" | head -1 | tr -d '[:space:]'; }
+section_block(){ awk -v pat="$2" 'BEGIN{on=0} /^## /{ if(on){ exit } } $0 ~ pat { on=1 } on{ print }' "$1"; }
+sum_last_field(){ awk '{ if (NF>=1 && $NF ~ /^-?[0-9.]+$/) s+=$NF } END { if (s=="") print "0"; else print s }'; }
+max_last_field(){ awk '{ if ($NF ~ /^-?[0-9.]+$/) { if ($NF>m) m=$NF } } END { if (m=="") print "NaN"; else print m }'; }
+pct(){ [[ "$1" == "0" || "$1" == "NaN" || -z "$1" || -z "$2" ]] && echo "n/a" || echo "scale=4; (($2-$1)/$1)*100" | bc; }
+delta(){ [[ -z "$1" || -z "$2" ]] && echo "n/a" || echo "scale=6; $2-$1" | bc; }
+fmt_pct(){ v="$1"; [[ "$v" == "n/a" ]] && echo "n/a" || printf "%+.2f%%%%" "$v"; }
+fmt_num(){ v="$1"; [[ -z "$v" ]] && echo "n/a" || echo "$v"; }
+
+FSYNC_B=$(extract_scalar "$B" '- \*\*p99 fsync latency.*: `?([0-9.]+)`?')
+FSYNC_P=$(extract_scalar "$P" '- \*\*p99 fsync latency.*: `?([0-9.]+)`?')
+DB_B=$(extract_scalar "$B" '- \*\*DB size \(bytes\):\*\* `?([0-9]+)`?')
+DB_P=$(extract_scalar "$P" '- \*\*DB size \(bytes\):\*\* `?([0-9]+)`?')
+
+LEAD_B=$(section_block "$B" '^## etcd performance SLOs' | section_block /dev/stdin 'Leader changes' | sum_last_field)
+LEAD_P=$(section_block "$P" '^## etcd performance SLOs' | section_block /dev/stdin 'Leader changes' | sum_last_field)
+
+API_B=$(section_block "$B" '^## API server p99 latency' | max_last_field)
+API_P=$(section_block "$P" '^## API server p99 latency' | max_last_field)
+
+CMS_B=$(extract_scalar "$B" 'ConfigMaps:\s*([0-9]+)')
+CMS_P=$(extract_scalar "$P" 'ConfigMaps:\s*([0-9]+)')
+SECS_B=$(extract_scalar "$B" 'Secrets:\s*([0-9]+)')
+SECS_P=$(extract_scalar "$P" 'Secrets:\s*([0-9]+)')
+
+echo "==========================================="
+echo "OpenShift 4.16 Master Performance — DIFF"
+echo "Baseline: $B"
+echo "Post:     $P"
+echo "==========================================="
+D_FSYNC=$(delta "$FSYNC_B" "$FSYNC_P"); P_FSYNC=$(pct "$FSYNC_B" "$FSYNC_P")
+printf "fsync p99 (s): base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$FSYNC_B")" "$(fmt_num "$FSYNC_P")" "$(fmt_num "$D_FSYNC")" "$(fmt_pct "$P_FSYNC")"
+
+D_DB=$(delta "$DB_B" "$DB_P"); P_DB=$(pct "$DB_B" "$DB_P")
+printf "DB size (B):  base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$DB_B")" "$(fmt_num "$DB_P")" "$(fmt_num "$D_DB")" "$(fmt_pct "$P_DB")"
+
+D_LEAD=$(delta "$LEAD_B" "$LEAD_P"); P_LEAD=$(pct "$LEAD_B" "$LEAD_P")
+printf "Leader chg/h: base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$LEAD_B")" "$(fmt_num "$LEAD_P")" "$(fmt_num "$D_LEAD")" "$(fmt_pct "$P_LEAD")"
+
+D_API=$(delta "$API_B" "$API_P"); P_API=$(pct "$API_B" "$API_P")
+printf "API p99 (s):  base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$API_B")" "$(fmt_num "$API_P")" "$(fmt_num "$D_API")" "$(fmt_pct "$P_API")"
+
+D_CM=$(delta "$CMS_B" "$CMS_P"); P_CM=$(pct "$CMS_B" "$CMS_P")
+D_SEC=$(delta "$SECS_B" "$SECS_P"); P_SEC=$(pct "$SECS_B" "$SECS_P")
+printf "ConfigMaps:    base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$CMS_B")" "$(fmt_num "$CMS_P")" "$(fmt_num "$D_CM")" "$(fmt_pct "$P_CM")"
+printf "Secrets:       base=%s post=%s  Δ=%s  (%s)\n" "$(fmt_num "$SECS_B")" "$(fmt_num "$SECS_P")" "$(fmt_num "$D_SEC")" "$(fmt_pct "$P_SEC")"
+
+echo "Interpretation:"
+echo "  ↓ fsync p99 & ↓ DB size = better etcd I/O & less compaction pressure."
+echo "  ~0 leader changes = stable control plane."
+echo "  Flat/↓ API p99 = better API responsiveness."
+echo "  ↓ CM/Secrets = successful pruning."
+EOF
+chmod +x "${DIFF}"
+
+# --------------------------------------------------------------------
+# Final instructions
+# --------------------------------------------------------------------
+cat <<EONEXT
+
+Files created:
+  - ${YAML}
+  - ${SNAP}
+  - ${DIFF}
+
+NEXT STEPS (copy/paste):
+
+1) Take a BASELINE snapshot (runs read-only; needs 'oc', 'jq', 'curl'):
+   ${SNAP} baseline
+
+2) Apply the performance pack (KubeletConfig + etcd disk + Pruner in DRY-RUN):
+   oc apply -f ${YAML}
+   oc get mcp master -w
+   # NOTE: masters will reboot for the etcd disk MachineConfig to mount /var/lib/etcd
+
+3) After 24–72h of normal load, take a POST snapshot:
+   ${SNAP} post
+
+4) Compare before vs after:
+   ${DIFF} \$(ls -1 ${PACK_DIR}/ocp416-master-perf-baseline-*.md | tail -1) \\
+            \$(ls -1 ${PACK_DIR}/ocp416-master-perf-post-*.md | tail -1)
+
+5) Review pruner logs (still DRY-RUN). When satisfied, enable deletion:
+   oc patch cronjob/resource-pruner -n openshift-config \\
+     --type='json' -p='[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/env/0/value","value":"false"}]'
+
+6) (Optional) Re-run snapshot later and diff again to show object-count reduction.
+
+Safety / rollback:
+- Delete CronJob to stop pruning: oc -n openshift-config delete cronjob resource-pruner
+- Revert kubelet or etcd disk: oc delete kubeletconfig master-kubelet-fixed-reserve ; oc delete mc 99-master-etcd-dedicated-disk
+  (Then watch: oc get mcp master -w)
+
+EONEXT
+
+echo "Done."
