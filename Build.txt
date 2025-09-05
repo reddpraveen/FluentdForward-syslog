@@ -2,6 +2,84 @@ apiVersion: scaffolder.backstage.io/v1beta3
 kind: Template
 metadata:
   name: ansible-playbook-template
+  title: Ansible Playbook Template (PR into existing repo)
+  description: Generate/update an Ansible playbook into an existing repository via PR
+  tags: [ansible, playbook, rhdh]
+spec:
+  type: playbook
+  owner: user:Maskeen-Singh1
+  lifecycle: experimental
+
+  parameters:
+    - title: Target Repository
+      required: [owner, repo, projectName, subPath]
+      properties:
+        owner:
+          type: string
+          title: GitHub org or user that owns the repo
+          description: e.g. Maskeen-singh1 or your-org
+        repo:
+          type: string
+          title: Existing repository name
+          description: The repo you want to update (must already exist)
+        projectName:
+          type: string
+          title: Project name (folder that will be created/updated)
+          description: Becomes the leaf folder name in subPath
+        subPath:
+          type: string
+          title: Path inside repo where the project folder should live
+          description: e.g. playbooks (resulting path = subPath/projectName)
+
+  steps:
+    - id: fetch
+      name: Fetch template
+      action: fetch:template
+      input:
+        url: ./templates
+        # stage the generated files into a local folder named after the project
+        targetPath: ./${{ parameters.projectName }}
+
+    - id: pr
+      name: Open Pull Request to GitHub
+      action: publish:github:pull-request
+      input:
+        allowedHosts: ['github.devops.com'] # <--- change if your host differs
+        repoUrl: github.devops.com?owner=${{ parameters.owner }}&repo=${{ parameters.repo }}
+        branchName: scaffold/${{ parameters.projectName }}
+        title: "Add/Update ${{ parameters.projectName }} (scaffold)"
+        description: |
+          This PR was created by the RHDH scaffolder to add/update:
+          `${{ parameters.subPath }}/${{ parameters.projectName }}`.
+        commitMessage: "scaffold: add/update ${{ parameters.subPath }}/${{ parameters.projectName }}"
+        # Put all generated content under subPath/projectName in the repo
+        targetPath: /${{ parameters.subPath }}/${{ parameters.projectName }}
+        # Optional: if your skeleton already has catalog-info.yaml at its root
+        # then registering will work using the new path below.
+
+    - id: register
+      name: Register in Catalog (optional)
+      if: ${{ steps.pr.output.repoContentsUrl }}
+      action: catalog:register
+      input:
+        # points at the new branch’s contents; Backstage will follow default branch after merge
+        repoContentsUrl: ${{ steps.pr.output.repoContentsUrl }}
+        # adjust if your catalog file is not at the generated folder root
+        catalogInfoPath: /${{ parameters.subPath }}/${{ parameters.projectName }}/catalog-info.yaml
+
+  output:
+    links:
+      - title: Open Pull Request
+        url: ${{ steps.pr.output.pullRequestUrl }}
+      - title: Repo (browse)
+        url: ${{ steps.pr.output.remoteUrl }}
+
+
+
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: ansible-playbook-template
   title: Ansible Playbook Template
   description: Template to spin a new Ansible playbook
   tags: [ansible-template, automation, playbook, ansible, rhdh]
