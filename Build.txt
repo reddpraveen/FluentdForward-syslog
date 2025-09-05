@@ -1,3 +1,65 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: ansible-playbook-template
+  title: Ansible Playbook Template
+  description: Template to spin a new Ansible playbook
+  tags: [ansible-template, automation, playbook, ansible, rhdh]
+spec:
+  type: playbook
+  owner: user:Maskeen-Singh1
+  lifecycle: experimental
+
+  parameters:
+    - title: Project Info
+      required: [projectName, owner]
+      properties:
+        projectName:
+          type: string
+          title: Project Name
+        owner:
+          type: string
+          title: GitHub org or user (destination owner)
+
+  steps:
+    - id: fetch
+      name: Fetch Template
+      action: fetch:template
+      input:
+        url: ./templates
+        targetPath: ./${{ parameters.projectName }}
+
+    - id: publish
+      name: Publish to GitHub
+      action: publish:github
+      input:
+        # MUST be your actual GitHub Enterprise host
+        allowedHosts: ['github.devops.com']    # <-- change to your host
+        repoUrl: github.devops.com?owner=${{ parameters.owner }}&repo=${{ parameters.projectName }}
+        repoVisibility: private                 # or public/internal as your org allows
+        defaultBranch: main
+
+    - id: register
+      name: Register in Catalog
+      action: catalog:register
+      input:
+        # Use the OUTPUT from publish, not the input
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: /catalog-info.yaml
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps.publish.output.remoteUrl }}
+      - title: Open in Catalog
+        icon: catalog
+        entityRef: ${{ steps.register.output.entityRef }}
+
+
+
+
+
+
 # Exec into Alertmanager and create a multi-year silence
 POD=$(oc -n openshift-monitoring get pod -l app.kubernetes.io/name=alertmanager,alertmanager=main -o jsonpath='{.items[0].metadata.name}')
 
