@@ -102,14 +102,19 @@ EOF
 }
 
 # ---------- API p99 (Prometheus) ----------
+# ---------- API p99 (Prometheus) - Simplified ----------
 collect_api_metrics() {
   log_info "Collecting API server p99 (Prometheus)"
 
-  local p99_get p99_list p99_watch overall_p99
+  # Overall API server p99 (all verbs combined) - primary metric
+  local overall_p99
+  overall_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket[5m])))')"
+  
+  # Individual verbs (best effort, longer windows for sparse operations)
+  local p99_get p99_list p99_watch
   p99_get="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="GET"}[5m])))')"
-  p99_list="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="LIST"}[5m])))')"
-  p99_watch="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="WATCH"}[5m])))')"
-  overall_p99="$(max_num "$(max_num "$p99_get" "$p99_list")" "$p99_watch")"
+  p99_list="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="LIST"}[10m])))')"
+  p99_watch="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="WATCH"}[30m])))')"
 
   cat > "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" << EOF
 {
