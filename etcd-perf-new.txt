@@ -1,3 +1,250 @@
+
+#!/bin/bash
+# OpenShift 4.16 Master Node Performance Snapshot Script - Clean Version
+# This version has no special characters that cause issues in vi
+
+set -euo pipefail
+
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-snapshots"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SNAPSHOT_TYPE=${SNAPSHOT_TYPE:-"baseline"}
+LOG_FILE="$OUTPUT_DIR/performance-snapshot-$TIMESTAMP.log"
+CURL_TIMEOUT=${CURL_TIMEOUT:-5}
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+echo "DEBUG: Created output directory: $OUTPUT_DIR"
+echo "DEBUG: Timestamp: $TIMESTAMP"
+echo "DEBUG: Snapshot type: $SNAPSHOT_TYPE"
+
+# Logging function
+log() { 
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"
+    echo "DEBUG: $1"
+}
+
+log_info() { log "INFO: $1"; }
+log_error() { log "ERROR: $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    log_info "Checking prerequisites..."
+    
+    if ! command -v oc >/dev/null 2>&1; then
+        log_error "oc CLI not found. Please install and configure oc CLI."
+        exit 1
+    fi
+    log_info "oc CLI found"
+    
+    if ! command -v jq >/dev/null 2>&1; then
+        log_error "jq not found. Please install jq."
+        exit 1
+    fi
+    log_info "jq found"
+    
+    if ! command -v bc >/dev/null 2>&1; then
+        log_error "bc not found. Please install bc."
+        exit 1
+    fi
+    log_info "bc found"
+    
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_error "python3 not found. Please install python3."
+        exit 1
+    fi
+    log_info "python3 found"
+}
+
+# Check cluster connectivity
+check_cluster() {
+    log_info "Checking cluster connectivity..."
+    if ! oc cluster-info >/dev/null 2>&1; then
+        log_error "Cannot connect to OpenShift cluster. Please check your kubeconfig."
+        exit 1
+    fi
+    log_info "Cluster connectivity verified"
+}
+
+# Simple resource count collection
+collect_simple_metrics() {
+    log_info "Collecting simple metrics..."
+    
+    # Get basic cluster info
+    local cluster_version
+    cluster_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "n/a")
+    
+    # Get resource counts
+    local total_configmaps total_secrets
+    total_configmaps=$(oc get configmaps --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+    total_secrets=$(oc get secrets --all-namespaces --no-headers 2>/dev/null | wc -l || echo "0")
+    
+    # Write simple JSON
+    cat > "$OUTPUT_DIR/simple-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "cluster_version": "$cluster_version",
+  "total_configmaps": $total_configmaps,
+  "total_secrets": $total_secrets
+}
+EOF
+    
+    log_info "Simple metrics collected and saved to: $OUTPUT_DIR/simple-metrics-$TIMESTAMP.json"
+}
+
+# Generate simple markdown report
+generate_simple_report() {
+    log_info "Generating simple markdown report..."
+    
+    local report_file="$OUTPUT_DIR/performance-report-$TIMESTAMP.md"
+    echo "DEBUG: Report file path: $report_file"
+    
+    # Read the JSON file we just created
+    local cluster_version total_configmaps total_secrets
+    
+    if [[ -f "$OUTPUT_DIR/simple-metrics-$TIMESTAMP.json" ]]; then
+        cluster_version=$(jq -r '.cluster_version' "$OUTPUT_DIR/simple-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+        total_configmaps=$(jq -r '.total_configmaps' "$OUTPUT_DIR/simple-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+        total_secrets=$(jq -r '.total_secrets' "$OUTPUT_DIR/simple-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+        echo "DEBUG: Read from JSON - cluster_version=$cluster_version, configmaps=$total_configmaps, secrets=$total_secrets"
+    else
+        cluster_version="n/a"
+        total_configmaps="n/a"
+        total_secrets="n/a"
+        echo "DEBUG: JSON file not found, using defaults"
+    fi
+    
+    # Create the markdown report
+    cat > "$report_file" << EOF
+# OpenShift 4.16 Master Node Performance Report
+## Red Hat Community of Practice
+
+**Snapshot Type:** $SNAPSHOT_TYPE  
+**Timestamp:** $TIMESTAMP  
+**Generated:** $(date -u +%Y-%m-%dT%H:%M:%SZ)  
+**Cluster:** $(oc config current-context 2>/dev/null || echo "n/a")
+
+---
+
+## Executive Summary
+
+This is a simplified performance snapshot for OpenShift 4.16 master node performance tuning validation.
+
+### Key Metrics
+- **Cluster Version**: $cluster_version
+- **Total ConfigMaps**: $total_configmaps
+- **Total Secrets**: $total_secrets
+
+---
+
+## Cluster Information
+
+- **Version**: $cluster_version
+- **Context**: $(oc config current-context 2>/dev/null || echo "n/a")
+- **API Server**: $(oc cluster-info | grep "Kubernetes control plane" | awk '{print $NF}' 2>/dev/null || echo "n/a")
+
+---
+
+## Resource Counts
+
+- **ConfigMaps**: $total_configmaps
+- **Secrets**: $total_secrets
+
+---
+
+## Output Files Summary
+
+This snapshot generated the following files in $OUTPUT_DIR:
+
+### JSON Data Files
+- **simple-metrics-$TIMESTAMP.json** - Basic cluster metrics
+
+### Report Files
+- **performance-report-$TIMESTAMP.md** - This markdown report
+- **performance-snapshot-$TIMESTAMP.log** - Detailed execution log
+
+### File Locations
+$OUTPUT_DIR/
+├── simple-metrics-$TIMESTAMP.json
+├── performance-report-$TIMESTAMP.md
+└── performance-snapshot-$TIMESTAMP.log
+
+---
+
+## Notes
+
+This is a simplified report to verify the script is working correctly. 
+The full version includes ETCD metrics, API server performance, and detailed analysis.
+
+### Report Generation
+- **Generated by**: OpenShift 4.16 Master Node Performance Snapshot Script (Clean Version)
+- **Output Directory**: $OUTPUT_DIR
+- **Log File**: $LOG_FILE
+
+EOF
+    
+    log_info "Simple report generated: $report_file"
+    
+    # Verify the file was created
+    if [[ -f "$report_file" ]]; then
+        log_info "Report file created successfully: $report_file"
+        log_info "Report file size: $(wc -c < "$report_file") bytes"
+        echo "DEBUG: File exists and has content"
+    else
+        log_error "Report file was NOT created: $report_file"
+        echo "DEBUG: File does not exist"
+    fi
+}
+
+# Main function
+main() {
+    echo "DEBUG: Starting main function"
+    log_info "Starting OpenShift 4.16 performance snapshot (clean): $SNAPSHOT_TYPE"
+    log_info "Output directory: $OUTPUT_DIR"
+    log_info "Log file: $LOG_FILE"
+    
+    # Check prerequisites
+    echo "DEBUG: Checking prerequisites"
+    check_prerequisites
+    
+    # Check cluster connectivity
+    echo "DEBUG: Checking cluster connectivity"
+    check_cluster
+    
+    # Collect simple metrics
+    echo "DEBUG: Collecting simple metrics"
+    collect_simple_metrics
+    
+    # Generate simple report
+    echo "DEBUG: Generating simple report"
+    generate_simple_report
+    
+    log_info "Performance snapshot completed successfully"
+    log_info "Files created:"
+    log_info "  - $OUTPUT_DIR/simple-metrics-$TIMESTAMP.json"
+    log_info "  - $OUTPUT_DIR/performance-report-$TIMESTAMP.md"
+    log_info "  - $LOG_FILE"
+    
+    # List all files in output directory
+    log_info "All files in output directory:"
+    ls -la "$OUTPUT_DIR" | while read line; do
+        log_info "  $line"
+    done
+    
+    echo "DEBUG: Script completed successfully"
+}
+
+# Run main function
+echo "DEBUG: About to run main function"
+main "$@"
+echo "DEBUG: Script finished"
+
+
+
+
+
+
+---\
 #!/bin/bash
 # OpenShift 4.16 Master Node Performance Snapshot Script - Debug Version
 # This version includes extensive debugging to show exactly what's happening
