@@ -294,6 +294,646 @@ EOF
   log_info "Cluster health collected: Version=$cluster_version, Failed COs=$cluster_operators_failed, Not ready nodes=$node_status"
 }
 
+# ---------- Generate comprehensive markdown report ----------
+generate_report() {
+  log_info "Generating comprehensive performance report"
+  
+  local report_file="$OUTPUT_DIR/performance-report-$TIMESTAMP.md"
+  
+  cat > "$report_file" << EOF
+# OpenShift 4.16 Master Node Performance Report
+## Red Hat Community of Practice
+
+**Snapshot Type:** $SNAPSHOT_TYPE  
+**Timestamp:** $TIMESTAMP  
+**Generated:** $(date -u +%Y-%m-%dT%H:%M:%SZ)  
+**Cluster:** $(oc config current-context 2>/dev/null || echo "n/a")
+
+---
+
+## Executive Summary
+
+This performance snapshot captures key metrics for OpenShift 4.16 master node performance tuning validation. The report includes ETCD performance metrics, API server response times, resource counts, and cluster health indicators.
+
+### Key Performance Indicators
+- **ETCD WAL fsync p99**: $(jq -r '.etcd.wal_fsync_p99_seconds' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **ETCD DB size**: $(jq -r '.etcd.db_size_bytes' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") bytes
+- **ETCD leader changes/hour**: $(jq -r '.etcd.leader_changes_per_hour' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+- **API server overall p99 (CLI)**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **API server overall p99 (Prometheus)**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+
+---
+
+## ETCD Performance Metrics
+
+ETCD is the backbone of OpenShift's control plane. These metrics indicate the health and performance of the distributed key-value store.
+
+### WAL Fsync Latency
+- **p99 Latency**: $(jq -r '.etcd.wal_fsync_p99_seconds' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **Target**: ≤ 0.010 seconds for optimal performance
+- **Impact**: High fsync latency can cause ETCD timeouts and cluster instability
+
+### Database Size
+- **Current Size**: $(jq -r '.etcd.db_size_bytes' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") bytes
+- **Recommended**: < 8GB for optimal performance
+- **Impact**: Large DB size increases backup/restore times and memory usage
+
+### Leadership Stability
+- **Leader Changes/Hour**: $(jq -r '.etcd.leader_changes_per_hour' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+- **Target**: ≈ 0 (stable leadership)
+- **Impact**: Frequent leader changes indicate network or performance issues
+
+---
+
+## API Server Performance Metrics
+
+The API server handles all cluster communication. These metrics measure response times for different operation types.
+
+### CLI-based Measurements (Real-time)
+These measurements use actual \`oc\` CLI commands with timing to capture real-world performance:
+
+- **GET p99**: $(jq -r '.api_server.get_p99_seconds' "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **LIST p99**: $(jq -r '.api_server.list_p99_seconds' "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **WATCH p99**: $(jq -r '.api_server.watch_p99_seconds' "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **Overall p99**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+
+### Prometheus-based Measurements (Historical)
+These measurements use Prometheus metrics for historical analysis:
+
+- **Overall p99**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **GET p99**: $(jq -r '.api_server.get_p99_seconds' "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **LIST p99**: $(jq -r '.api_server.list_p99_seconds' "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **WATCH p99**: $(jq -r '.api_server.watch_p99_seconds' "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+
+### Performance Targets
+- **GET operations**: < 0.1 seconds p99
+- **LIST operations**: < 0.5 seconds p99
+- **WATCH operations**: < 1.0 seconds p99
+- **Overall**: < 0.5 seconds p99
+
+---
+
+## Resource Counts
+
+Resource counts help validate the effectiveness of pruning operations and identify potential performance bottlenecks.
+
+### Total Resources
+- **ConfigMaps**: $(jq -r '.resources.total_configmaps' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+- **Secrets**: $(jq -r '.resources.total_secrets' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### Application Namespace Resources
+These are the resources that can be safely pruned (excluding system namespaces):
+
+- **ConfigMaps (application namespaces)**: $(jq -r '.resources.configmaps_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+- **Secrets (application namespaces)**: $(jq -r '.resources.secrets_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### Pruning Impact
+- **Target reduction**: 20-30% of application namespace resources
+- **Expected benefit**: Reduced ETCD DB size and improved API server performance
+- **Safety**: Only application namespaces are targeted for pruning
+
+---
+
+## Master Node Metrics
+
+Master node resource utilization provides insight into system performance and capacity planning.
+
+$(jq -r '.master_nodes[] | "### " + .node + "\n- **CPU Usage**: " + .cpu_usage_percent + "%\n- **Memory Usage**: " + .memory_usage_percent + "%\n- **ETCD Disk Usage**: " + .etcd_disk_usage_percent + "%\n"' "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" 2>/dev/null || echo "### No master node metrics available")
+
+### Resource Utilization Targets
+- **CPU Usage**: < 70% sustained
+- **Memory Usage**: < 80% sustained
+- **ETCD Disk Usage**: < 80% sustained
+
+---
+
+## Cluster Health
+
+Overall cluster health indicators provide context for performance metrics.
+
+### Cluster Information
+- **Version**: $(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "n/a")
+- **Context**: $(oc config current-context 2>/dev/null || echo "n/a")
+- **API Server**: $(oc cluster-info | grep "Kubernetes control plane" | awk '{print $NF}' 2>/dev/null || echo "n/a")
+
+### Health Status
+- **Failed Cluster Operators**: $(oc get clusteroperators --no-headers | grep -v "True" | wc -l)
+- **Not Ready Nodes**: $(oc get nodes --no-headers | grep -v "Ready" | wc -l)
+- **Total Nodes**: $(oc get nodes --no-headers | wc -l)
+
+### Health Targets
+- **Cluster Operators**: All should be "True"
+- **Node Status**: All should be "Ready"
+- **API Server**: Should be accessible and responsive
+
+---
+
+## Performance Analysis
+
+### Current Performance Assessment
+$(if [[ "$SNAPSHOT_TYPE" == "baseline" ]]; then
+  echo "This is a baseline measurement. Use this data to establish performance benchmarks before applying tuning changes."
+elif [[ "$SNAPSHOT_TYPE" == "post" ]]; then
+  echo "This is a post-tuning measurement. Compare with baseline data to validate performance improvements."
+else
+  echo "This is a $SNAPSHOT_TYPE measurement. Use for ongoing performance monitoring."
+fi)
+
+### Key Metrics to Monitor
+1. **ETCD WAL fsync p99** - Critical for cluster stability
+2. **API server p99** - Affects user experience and application performance
+3. **Resource counts** - Indicates pruning effectiveness
+4. **Master node utilization** - Shows resource pressure
+
+### Performance Improvement Indicators
+- **ETCD WAL fsync p99** should decrease or remain ≤ 0.010 seconds
+- **API server p99** should decrease or remain stable
+- **Resource counts** should decrease after pruning
+- **Master node utilization** should remain within targets
+
+---
+
+## Recommendations
+
+### Immediate Actions
+$(if [[ "$SNAPSHOT_TYPE" == "baseline" ]]; then
+  echo "1. **Apply Performance Tuning**: Deploy the master node performance tuning configurations"
+  echo "2. **Enable Resource Pruning**: Deploy the ConfigMap/Secret pruning CronJob"
+  echo "3. **Configure ETCD Dedicated Disk**: If using HCI masters, configure dedicated ETCD storage"
+  echo "4. **Monitor Progress**: Run post-tuning snapshots to validate improvements"
+elif [[ "$SNAPSHOT_TYPE" == "post" ]]; then
+  echo "1. **Compare with Baseline**: Analyze performance deltas to validate improvements"
+  echo "2. **Fine-tune Configuration**: Adjust systemReserved values if needed"
+  echo "3. **Schedule Regular Pruning**: Ensure pruning CronJob is running successfully"
+  echo "4. **Monitor Long-term**: Set up continuous monitoring for performance regression"
+else
+  echo "1. **Continue Monitoring**: Regular performance snapshots help identify trends"
+  echo "2. **Review Metrics**: Look for any performance degradation or improvement opportunities"
+  echo "3. **Update Tuning**: Adjust configurations based on observed performance patterns"
+fi)
+
+### Long-term Monitoring
+1. **Automated Snapshots**: Schedule regular performance snapshots
+2. **Alerting**: Set up alerts for performance threshold breaches
+3. **Capacity Planning**: Use metrics for future capacity planning
+4. **Documentation**: Maintain performance baselines and improvement records
+
+---
+
+## Technical Details
+
+### Data Collection Methods
+- **ETCD Metrics**: Prometheus queries via Thanos Querier
+- **API Server Metrics**: Both CLI timing and Prometheus queries
+- **Resource Counts**: Direct \`oc\` CLI queries
+- **Node Metrics**: Node proxy metrics endpoint
+- **Cluster Health**: Cluster API queries
+
+### Data Sources
+- **Prometheus**: Historical metrics and trends
+- **OpenShift API**: Real-time cluster state
+- **Node Metrics**: Resource utilization data
+- **Cluster Operators**: Health status information
+
+### Validation Criteria
+- **ETCD WAL fsync p99**: ≤ 0.010 seconds
+- **ETCD leader changes**: ≈ 0 per hour
+- **API server p99**: < 0.5 seconds
+- **Resource reduction**: 20-30% after pruning
+- **Node utilization**: Within recommended thresholds
+
+---
+
+## Output Files Summary
+
+This snapshot generated the following files in \`$OUTPUT_DIR\`:
+
+### JSON Data Files
+- **etcd-metrics-$TIMESTAMP.json** - ETCD performance metrics
+- **api-metrics-cli-$TIMESTAMP.json** - API server metrics (CLI timing)
+- **api-metrics-prometheus-$TIMESTAMP.json** - API server metrics (Prometheus)
+- **resource-counts-$TIMESTAMP.json** - Resource counts and pruning data
+- **master-metrics-$TIMESTAMP.json** - Master node resource utilization
+- **cluster-health-$TIMESTAMP.json** - Cluster health and status
+
+### Report Files
+- **performance-report-$TIMESTAMP.md** - This comprehensive markdown report
+- **performance-snapshot-$TIMESTAMP.log** - Detailed execution log
+
+### File Locations
+\`\`\`
+$OUTPUT_DIR/
+├── etcd-metrics-$TIMESTAMP.json
+├── api-metrics-cli-$TIMESTAMP.json
+├── api-metrics-prometheus-$TIMESTAMP.json
+├── resource-counts-$TIMESTAMP.json
+├── master-metrics-$TIMESTAMP.json
+├── cluster-health-$TIMESTAMP.json
+├── performance-report-$TIMESTAMP.md
+└── performance-snapshot-$TIMESTAMP.log
+\`\`\`
+
+---
+
+## Notes
+
+- This report captures performance metrics for OpenShift 4.16 master node tuning validation
+- ETCD metrics are collected via Prometheus (Thanos Querier) with proper TLS handling
+- API server metrics are collected via both CLI timing and Prometheus for comprehensive analysis
+- Resource counts help validate the effectiveness of pruning operations
+- Master node metrics provide insight into resource utilization and capacity planning
+- All measurements follow Red Hat Community of Practice patterns and best practices
+
+### Report Generation
+- **Generated by**: OpenShift 4.16 Master Node Performance Snapshot Script
+- **Version**: Red Hat Community of Practice v1.0
+- **Output Directory**: $OUTPUT_DIR
+- **Log File**: $LOG_FILE
+
+EOF
+  
+  log_info "Comprehensive report generated: $report_file"
+}
+
+# ---------- Main function ----------
+main() {
+  log_info "Starting OpenShift 4.16 performance snapshot: $SNAPSHOT_TYPE"
+  
+  # Check prerequisites
+  if ! command -v oc >/dev/null 2>&1; then
+    log_error "oc CLI not found. Please install and configure oc CLI."
+    exit 1
+  fi
+  
+  if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq not found. Please install jq."
+    exit 1
+  fi
+  
+  if ! command -v bc >/dev/null 2>&1; then
+    log_error "bc not found. Please install bc."
+    exit 1
+  fi
+  
+  # Check cluster connectivity
+  if ! oc cluster-info >/dev/null 2>&1; then
+    log_error "Cannot connect to OpenShift cluster. Please check your kubeconfig."
+    exit 1
+  fi
+  
+  # Set up Prometheus connection
+  THANOS_HOST=$(get_thanos_host)
+  TOKEN=$(oc whoami -t)
+  INGRESS_CA_FILE=$(get_ingress_ca)
+  
+  if [[ -n "$THANOS_HOST" && -n "$TOKEN" ]]; then
+    log_info "Prometheus connection configured: $THANOS_HOST"
+    if [[ -n "$INGRESS_CA_FILE" ]]; then
+      log_info "Using ingress CA: $INGRESS_CA_FILE"
+    else
+      log_info "Using --insecure for Prometheus queries"
+    fi
+  else
+    log_info "Prometheus connection not available, some metrics will be n/a"
+  fi
+  
+  # Collect all metrics
+  collect_etcd_metrics
+  collect_api_metrics_cli
+  collect_api_metrics_prometheus
+  collect_resource_counts
+  collect_master_metrics
+  collect_cluster_health
+  
+  # Generate comprehensive report
+  generate_report
+  
+  log_info "Performance snapshot completed successfully"
+  log_info "Output directory: $OUTPUT_DIR"
+  log_info "Report file: $OUTPUT_DIR/performance-report-$TIMESTAMP.md"
+  log_info "JSON files:"
+  log_info "  - etcd-metrics-$TIMESTAMP.json"
+  log_info "  - api-metrics-cli-$TIMESTAMP.json"
+  log_info "  - api-metrics-prometheus-$TIMESTAMP.json"
+  log_info "  - resource-counts-$TIMESTAMP.json"
+  log_info "  - master-metrics-$TIMESTAMP.json"
+  log_info "  - cluster-health-$TIMESTAMP.json"
+  
+  # List all files in output directory
+  log_info "All files in output directory:"
+  ls -la "$OUTPUT_DIR" | while read line; do
+    log_info "  $line"
+  done
+}
+
+# Run main function
+main "$@"
+
+
+
+
+
+
+
+
+############################
+-----------------
+#!/bin/bash
+# OpenShift 4.16 Master Node Performance Snapshot Script
+# Red Hat CoP - Prometheus for etcd, oc CLI timing for API server
+# Also includes Prometheus-based API server metrics as alternative
+
+set -euo pipefail
+
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-snapshots"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SNAPSHOT_TYPE=${SNAPSHOT_TYPE:-"baseline"}
+LOG_FILE="$OUTPUT_DIR/performance-snapshot-$TIMESTAMP.log"
+CURL_TIMEOUT=${CURL_TIMEOUT:-5}
+
+mkdir -p "$OUTPUT_DIR"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"; }
+log_info() { log "INFO: $1"; }
+log_error() { log "ERROR: $1"; }
+
+# ---------- Prometheus helpers (Thanos Querier with CA) ----------
+get_thanos_host() {
+  oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}' 2>/dev/null || true
+}
+
+# Cache the ingress CA bundle to a temp file
+get_ingress_ca() {
+  local ca_file="${INGRESS_CA_FILE:-}"
+  if [[ -n "$ca_file" && -s "$ca_file" ]]; then
+    echo "$ca_file"; return 0
+  fi
+  ca_file="$(mktemp)"
+  # default-ingress-cert is the cluster-wide ingress CA
+  if oc get configmap default-ingress-cert -n openshift-config-managed -o jsonpath='{.data.ca-bundle\.crt}' > "$ca_file" 2>/dev/null; then
+    echo "$ca_file"; return 0
+  fi
+  # fallback to openshift-ingress-operator
+  if oc get configmap router-ca -n openshift-ingress-operator -o jsonpath='{.data.tls\.crt}' > "$ca_file" 2>/dev/null; then
+    echo "$ca_file"; return 0
+  fi
+  rm -f "$ca_file"
+  echo ""; return 1
+}
+
+# Run a PromQL query and return the value (or n/a)
+prom_query() {
+  local q="$1"
+  local thanos_host="${THANOS_HOST:-}"
+  local token="${TOKEN:-}"
+  local ca_file="${INGRESS_CA_FILE:-}"
+  
+  if [[ -z "$thanos_host" || -z "$token" ]]; then
+    echo "n/a"; return 0
+  fi
+  
+  local url="https://${thanos_host}/api/v1/query?query=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''${q}'''))")"
+  local curl_opts=(-sS -H "Authorization: Bearer $token" --connect-timeout "$CURL_TIMEOUT" --max-time "$CURL_TIMEOUT")
+  
+  if [[ -n "$ca_file" && -s "$ca_file" ]]; then
+    curl_opts+=(--cacert "$ca_file")
+  else
+    curl_opts+=(--insecure)
+  fi
+  
+  local result
+  result="$(curl "${curl_opts[@]}" "$url" 2>/dev/null | jq -r '.data.result[0].value[1] // "n/a"' 2>/dev/null || echo "n/a")"
+  
+  if [[ "$result" == "null" || "$result" == "" ]]; then
+    echo "n/a"
+  else
+    echo "$result"
+  fi
+}
+
+# ---------- ETCD metrics (Prometheus) ----------
+collect_etcd_metrics() {
+  log_info "Collecting ETCD metrics (Prometheus)"
+  
+  local wal_fsync_p99 db_size leader_changes_per_hour
+  
+  # ETCD WAL fsync p99 latency
+  wal_fsync_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])))')"
+  
+  # ETCD DB size
+  db_size="$(prom_query 'etcd_mvcc_db_total_size_in_bytes')"
+  
+  # ETCD leader changes per hour (sum across all etcd instances)
+  leader_changes_per_hour="$(prom_query 'sum(rate(etcd_server_leader_changes_seen_total[1h]))')"
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "etcd": {
+    "wal_fsync_p99_seconds": "$wal_fsync_p99",
+    "db_size_bytes": "$db_size",
+    "leader_changes_per_hour": "$leader_changes_per_hour"
+  }
+}
+EOF
+  
+  log_info "ETCD metrics collected: WAL fsync p99=$wal_fsync_p99, DB size=$db_size, leader changes/h=$leader_changes_per_hour"
+}
+
+# ---------- API server metrics (oc CLI timing) ----------
+collect_api_metrics_cli() {
+  log_info "Collecting API server metrics (oc CLI timing)"
+  
+  local get_p99 list_p99 watch_p99 overall_p99
+  
+  # Measure API response times using oc CLI
+  log_info "Measuring API response times..."
+  
+  # GET operations
+  local get_times=()
+  for i in {1..10}; do
+    local start_time=$(date +%s.%N)
+    oc get nodes --no-headers >/dev/null 2>&1
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l)
+    get_times+=("$duration")
+  done
+  
+  # LIST operations
+  local list_times=()
+  for i in {1..10}; do
+    local start_time=$(date +%s.%N)
+    oc get pods --all-namespaces --no-headers >/dev/null 2>&1
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l)
+    list_times+=("$duration")
+  done
+  
+  # WATCH operations (simulate with timeout)
+  local watch_times=()
+  for i in {1..5}; do
+    local start_time=$(date +%s.%N)
+    timeout 2s oc get pods --watch --no-headers >/dev/null 2>&1 || true
+    local end_time=$(date +%s.%N)
+    local duration=$(echo "$end_time - $start_time" | bc -l)
+    watch_times+=("$duration")
+  done
+  
+  # Calculate p99 for each operation type
+  get_p99=$(printf '%s\n' "${get_times[@]}" | sort -n | tail -1)
+  list_p99=$(printf '%s\n' "${list_times[@]}" | sort -n | tail -1)
+  watch_p99=$(printf '%s\n' "${watch_times[@]}" | sort -n | tail -1)
+  
+  # Overall p99 (max of all operations)
+  overall_p99=$(printf '%s\n' "$get_p99" "$list_p99" "$watch_p99" | sort -n | tail -1)
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/api-metrics-cli-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "api_server": {
+    "get_p99_seconds": "$get_p99",
+    "list_p99_seconds": "$list_p99",
+    "watch_p99_seconds": "$watch_p99",
+    "overall_p99_seconds": "$overall_p99"
+  }
+}
+EOF
+  
+  log_info "API metrics (CLI) collected: GET p99=$get_p99, LIST p99=$list_p99, WATCH p99=$watch_p99, Overall p99=$overall_p99"
+}
+
+# ---------- API server metrics (Prometheus) - Alternative method ----------
+collect_api_metrics_prometheus() {
+  log_info "Collecting API server metrics (Prometheus)"
+  
+  local overall_p99 get_p99 list_p99 watch_p99
+  
+  # Overall API server p99 (all verbs combined) - primary metric
+  overall_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket[5m])))')"
+  
+  # Individual verbs (best effort, longer windows for sparse operations)
+  get_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="GET"}[5m])))')"
+  list_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="LIST"}[5m])))')"
+  watch_p99="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="WATCH"}[5m])))')"
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/api-metrics-prometheus-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "api_server": {
+    "overall_p99_seconds": "$overall_p99",
+    "get_p99_seconds": "$get_p99",
+    "list_p99_seconds": "$list_p99",
+    "watch_p99_seconds": "$watch_p99"
+  }
+}
+EOF
+  
+  log_info "API metrics (Prometheus) collected: Overall p99=$overall_p99, GET p99=$get_p99, LIST p99=$list_p99, WATCH p99=$watch_p99"
+}
+
+# ---------- Resource counts ----------
+collect_resource_counts() {
+  log_info "Collecting resource counts"
+  
+  local total_configmaps total_secrets configmaps_application secrets_application
+  
+  # Total ConfigMaps and Secrets
+  total_configmaps=$(oc get configmaps --all-namespaces --no-headers | wc -l)
+  total_secrets=$(oc get secrets --all-namespaces --no-headers | wc -l)
+  
+  # Application namespace ConfigMaps and Secrets (exclude system namespaces)
+  configmaps_application=$(oc get configmaps --all-namespaces --no-headers | grep -v -E '^(openshift-|kube-|default)' | wc -l)
+  secrets_application=$(oc get secrets --all-namespaces --no-headers | grep -v -E '^(openshift-|kube-|default)' | wc -l)
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "resources": {
+    "total_configmaps": $total_configmaps,
+    "total_secrets": $total_secrets,
+    "configmaps_application_namespaces": $configmaps_application,
+    "secrets_application_namespaces": $secrets_application
+  }
+}
+EOF
+  
+  log_info "Resource counts collected: Total CMs=$total_configmaps, Total Secrets=$total_secrets, App CMs=$configmaps_application, App Secrets=$secrets_application"
+}
+
+# ---------- Master node metrics ----------
+collect_master_metrics() {
+  log_info "Collecting master node metrics"
+  
+  local master_nodes=()
+  while IFS= read -r line; do
+    master_nodes+=("$line")
+  done < <(oc get nodes -l node-role.kubernetes.io/master --no-headers -o custom-columns=NAME:.metadata.name)
+  
+  local master_metrics=()
+  for node in "${master_nodes[@]}"; do
+    local cpu_usage memory_usage etcd_disk_usage
+    
+    # Get node metrics
+    cpu_usage=$(oc get --raw "/api/v1/nodes/$node/proxy/metrics" 2>/dev/null | grep 'node_cpu_seconds_total' | tail -1 | awk '{print $2}' | sed 's/.*{.*} //' || echo "n/a")
+    memory_usage=$(oc get --raw "/api/v1/nodes/$node/proxy/metrics" 2>/dev/null | grep 'node_memory_MemTotal_bytes' | tail -1 | awk '{print $2}' | sed 's/.*{.*} //' || echo "n/a")
+    
+    # ETCD disk usage (if available)
+    etcd_disk_usage=$(oc get --raw "/api/v1/nodes/$node/proxy/metrics" 2>/dev/null | grep 'etcd_disk_wal_fsync_duration_seconds' | tail -1 | awk '{print $2}' | sed 's/.*{.*} //' || echo "n/a")
+    
+    master_metrics+=("{\"node\":\"$node\",\"cpu_usage_percent\":\"$cpu_usage\",\"memory_usage_percent\":\"$memory_usage\",\"etcd_disk_usage_percent\":\"$etcd_disk_usage\"}")
+  done
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "master_nodes": [$(IFS=','; echo "${master_metrics[*]}")]
+}
+EOF
+  
+  log_info "Master node metrics collected for ${#master_nodes[@]} nodes"
+}
+
+# ---------- Cluster health ----------
+collect_cluster_health() {
+  log_info "Collecting cluster health metrics"
+  
+  local cluster_version cluster_operators_failed node_status
+  
+  # Cluster version
+  cluster_version=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "n/a")
+  
+  # Failed cluster operators
+  cluster_operators_failed=$(oc get clusteroperators --no-headers | grep -v "True" | wc -l)
+  
+  # Node status
+  node_status=$(oc get nodes --no-headers | grep -v "Ready" | wc -l)
+  
+  # Write to JSON
+  cat > "$OUTPUT_DIR/cluster-health-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "cluster_health": {
+    "version": "$cluster_version",
+    "failed_cluster_operators": $cluster_operators_failed,
+    "not_ready_nodes": $node_status
+  }
+}
+EOF
+  
+  log_info "Cluster health collected: Version=$cluster_version, Failed COs=$cluster_operators_failed, Not ready nodes=$node_status"
+}
+
 # ---------- Generate detailed markdown report ----------
 generate_report() {
   log_info "Generating detailed performance report"
