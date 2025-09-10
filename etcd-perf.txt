@@ -1,0 +1,223 @@
+#!/bin/bash
+# OpenShift 4.16 Master Node Performance Snapshot Script
+# Red Hat Community of Practice - Performance Validation
+# Collects baseline and post-tuning performance metrics with Prometheus-based etcd and API p99
+
+set -euo pipefail
+
+# Config
+OUTPUT_DIR=${OUTPUT_DIR:-"/tmp/openshift-performance-snapshots"}
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+SNAPSHOT_TYPE=${SNAPSHOT_TYPE:-"baseline"}  # baseline or post
+LOG_FILE="$OUTPUT_DIR/performance-snapshot-$TIMESTAMP.log"
+CURL_TIMEOUT=${CURL_TIMEOUT:-5}
+
+mkdir -p "$OUTPUT_DIR"
+
+log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $1" | tee -a "$LOG_FILE"; }
+log_info() { log "INFO: $1"; }
+log_error() { log "ERROR: $1"; }
+
+# ---------- Prometheus helpers (Thanos Querier) ----------
+get_thanos_host() {
+  oc -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}' 2>/dev/null || true
+}
+
+prom_query() {
+  local q="$1"
+  local thanos_host token enc_q
+  thanos_host="$(get_thanos_host)"
+  [[ -z "$thanos_host" ]] && echo "n/a" && return 0
+
+  token="$(oc whoami -t 2>/dev/null || true)"
+  [[ -z "$token" ]] && echo "n/a" && return 0
+
+  # URI-encode with jq (no python dependency)
+  enc_q=$(printf '%s' "$q" | jq -s -R -r @uri)
+  curl -sS --connect-timeout "$CURL_TIMEOUT" -m "$CURL_TIMEOUT" \
+       -H "Authorization: Bearer $token" \
+       "https://${thanos_host}/api/v1/query?query=${enc_q}" \
+    | jq -r '.data.result[0].value[1] // "n/a"' 2>/dev/null || echo "n/a"
+}
+
+# Numeric compare, returns max of two numeric strings or n/a
+max_num() {
+  local a="$1" b="$2"
+  if [[ "$a" == "n/a" ]]; then echo "$b"; return; fi
+  if [[ "$b" == "n/a" ]]; then echo "$a"; return; fi
+  if awk "BEGIN{exit !($a>$b)}"; then echo "$a"; else echo "$b"; fi
+}
+
+# ---------- etcd metrics (Prometheus) ----------
+collect_etcd_metrics() {
+  log_info "Collecting etcd metrics (via Prometheus)"
+
+  # p99 over last 5m
+  local wal_p99
+  wal_p99="$(prom_query 'histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m]))')"
+
+  # DB size (bytes) average across members
+  local db_size
+  db_size="$(prom_query 'avg(etcd_mvcc_db_total_size_in_bytes)')"
+
+  # Leader changes per hour (sum across members)
+  local leader_changes_per_h
+  leader_changes_per_h="$(prom_query 'sum(rate(etcd_server_leader_changes_seen_total[1h]))')"
+
+  cat > "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "etcd": {
+    "wal_fsync_p99_seconds": "$wal_p99",
+    "db_size_bytes": "$db_size",
+    "leader_changes_per_hour": "$leader_changes_per_h"
+  }
+}
+EOF
+
+  log_info "ETCD metrics: p99=${wal_p99}s, DB=${db_size}B, leader_changes/h=${leader_changes_per_h}"
+}
+
+# ---------- API p99 (Prometheus) ----------
+collect_api_metrics() {
+  log_info "Collecting API server p99 (via Prometheus)"
+
+  # p99 by verb over last 5m
+  local p99_get p99_list p99_watch
+  p99_get="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="GET"}[5m])))')"
+  p99_list="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="LIST"}[5m])))')"
+  p99_watch="$(prom_query 'histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb="WATCH"}[5m])))')"
+
+  # Max across GET/LIST/WATCH as required
+  local overall_p99
+  overall_p99="$(max_num "$(max_num "$p99_get" "$p99_list")" "$p99_watch")"
+
+  cat > "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "api_server": {
+    "get_p99_seconds": "$p99_get",
+    "list_p99_seconds": "$p99_list",
+    "watch_p99_seconds": "$p99_watch",
+    "overall_p99_seconds": "$overall_p99"
+  }
+}
+EOF
+
+  log_info "API p99: GET=$p99_get, LIST=$p99_list, WATCH=$p99_watch, overall=$overall_p99"
+}
+
+# ---------- Resource counts (application namespaces) ----------
+collect_resource_counts() {
+  log_info "Collecting resource counts (application namespaces)"
+
+  local configmap_count secret_count
+  configmap_count=$(oc get configmaps --all-namespaces -o json \
+    | jq -r '.items[] | select(.metadata.namespace|test("^(openshift-|kube-|default$)")|not) | .metadata.name' | wc -l | tr -d ' ' || echo "n/a")
+  secret_count=$(oc get secrets --all-namespaces -o json \
+    | jq -r '.items[] | select(.metadata.namespace|test("^(openshift-|kube-|default$)")|not) | .metadata.name' | wc -l | tr -d ' ' || echo "n/a")
+
+  cat > "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "resources": {
+    "configmaps_application_namespaces": $configmap_count,
+    "secrets_application_namespaces": $secret_count
+  }
+}
+EOF
+
+  log_info "Resource counts: CM=$configmap_count, Secrets=$secret_count"
+}
+
+# ---------- Optional: basic master node snapshot (best-effort) ----------
+collect_master_metrics() {
+  log_info "Collecting master node snapshot (best-effort)"
+  local masters master_list
+  master_list=$(oc get nodes -l node-role.kubernetes.io/master= -o name 2>/dev/null | cut -d/ -f2 || true)
+
+  local items=()
+  for n in $master_list; do
+    # These are best-effort approximations from node description (percentages may be n/a)
+    local cpu memory
+    cpu=$(oc describe node "$n" 2>/dev/null | awk '/Allocated resources:/{p=1} p&&/cpu/{gsub(/[()%]/,""); print $3; exit}' || true)
+    memory=$(oc describe node "$n" 2>/dev/null | awk '/Allocated resources:/{p=1} p&&/memory/{gsub(/[()%]/,""); print $3; exit}' || true)
+    [[ -z "$cpu" ]] && cpu="n/a"
+    [[ -z "$memory" ]] && memory="n/a"
+    items+=("{\"node\":\"$n\",\"cpu_usage_percent\":\"$cpu\",\"memory_usage_percent\":\"$memory\"}")
+  done
+
+  local joined="[]"
+  if [[ ${#items[@]} -gt 0 ]]; then
+    joined=$(printf '%s\n' "${items[@]}" | jq -s '.')
+  fi
+
+  cat > "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" << EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "snapshot_type": "$SNAPSHOT_TYPE",
+  "master_nodes": $joined
+}
+EOF
+
+  log_info "Master nodes captured: $(echo "$master_list" | wc -w | tr -d ' ')"
+}
+
+# ---------- Markdown report ----------
+generate_markdown_report() {
+  log_info "Generating markdown report"
+  local report_file="$OUTPUT_DIR/performance-report-$SNAPSHOT_TYPE-$TIMESTAMP.md"
+
+  cat > "$report_file" << EOF
+# OpenShift 4.16 Master Node Performance Report
+## $SNAPSHOT_TYPE - $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+### ETCD Metrics
+- **WAL fsync p99 latency**: $(jq -r '.etcd.wal_fsync_p99_seconds' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **DB size**: $(jq -r '.etcd.db_size_bytes' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") bytes
+- **Leader changes per hour**: $(jq -r '.etcd.leader_changes_per_hour' "$OUTPUT_DIR/etcd-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### API Server Metrics
+- **GET p99**: $(jq -r '.api_server.get_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **LIST p99**: $(jq -r '.api_server.list_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **WATCH p99**: $(jq -r '.api_server.watch_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+- **Overall p99 (max)**: $(jq -r '.api_server.overall_p99_seconds' "$OUTPUT_DIR/api-metrics-$TIMESTAMP.json" 2>/dev/null || echo "n/a") seconds
+
+### Resource Counts
+- **ConfigMaps (application namespaces)**: $(jq -r '.resources.configmaps_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+- **Secrets (application namespaces)**: $(jq -r '.resources.secrets_application_namespaces' "$OUTPUT_DIR/resource-counts-$TIMESTAMP.json" 2>/dev/null || echo "n/a")
+
+### Master Node Snapshot
+$(jq -r '.master_nodes[]? | "- " + .node + ": CPU " + (.cpu_usage_percent|tostring) + "%, Memory " + (.memory_usage_percent|tostring) + "%"' "$OUTPUT_DIR/master-metrics-$TIMESTAMP.json" 2>/dev/null || echo "- n/a")
+
+### Cluster Health (best-effort)
+- **Cluster version**: $(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "n/a")
+- **Cluster operators not fully healthy**: $(oc get clusteroperators --no-headers 2>/dev/null | grep -v "True" | wc -l | tr -d ' ' || echo "n/a")
+- **Nodes not Ready**: $(oc get nodes --no-headers 2>/dev/null | grep -v " Ready " | wc -l | tr -d ' ' || echo "n/a")
+
+### Notes
+- Snapshot type: $SNAPSHOT_TYPE
+- Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+- Output directory: $OUTPUT_DIR
+EOF
+
+  log_info "Markdown report: $report_file"
+  echo "$report_file"
+}
+
+main() {
+  log_info "Starting performance snapshot (type=$SNAPSHOT_TYPE)"
+  collect_etcd_metrics
+  collect_api_metrics
+  collect_resource_counts
+  collect_master_metrics
+  local report_file
+  report_file=$(generate_markdown_report)
+  log_info "Completed. Report: $report_file"
+  echo "$report_file"
+}
+
+main "$@"
