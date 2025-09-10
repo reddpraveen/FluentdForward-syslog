@@ -1,3 +1,5 @@
+
+curl -sS -H "Authorization: Bearer <token>" "https://<thanos_host>/api/v1/query?query=histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket[5m])))" --insecure | jq
 #!/bin/bash
 # OpenShift 4.16 Master Node Performance Snapshot Script
 # Red Hat CoP - Prometheus for etcd, oc CLI timing for API server
