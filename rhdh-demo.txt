@@ -1,0 +1,332 @@
+# Complete RHDH + AAP Demo Setup Guide
+
+Copy and paste the configurations below in order.
+
+## 1. GitHub Enterprise Setup
+
+### Create OAuth App
+1. Go to GitHub Enterprise → Settings → Developer settings → OAuth Apps
+2. Click "New OAuth App"
+3. Configure:
+   - **Application name**: `Red Hat Developer Hub`
+   - **Homepage URL**: `https://your-rhdh-route.apps.cluster.com`
+   - **Authorization callback URL**: `https://your-rhdh-route.apps.cluster.com/api/auth/github/handler/frame`
+4. Save **Client ID** and **Client Secret**
+
+### Create Personal Access Token
+1. Go to GitHub Enterprise → Settings → Developer settings → Personal access tokens
+2. Generate token with scopes: `repo`, `workflow`, `write:packages`, `admin:org`, `user:email`
+3. Save the token
+
+## 2. OpenShift Secrets
+
+### GitHub Credentials Secret
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-credentials
+  namespace: rhdh
+type: Opaque
+stringData:
+  GITHUB_TOKEN: "your-github-personal-access-token"
+  GITHUB_CLIENT_ID: "your-oauth-client-id"
+  GITHUB_CLIENT_SECRET: "your-oauth-client-secret"
+```
+
+### AAP Credentials Secret
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aap-credentials
+  namespace: rhdh
+type: Opaque
+stringData:
+  AAP_TOKEN: "your-aap-controller-token"
+```
+
+## 3. RHDH Configuration
+
+### app-config-rhdh ConfigMap
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config-rhdh
+  namespace: rhdh
+data:
+  app-config-rhdh.yaml: |
+    app:
+      title: Red Hat Developer Hub
+      baseUrl: https://your-rhdh-route.apps.cluster.com
+    
+    backend:
+      baseUrl: https://your-rhdh-route.apps.cluster.com
+      cors:
+        origin: https://your-rhdh-route.apps.cluster.com
+    
+    auth:
+      environment: production
+      providers:
+        github:
+          production:
+            clientId: ${GITHUB_CLIENT_ID}
+            clientSecret: ${GITHUB_CLIENT_SECRET}
+            enterpriseInstanceUrl: https://github.enterprise.com
+    
+    integrations:
+      github:
+        - host: github.enterprise.com
+          token: ${GITHUB_TOKEN}
+        - host: github.com
+          token: ${GITHUB_TOKEN}
+    
+    catalog:
+      providers:
+        github:
+          providerId:
+            organization: 'your-org'
+            catalogPath: '/catalog-info.yaml'
+            filters:
+              branch: 'main'
+              repository: '.*'
+            schedule:
+              frequency: { minutes: 30 }
+              timeout: { minutes: 3 }
+      locations:
+        - type: url
+          target: https://github.enterprise.com/your-org/rhdh-templates/blob/main/template.yaml
+    
+    scaffolder:
+      defaultAuthor:
+        name: 'RHDH Scaffolder'
+        email: 'scaffolder@company.com'
+      defaultCommitMessage: 'Initial commit from RHDH Scaffolder'
+    
+    ansible:
+      baseUrl: https://your-aap-controller.com
+      token: ${AAP_TOKEN}
+      checkSSL: false
+```
+
+### Dynamic Plugins ConfigMap
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamic-plugins-rhdh
+  namespace: rhdh
+data:
+  dynamic-plugins.yaml: |
+    includes:
+      - dynamic-plugins.default.yaml
+    plugins:
+      - package: '@ansible/plugin-scaffolder-backend-module-ansible@1.0.0'
+        disabled: false
+        pluginConfig:
+          ansible:
+            baseUrl: https://your-aap-controller.com
+      - package: '@backstage/plugin-scaffolder-backend-module-github@0.2.0'
+        disabled: false
+      - package: '@backstage/plugin-catalog-backend-module-github@0.4.0'
+        disabled: false
+      - package: '@backstage/plugin-github-actions@0.6.0'
+        disabled: false
+```
+
+### Backstage CRD
+```yaml
+apiVersion: rhdh.redhat.com/v1alpha1
+kind: Backstage
+metadata:
+  name: backstage
+  namespace: rhdh
+spec:
+  application:
+    appConfig:
+      configMaps:
+        - name: app-config-rhdh
+    dynamicPluginsConfigMapName: dynamic-plugins-rhdh
+    extraEnvs:
+      secrets:
+        - name: github-credentials
+        - name: aap-credentials
+    replicas: 1
+    route:
+      enabled: true
+      host: your-rhdh-route.apps.cluster.com
+      tls:
+        termination: edge
+        insecureEdgeTerminationPolicy: Redirect
+  database:
+    enableLocalDb: true
+```
+
+## 4. AAP Controller Setup
+
+### Create Project
+1. Login to AAP Controller
+2. Navigate to **Projects** → **Add**
+3. Configure:
+   - **Name**: `rhdh-demo-project`
+   - **SCM Type**: `Git`
+   - **SCM URL**: `https://github.enterprise.com/your-org/rhdh-templates`
+   - **SCM Branch**: `main`
+   - **Credential**: Your GitHub credential
+
+### Create Job Template
+1. Navigate to **Templates** → **Add** → **Job Template**
+2. Configure:
+   - **Name**: `simple-demo-template`
+   - **Job Type**: `Run`
+   - **Inventory**: `Demo Inventory` (localhost)
+   - **Project**: `rhdh-demo-project`
+   - **Playbook**: `content/playbook.yaml`
+   - **Credentials**: Machine credential for localhost
+   - **Variables**: Check "Prompt on launch"
+   - **Extra Variables**: 
+     ```yaml
+     ---
+     project_name: "{{ project_name | default('demo') }}"
+     environment: "{{ environment | default('demo') }}"
+     repo_url: "{{ repo_url | default('') }}"
+     ```
+
+### Create Demo Inventory
+1. Navigate to **Inventories** → **Add** → **Inventory**
+2. Configure:
+   - **Name**: `Demo Inventory`
+3. Add **Host**:
+   - **Name**: `localhost`
+   - **Variables**:
+     ```yaml
+     ansible_connection: local
+     ansible_python_interpreter: "{{ ansible_playbook_python }}"
+     ```
+
+### Generate AAP Token
+1. Navigate to **Users** → **your-user** → **Tokens**
+2. Create token with **Write** scope
+3. Copy token for RHDH configuration
+
+## 5. GitHub Repository Setup
+
+Create repository `rhdh-templates` in GitHub Enterprise with this structure:
+
+### Repository Structure
+```
+rhdh-templates/
+├── template.yaml
+└── content/
+    ├── catalog-info.yaml
+    ├── playbook.yaml
+    └── README.md
+```
+
+### Upload Files
+Upload the 4 files created in the demo to your GitHub Enterprise repository.
+
+## 6. Apply Configurations
+
+### Step 1: Create Secrets
+```bash
+# Apply GitHub credentials
+oc apply -f github-credentials-secret.yaml
+
+# Apply AAP credentials  
+oc apply -f aap-credentials-secret.yaml
+```
+
+### Step 2: Update ConfigMaps
+```bash
+# Apply app-config
+oc apply -f app-config-rhdh-configmap.yaml
+
+# Apply dynamic plugins
+oc apply -f dynamic-plugins-configmap.yaml
+```
+
+### Step 3: Update Backstage CRD
+```bash
+# Apply Backstage configuration
+oc apply -f backstage-crd.yaml
+```
+
+### Step 4: Verify Deployment
+```bash
+# Check pod status
+oc get pods -n rhdh
+
+# Check logs
+oc logs -f deployment/backstage-backstage -n rhdh
+
+# Check route
+oc get route -n rhdh
+```
+
+## 7. Demo Execution
+
+### Access RHDH
+1. Navigate to your RHDH route URL
+2. Login with GitHub Enterprise credentials
+3. Go to **Create Component**
+
+### Run Demo
+1. Select **Simple RHDH Demo** template
+2. Fill form:
+   - **Project Name**: `demo-test-1`
+   - **Description**: `Testing RHDH integration`
+   - **Environment**: `demo`
+   - **Repository**: Select GitHub Enterprise location
+3. Click **Create**
+
+### Verify Results
+1. **New GitHub Repository**: Check repository creation
+2. **Backstage Catalog**: Find component in catalog
+3. **AAP Job**: Verify job completion in AAP Controller
+4. **Demo Files**: SSH to target and check `/tmp/rhdh-demo/demo-test-1/`
+
+## 8. Troubleshooting Commands
+
+```bash
+# Check RHDH pod logs
+oc logs -f deployment/backstage-backstage -n rhdh
+
+# Check secrets
+oc get secrets -n rhdh
+oc describe secret github-credentials -n rhdh
+oc describe secret aap-credentials -n rhdh
+
+# Check configmaps
+oc get configmap app-config-rhdh -n rhdh -o yaml
+
+# Check Backstage CRD
+oc get backstage -n rhdh -o yaml
+
+# Test GitHub connectivity
+curl -H "Authorization: token YOUR_GITHUB_TOKEN" \
+  https://github.enterprise.com/api/v3/user
+
+# Test AAP connectivity  
+curl -k -H "Authorization: Bearer YOUR_AAP_TOKEN" \
+  https://your-aap-controller.com/api/v2/job_templates/
+```
+
+## Replace These Values
+
+Before applying configurations, replace:
+- `your-rhdh-route.apps.cluster.com` → Your actual RHDH route
+- `github.enterprise.com` → Your GitHub Enterprise URL
+- `your-org` → Your GitHub organization
+- `your-aap-controller.com` → Your AAP Controller URL
+- `your-github-personal-access-token` → Your GitHub token
+- `your-oauth-client-id` → Your OAuth app client ID
+- `your-oauth-client-secret` → Your OAuth app client secret
+- `your-aap-controller-token` → Your AAP token
+
+This configuration proves:
+✅ Fetch from GitHub Enterprise
+✅ Publish to GitHub Enterprise  
+✅ AAP 2.5 Integration
+✅ Complete RHDH workflow
