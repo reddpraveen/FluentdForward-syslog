@@ -1,3 +1,23 @@
+apiVersion: backstage.io/v1alpha1
+kind: Group
+metadata:
+  name: developers
+  namespace: default
+  description: Development team group
+spec:
+  type: team
+  profile:
+    displayName: Developers
+    email: developers@company.com
+    picture: https://example.com/group-avatar.jpeg
+  parent: engineering  # optional: parent group
+  children: []         # optional: child groups
+  members:
+    - maskeen-singh1   # add your username here
+    # - other-developer
+    # - another-developer
+
+
 # Complete Operator-Based RHDH Ansible Plugin Implementation
 # Based on Red Hat Developer Learning Path - Converted from Helm to Operator
 
