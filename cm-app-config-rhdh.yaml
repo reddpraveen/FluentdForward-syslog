@@ -1,3 +1,40 @@
+# 1) Save the CLF to a file
+oc get clusterlogforwarder instance -n openshift-logging -o yaml > clf.yaml
+
+# 2) Normalize inputs so every item has the same keys as the first item
+yq -oy '
+  def empty_like(x):
+    (x | type) as $t |
+    if   $t == "!!map" then {} 
+    elif $t == "!!seq" then [] 
+    else null end;
+
+  def ensure_keys($tmpl):
+    reduce ($tmpl | keys)[] as $k (.;
+      if has($k) then .
+      else . *+ {($k): empty_like($tmpl[$k])}
+      end
+    );
+
+  . as $root
+  | $root.spec.inputs as $ins
+  | $ins[0] as $first
+  | $root
+  | .spec.inputs = [ $ins[]
+      # ensure top-level keys present like in the first item
+      | ensure_keys($first)
+      # and recursively for nested maps we know about (e.g. application)
+      | (.application |= ( . // {} | ensure_keys($first.application // {}) ))
+    ]
+' clf.yaml > clf-normalized.yaml
+
+# 3) Apply it back (review diff first!)
+oc diff -f clf-normalized.yaml
+oc apply -f clf-normalized.yaml
+
+
+
+
 apiVersion: backstage.io/v1alpha1
 kind: Group
 metadata:
