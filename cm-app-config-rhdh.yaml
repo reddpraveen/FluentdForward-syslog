@@ -1,3 +1,10 @@
+curl -L --insecure \
+  https://github.com/mikefarah/yq/releases/latest/download/yq_darwin_amd64 \
+  -o /usr/local/bin/yq
+
+chmod +x /usr/local/bin/yq
+
+
 # macOS
 brew install yq
 # or Linux
