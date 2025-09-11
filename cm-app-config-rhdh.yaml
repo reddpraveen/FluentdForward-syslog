@@ -1,3 +1,12 @@
+# macOS
+brew install yq
+# or Linux
+sudo wget -O /usr/local/bin/yq \
+  https://github.com/mikefarah/yq/releases/latest/download/yq_$(uname -s | tr '[:upper:]' '[:lower:]')_amd64
+sudo chmod +x /usr/local/bin/yq
+
+
+
 # 1) Save the CLF to a file
 oc get clusterlogforwarder instance -n openshift-logging -o yaml > clf.yaml
 
