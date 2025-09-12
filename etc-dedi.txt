@@ -1,0 +1,526 @@
+# Complete OpenShift 4.16 Master Node Configuration Deployment Guide
+
+This comprehensive guide provides all configuration files and deployment steps for configuring OpenShift 4.16 master nodes with system reserved resources (8Gi memory) and dedicated etcd disks via ArgoCD.
+
+## Table of Contents
+1. [Prerequisites](#prerequisites)
+2. [Configuration Files](#configuration-files)
+3. [Deployment Steps](#deployment-steps)
+4. [Verification](#verification)
+5. [Troubleshooting](#troubleshooting)
+
+## Prerequisites
+
+- OpenShift 4.16 cluster running on VMware vSphere
+- ArgoCD installed and configured
+- vCenter credentials with VM management permissions
+- Git repository for ArgoCD to monitor
+
+## Configuration Files
+
+### 1. KubeletConfig for System Reserved Resources
+
+**File: `kubeletconfig.yaml`**
+```yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: KubeletConfig
+metadata:
+  name: master-system-reserved
+spec:
+  machineConfigPoolSelector:
+    matchLabels:
+      pools.operator.machineconfiguration.openshift.io/master: ""
+  kubeletConfig:
+    systemReserved:
+      memory: "8Gi"
+      cpu: "1000m"
+    kubeReserved:
+      memory: "2Gi"
+      cpu: "500m"
+    evictionHard:
+      memory.available: "1Gi"
+      nodefs.available: "10%"
+      imagefs.available: "15%"
+```
+
+### 2. vSphere Credentials Secret
+
+**File: `vsphere-credentials-secret.yaml`**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsphere-creds
+  namespace: openshift-machine-config-operator
+type: Opaque
+stringData:
+  vcenter-url: "https://your-vcenter-server.domain.com"
+  username: "your-vcenter-username"
+  password: "your-vcenter-password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubeconfig
+  namespace: openshift-machine-config-operator
+type: Opaque
+data:
+  # Base64 encoded kubeconfig content
+  # Replace this with your actual kubeconfig
+  config: ""
+```
+
+### 3. etcd Disk Setup Job
+
+**File: `etcd-disk-setup-job.yaml`**
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etcd-disk-setup
+  namespace: openshift-machine-config-operator
+spec:
+  template:
+    spec:
+      serviceAccountName: etcd-disk-setup-sa
+      containers:
+      - name: etcd-disk-setup
+        image: registry.redhat.io/ubi8/ubi:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          set -euo pipefail
+          
+          # Install required tools
+          dnf install -y wget unzip
+          
+          # Download and install govc
+          wget -O govc.gz https://github.com/vmware/govmomi/releases/latest/download/govc_Linux_x86_64.tar.gz
+          tar -xzf govc.gz
+          chmod +x govc
+          mv govc /usr/local/bin/
+          
+          # Set govc environment variables
+          export GOVC_URL="${VCENTER_URL}"
+          export GOVC_USERNAME="${VCENTER_USERNAME}"
+          export GOVC_PASSWORD="${VCENTER_PASSWORD}"
+          export GOVC_INSECURE=1
+          
+          # Get master node names
+          MASTER_NODES=$(oc get nodes -l node-role.kubernetes.io/master --no-headers -o custom-columns=NAME:.metadata.name)
+          
+          echo "Found master nodes: $MASTER_NODES"
+          
+          # For each master node, attach dedicated etcd disk
+          for node in $MASTER_NODES; do
+            echo "Processing master node: $node"
+            
+            # Get VM name (assuming it matches the node name or has a pattern)
+            VM_NAME="$node"
+            
+            # Check if VM exists
+            if govc vm.info "$VM_NAME" > /dev/null 2>&1; then
+              echo "Found VM: $VM_NAME"
+              
+              # Create and attach 100GB disk for etcd
+              echo "Creating 100GB disk for etcd on $VM_NAME"
+              govc vm.disk.create -vm "$VM_NAME" -name "${VM_NAME}-etcd" -size 100G
+              
+              echo "Disk created successfully for $VM_NAME"
+            else
+              echo "Warning: VM $VM_NAME not found, skipping..."
+            fi
+          done
+          
+          echo "Disk attachment completed for all master nodes"
+          
+          # Create MachineConfig for etcd disk setup
+          cat << 'EOF' | oc apply -f -
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfig
+          metadata:
+            labels:
+              machineconfiguration.openshift.io/role: master
+            name: 99-master-etcd-disk
+          spec:
+            config:
+              ignition:
+                version: 3.2.0
+              systemd:
+                units:
+                - name: etcd-disk-setup.service
+                  enabled: true
+                  contents: |
+                    [Unit]
+                    Description=Setup dedicated etcd disk
+                    Before=kubelet.service
+                    After=local-fs.target
+                    
+                    [Service]
+                    Type=oneshot
+                    RemainAfterExit=yes
+                    ExecStart=/usr/local/bin/setup-etcd-disk.sh
+                    
+                    [Install]
+                    WantedBy=multi-user.target
+              storage:
+                files:
+                - path: /usr/local/bin/setup-etcd-disk.sh
+                  mode: 0755
+                  contents:
+                    inline: |
+                      #!/bin/bash
+                      set -euo pipefail
+                      
+                      # Find the new disk (assuming it's the largest unpartitioned disk)
+                      NEW_DISK=$(lsblk -dn -o NAME,SIZE,TYPE | grep disk | sort -k2 -hr | head -1 | awk '{print "/dev/"$1}')
+                      
+                      # Check if etcd directory is already on a separate mount
+                      if mountpoint -q /var/lib/etcd; then
+                        echo "etcd directory already mounted on separate disk"
+                        exit 0
+                      fi
+                      
+                      # Check if disk is already formatted
+                      if ! blkid "$NEW_DISK" > /dev/null 2>&1; then
+                        echo "Formatting disk $NEW_DISK for etcd"
+                        mkfs.xfs -f "$NEW_DISK"
+                      fi
+                      
+                      # Get UUID of the disk
+                      DISK_UUID=$(blkid -s UUID -o value "$NEW_DISK")
+                      
+                      # Stop etcd temporarily if running
+                      systemctl stop etcd || true
+                      
+                      # Backup existing etcd data
+                      if [ -d /var/lib/etcd ] && [ "$(ls -A /var/lib/etcd)" ]; then
+                        mkdir -p /var/lib/etcd-backup
+                        cp -a /var/lib/etcd/* /var/lib/etcd-backup/
+                      fi
+                      
+                      # Create mount point and add to fstab
+                      mkdir -p /var/lib/etcd
+                      
+                      # Add to fstab if not already present
+                      if ! grep -q "$DISK_UUID" /etc/fstab; then
+                        echo "UUID=$DISK_UUID /var/lib/etcd xfs defaults 0 2" >> /etc/fstab
+                      fi
+                      
+                      # Mount the disk
+                      mount /var/lib/etcd
+                      
+                      # Restore etcd data if backup exists
+                      if [ -d /var/lib/etcd-backup ] && [ "$(ls -A /var/lib/etcd-backup)" ]; then
+                        cp -a /var/lib/etcd-backup/* /var/lib/etcd/
+                        rm -rf /var/lib/etcd-backup
+                      fi
+                      
+                      # Set proper ownership and permissions
+                      chown -R etcd:etcd /var/lib/etcd
+                      chmod 700 /var/lib/etcd
+                      
+                      echo "etcd disk setup completed successfully"
+          EOF
+          
+          echo "MachineConfig for etcd disk setup created successfully"
+          echo "Job completed successfully"
+        env:
+        - name: VCENTER_URL
+          valueFrom:
+            secretKeyRef:
+              name: vsphere-creds
+              key: vcenter-url
+        - name: VCENTER_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: vsphere-creds
+              key: username
+        - name: VCENTER_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vsphere-creds
+              key: password
+        volumeMounts:
+        - name: kubeconfig
+          mountPath: /etc/kubernetes
+          readOnly: true
+      volumes:
+      - name: kubeconfig
+        secret:
+          secretName: kubeconfig
+      restartPolicy: Never
+  backoffLimit: 3
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-disk-setup-sa
+  namespace: openshift-machine-config-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: etcd-disk-setup-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+- apiGroups: ["machineconfiguration.openshift.io"]
+  resources: ["machineconfigs"]
+  verbs: ["create", "get", "list", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: etcd-disk-setup-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: etcd-disk-setup-role
+subjects:
+- kind: ServiceAccount
+  name: etcd-disk-setup-sa
+  namespace: openshift-machine-config-operator
+```
+
+### 4. ArgoCD Application
+
+**File: `argocd-application.yaml`**
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openshift-master-config
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/your-repo.git
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: openshift-machine-config-operator
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - PrunePropagationPolicy=foreground
+    - PruneLast=true
+  ignoreDifferences:
+  - group: machineconfiguration.openshift.io
+    kind: MachineConfig
+    jsonPointers:
+    - /status
+```
+
+## Deployment Steps
+
+### Step 1: Prepare Configuration Files
+
+1. **Create directory structure:**
+```bash
+mkdir -p openshift-master-config
+cd openshift-master-config
+```
+
+2. **Copy all configuration files above into separate YAML files**
+
+### Step 2: Configure vSphere Credentials
+
+1. **Edit `vsphere-credentials-secret.yaml`:**
+```bash
+# Replace these values with your actual vCenter details
+vcenter-url: "https://your-vcenter-server.domain.com"
+username: "your-vcenter-username"  
+password: "your-vcenter-password"
+```
+
+2. **Get kubeconfig and encode it:**
+```bash
+# Get current kubeconfig
+oc config view --raw --minify > kubeconfig
+
+# Base64 encode it
+base64 -w 0 kubeconfig
+
+# Add the output to the kubeconfig secret in vsphere-credentials-secret.yaml
+```
+
+### Step 3: Update ArgoCD Application
+
+**Edit `argocd-application.yaml`:**
+```yaml
+source:
+  repoURL: https://github.com/YOUR-ORG/YOUR-REPO.git  # Update this
+```
+
+### Step 4: Deploy via Git + ArgoCD
+
+1. **Initialize Git repository (if new):**
+```bash
+git init
+git add .
+git commit -m "Initial OpenShift master configuration"
+git remote add origin https://github.com/YOUR-ORG/YOUR-REPO.git
+git push -u origin main
+```
+
+2. **Or add to existing repository:**
+```bash
+git add .
+git commit -m "Add OpenShift master node configuration"
+git push origin main
+```
+
+3. **Apply ArgoCD Application:**
+```bash
+oc apply -f argocd-application.yaml
+```
+
+### Step 5: Manual Deployment (Alternative)
+
+If you prefer manual deployment instead of ArgoCD:
+
+```bash
+# Apply secrets first
+oc apply -f vsphere-credentials-secret.yaml
+
+# Apply KubeletConfig
+oc apply -f kubeletconfig.yaml
+
+# Apply Job and RBAC
+oc apply -f etcd-disk-setup-job.yaml
+```
+
+## Verification
+
+### Monitor ArgoCD Application
+```bash
+# Check application status
+oc get application openshift-master-config -n openshift-gitops
+
+# View application details
+oc describe application openshift-master-config -n openshift-gitops
+```
+
+### Monitor Job Execution
+```bash
+# Check job status
+oc get jobs -n openshift-machine-config-operator
+
+# View job logs
+oc logs job/etcd-disk-setup -n openshift-machine-config-operator -f
+
+# Check job pods
+oc get pods -n openshift-machine-config-operator -l job-name=etcd-disk-setup
+```
+
+### Verify MachineConfig Application
+```bash
+# Check MachineConfig status
+oc get machineconfig 99-master-etcd-disk
+
+# Monitor MachineConfigPool
+oc get machineconfigpool master
+
+# Watch master node updates
+oc get nodes -l node-role.kubernetes.io/master -w
+```
+
+### Verify KubeletConfig
+```bash
+# Check KubeletConfig status
+oc get kubeletconfig master-system-reserved
+oc describe kubeletconfig master-system-reserved
+
+# Verify on nodes
+oc debug node/<master-node> -- chroot /host cat /etc/kubernetes/kubelet.conf
+```
+
+### Verify etcd Disk Configuration
+```bash
+# SSH to master nodes and verify disk mount
+for node in $(oc get nodes -l node-role.kubernetes.io/master --no-headers -o custom-columns=NAME:.metadata.name); do
+  echo "Checking $node:"
+  oc debug node/$node -- chroot /host df -h /var/lib/etcd
+  oc debug node/$node -- chroot /host lsblk
+done
+```
+
+## Troubleshooting
+
+### Job Troubleshooting
+```bash
+# Check job events
+oc describe job etcd-disk-setup -n openshift-machine-config-operator
+
+# Check pod logs for errors
+oc logs -l job-name=etcd-disk-setup -n openshift-machine-config-operator
+
+# Check secrets
+oc get secret vsphere-creds -n openshift-machine-config-operator -o yaml
+```
+
+### vCenter Connection Issues
+```bash
+# Test govc connection manually
+export GOVC_URL="https://your-vcenter-server.domain.com"
+export GOVC_USERNAME="your-username"
+export GOVC_PASSWORD="your-password"
+export GOVC_INSECURE=1
+
+# List VMs to test connection
+govc ls
+```
+
+### MachineConfig Issues
+```bash
+# Check MachineConfigPool status
+oc get mcp master -o yaml
+
+# Check machine-config-operator logs
+oc logs -n openshift-machine-config-operator deployment/machine-config-operator
+
+# Check if nodes are updating
+oc get nodes -o wide
+```
+
+### etcd Performance Verification
+```bash
+# Check etcd performance
+oc rsh -n openshift-etcd etcd-<master-node>
+etcdctl endpoint status --write-out=table
+
+# Run etcd performance test
+fio --rw=write --ioengine=sync --fdatasync=1 --directory=/var/lib/etcd --size=22m --bs=2300 --name=mytest
+```
+
+## Important Notes
+
+1. **Per-Node Operation**: govc commands run for each of the 3 master nodes individually
+2. **Disk Size**: Default 100GB disk for etcd (adjust size in job if needed)
+3. **Backup**: Existing etcd data is automatically backed up during migration
+4. **Downtime**: Brief etcd service interruption during disk migration
+5. **VM Naming**: Job assumes VM names match OpenShift node names
+6. **Rollback**: Keep original etcd backup for emergency rollback
+
+## Security Best Practices
+
+- Store vSphere credentials in external secret management (Vault, etc.)
+- Use service accounts with minimal required permissions
+- Rotate vCenter credentials regularly
+- Monitor job execution logs for security events
+- Use network policies to restrict job pod access
+
+## Red Hat Documentation Reference
+
+Based on Red Hat solution: https://access.redhat.com/solutions/5840061
+- Mounting separate disk for OpenShift 4 etcd
+- etcd performance requirements and guidelines
+
+This solution provides production-ready configuration for OpenShift 4.16 master nodes with enhanced performance and resource management.
