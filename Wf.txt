@@ -1,5 +1,40 @@
 - name: Set up GitHub CLI
   run: |
+    # Check if GitHub CLI is available
+    if ! command -v gh &> /dev/null; then
+      echo "Installing GitHub CLI..."
+      
+      # Get system architecture
+      ARCH=$(uname -m)
+      case $ARCH in
+        x86_64) ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        arm64) ARCH="arm64" ;;
+      esac
+      
+      # Get latest version
+      LATEST_VERSION=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$' | sed 's/v//')
+      
+      # Download and install
+      curl -fsSL "https://github.com/cli/cli/releases/latest/download/gh_${LATEST_VERSION}_linux_${ARCH}.tar.gz" -o gh.tar.gz
+      tar -xzf gh.tar.gz
+      sudo mv gh_${LATEST_VERSION}_linux_${ARCH}/bin/gh /usr/local/bin/
+      sudo chmod +x /usr/local/bin/gh
+      rm -rf gh_${LATEST_VERSION}_linux_${ARCH} gh.tar.gz
+    else
+      echo "GitHub CLI already installed"
+    fi
+    
+    # Verify installation
+    gh --version
+    
+    # Authenticate using token
+    echo "${{ secrets.GH_FUNC_TOKEN }}" | gh auth login --with-token
+
+
+
+- name: Set up GitHub CLI
+  run: |
     # Check if GitHub CLI is available and install/update if needed
     if ! command -v gh &> /dev/null; then
       echo "Installing GitHub CLI..."
