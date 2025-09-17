@@ -1,3 +1,43 @@
+# Start OC CLI container interactively
+podman run -it --name oc-cli-container registry.redhat.io/ubi8/ubi:latest /bin/bash
+
+# Inside the container, run these commands:
+# Update system and install dependencies
+dnf update -y && dnf install -y wget curl tar gzip
+
+# Install govc
+GOVC_VERSION=v0.33.0
+wget -O /tmp/govc_Linux_x86_64.tar.gz \
+  "https://github.com/vmware/govmomi/releases/download/${GOVC_VERSION}/govc_Linux_x86_64.tar.gz"
+tar -xzf /tmp/govc_Linux_x86_64.tar.gz -C /usr/local/bin/
+chmod +x /usr/local/bin/govc
+rm /tmp/govc_Linux_x86_64.tar.gz
+
+# Verify govc installation
+govc version
+
+# Exit the container
+exit
+
+# Commit the container to create new image
+podman commit oc-cli-container oc-cli-govc:latest
+
+# Tag for internal registry (update with your registry URL)
+podman tag oc-cli-govc:latest your-registry.com:5000/namespace/oc-cli-govc:latest
+
+# Login to internal registry
+podman login your-registry.com:5000
+
+# Push to internal registry
+podman push your-registry.com:5000/namespace/oc-cli-govc:latest
+
+# Clean up local container
+podman rm oc-cli-container
+
+# Test the final image
+podman run -it --rm your-registry.com:5000/namespace/oc-cli-govc:latest /bin/bash -c "oc version --client && govc version"
+
+
 - name: Set up GitHub CLI
   run: |
     # Check if GitHub CLI is available
