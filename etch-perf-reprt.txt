@@ -13,6 +13,7 @@ RESULTS_DIR="$HOME/etcd_benchmark_$(date +%Y%m%d_%H%M%S)"
 FIO_SIZE="1G"
 FIO_RUNTIME=60
 FIO_JOBS=4
+FIO_TIMEOUT=300  # 5 minutes timeout per test
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"
@@ -75,16 +76,21 @@ check_prerequisites() {
   if ! oc auth can-i '*' '*' --all-namespaces &> /dev/null; then
     log_warn "User does not have cluster-admin privileges. Some checks may fail."
   fi
+
+  # Check if jq is installed
+  if ! command -v jq &> /dev/null; then
+    log_warn "jq is not installed. Some features may be limited."
+  fi
+
+  # Check if timeout is available
+  if ! command -v timeout &> /dev/null; then
+    log_warn "timeout command not found. Timeout functionality may not work as expected."
+  fi
   
   log_info "All prerequisites met"
 }
 
-# Get etcd pods
-get_etcd_pods() {
-  oc get pods -n openshift-etcd -l app=etcd -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
-}
-
-# Run FIO test on node
+# Run FIO test on node with timeout and better error handling
 run_fio_test() {
   local node=$1
   local test_name=$2
@@ -93,90 +99,189 @@ run_fio_test() {
   local result_file="$RESULTS_DIR/fio_${node//\//_}_${test_name}.json"
   local log_file="$RESULTS_DIR/fio_${node//\//_}_${test_name}.log"
   
-  log_info "Running FIO test '$test_name' on $node"
+  log_info "Starting FIO test '$test_name' on $node (timeout: ${FIO_TIMEOUT}s)"
   
-  {
+  # Create a cleanup function
+  cleanup() {
+    local pid=$1
+    log_warn "Test '$test_name' on $node timed out after ${FIO_TIMEOUT}s"
+    kill -TERM "$pid" 2>/dev/null || true
+    return 1
+  }
+  
+  # Run FIO in background with timeout
+  (
     echo "=== FIO Test: $test_name ==="
     echo "Node: $node"
     echo "Command: fio --output-format=json $fio_params"
     echo "Timestamp: $(date)"
+    echo "Timeout: ${FIO_TIMEOUT} seconds"
     echo "==========================="
     echo
-  } > "$log_file"
-  
-  local start_time
-  start_time=$(date +%s)
-  
-  local result
-  result=$(oc debug "node/$node" --quiet -- chroot /host bash -c "
-    # Install fio if not present
-    if ! command -v fio &> /dev/null; then
-      if command -v dnf &> /dev/null; then
-        dnf install -y fio || yum install -y fio || {
-          echo 'ERROR: Failed to install fio' >&2
+    
+    oc debug "node/$node" --quiet -- chroot /host bash -c "
+      # Set error handling
+      set -euo pipefail
+      
+      # Install fio if not present
+      if ! command -v fio &> /dev/null; then
+        echo 'Installing fio...'
+        if command -v dnf &> /dev/null; then
+          dnf install -y fio || yum install -y fio || {
+            echo 'ERROR: Failed to install fio' >&2
+            exit 1
+          }
+        else
+          echo 'ERROR: Could not find package manager to install fio' >&2
           exit 1
-        }
-      else
-        echo 'ERROR: Could not find package manager to install fio' >&2
-        exit 1
+        fi
       fi
+      
+      # Create test directory
+      test_dir=\"/var/tmp/fio_test_$(date +%s)\"
+      mkdir -p \"\$test_dir\"
+      trap 'rm -rf \"\$test_dir\"' EXIT
+      
+      # Create test file
+      test_file=\"\$test_dir/fio_test\"
+      echo \"Creating test file: \$test_file\"
+      if ! fallocate -l 2G \"\$test_file\" 2>/dev/null; then
+        # Fallback to dd if fallocate fails
+        echo \"fallocate failed, trying dd...\"
+        if ! dd if=/dev/zero of=\"\$test_file\" bs=1M count=2048 status=none; then
+          echo 'ERROR: Failed to create test file' >&2
+          exit 1
+        fi
+      fi
+      
+      # Run fio with timeout
+      echo \"Starting FIO test...\"
+      timeout ${FIO_TIMEOUT} fio --filename=\$test_file --output-format=json $fio_params || {
+        if [ \$? -eq 124 ]; then
+          echo \"ERROR: FIO test timed out after ${FIO_TIMEOUT} seconds\" >&2
+        else
+          echo \"ERROR: FIO test failed with exit code \$?\" >&2
+        fi
+        exit 1
+      }
+    " 2>&1
+  ) > "$result_file" 2> >(tee -a "$log_file" >&2) &
+  
+  local pid=$!
+  
+  # Set timeout for the entire test
+  ( sleep "$FIO_TIMEOUT" && cleanup "$pid" ) 2>/dev/null &
+  local timeout_pid=$!
+  
+  # Wait for the test to complete
+  if wait "$pid" 2>/dev/null; then
+    # Test completed successfully
+    kill "$timeout_pid" 2>/dev/null || true
+    
+    # Verify the output is valid JSON
+    if ! jq empty "$result_file" 2>/dev/null; then
+      log_warn "Invalid JSON output from FIO test. Check $log_file for details."
+      return 1
     fi
     
-    # Create test file
-    test_file=\"/var/tmp/fio_test\"
-    fallocate -l 2G \"\$test_file\" || {
-      echo 'ERROR: Failed to create test file' >&2
-      exit 1
-    }
+    # Parse and log summary
+    local iops lat
+    iops=$(jq -r '.jobs[0].write.iops // 0' "$result_file" 2>/dev/null)
+    lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$result_file" 2>/dev/null)
+    lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}") # Convert ns to ms
     
-    # Run fio test
-    fio --filename=\$test_file --output-format=json $fio_params 2>&1 || {
-      echo 'ERROR: FIO test failed' >&2
-      exit 1
-    }
-    
-    # Cleanup
-    rm -f \"\$test_file\"
-  " 2>&1)
+    log_info "Test '$test_name' completed on $node - IOPS: $iops, Latency: ${lat}ms"
+    return 0
+  else
+    # Test failed or timed out
+    log_error "FIO test '$test_name' failed on $node. Check $log_file for details."
+    return 1
+  fi
+}
+
+# Collect etcd metrics
+collect_etcd_metrics() {
+  log_section "Collecting etcd Metrics"
+  local metrics_file="$RESULTS_DIR/etcd_metrics.json"
+  if oc get --raw /metrics > "$metrics_file" 2>/dev/null; then
+    log_info "Collected etcd metrics to $metrics_file"
+  else
+    log_warn "Failed to collect etcd metrics"
+  fi
+}
+
+# Collect etcd status
+collect_etcd_status() {
+  log_section "Collecting etcd Status"
+  local status_file="$RESULTS_DIR/etcd_status.log"
   
-  local exit_code=$?
+  {
+    echo "=== etcdctl member list ==="
+    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl member list -w table 2>&1 || true
+    
+    echo -e "\n=== etcdctl endpoint status ==="
+    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint status -w table --cluster 2>&1 || true
+    
+    echo -e "\n=== etcdctl endpoint health ==="
+    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint health --cluster 2>&1 || true
+  } > "$status_file"
+  
+  log_info "etcd status saved to $status_file"
+}
+
+# Generate summary report
+generate_summary() {
+  log_section "Generating Summary Report"
+  local summary_file="$RESULTS_DIR/summary.txt"
+  local start_time=$1
   local end_time
   end_time=$(date +%s)
   local duration=$((end_time - start_time))
   
   {
+    echo "=== etcd Performance Benchmark Summary ==="
+    echo "Date: $(date)"
+    echo "OpenShift Version: $(oc version -o json 2>/dev/null | jq -r .serverVersion.gitVersion || echo "Unknown")"
+    echo "Test Duration: $((duration / 60)) minutes $((duration % 60)) seconds"
+    echo "Results Directory: $RESULTS_DIR"
+    echo "========================================"
     echo
-    echo "=== Test Completed ==="
-    echo "Exit Code: $exit_code"
-    echo "Duration: ${duration}s"
-    echo "====================="
-  } >> "$log_file"
+    
+    # FIO results summary
+    echo "=== Disk Performance ==="
+    find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | while read -r f; do
+      local node_test
+      node_test=$(basename "$f" .json | sed 's/fio_//')
+      local iops
+      iops=$(jq -r '.jobs[0].write.iops // 0' "$f" 2>/dev/null || echo "0")
+      local lat
+      lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f" 2>/dev/null || echo "0")
+      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
+      
+      printf "%-40s: IOPS=%8.2f, Latency=%6.2fms\n" "$node_test" "$iops" "$lat"
+    done
+    
+    # etcd status summary
+    echo -e "\n=== etcd Cluster Status ==="
+    local status_file="$RESULTS_DIR/etcd_status.log"
+    if [ -f "$status_file" ]; then
+      grep -A 10 "etcdctl member list" "$status_file" 2>/dev/null | tail -n +2 || 
+        echo "No etcd member list found in status file"
+    else
+      echo "Status file not found: $status_file"
+    fi
+  } > "$summary_file"
   
-  if [ $exit_code -ne 0 ]; then
-    log_error "FIO test '$test_name' failed on $node. Check $log_file for details."
-    echo "$result" >> "$log_file"
-    return 1
-  fi
-  
-  # Save results
-  echo "$result" > "$result_file"
-  log_info "FIO test '$test_name' completed in ${duration}s. Results saved to $result_file"
-  
-  # Parse and log summary
-  local iops
-  iops=$(echo "$result" | jq -r '.jobs[0].write.iops // 0')
-  local lat
-  lat=$(echo "$result" | jq -r '.jobs[0].write.lat_ns.mean // 0')
-  lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}") # Convert ns to ms
-  
-  log_info "Test '$test_name' summary - IOPS: $iops, Latency: ${lat}ms"
-  
-  # Return the raw result
-  echo "$result"
+  log_info "Benchmark completed successfully!"
+  log_info "Summary report: $summary_file"
+  log_info "Detailed logs: $log_file"
 }
 
 # Main function
 main() {
+  local start_time
+  start_time=$(date +%s)
+  
   log_section "Starting etcd Performance Benchmark"
   log_info "Results will be saved to: $RESULTS_DIR"
   
@@ -243,61 +348,12 @@ main() {
       --group_reporting"
   done
   
-  # Collect etcd metrics
-  log_section "Collecting etcd Metrics"
-  local metrics_file="$RESULTS_DIR/etcd_metrics.json"
-  oc get --raw /metrics > "$metrics_file" 2>/dev/null || log_warn "Failed to collect etcd metrics"
+  # Collect additional diagnostics
+  collect_etcd_metrics
+  collect_etcd_status
   
-  # Collect etcd status
-  log_section "Collecting etcd Status"
-  local status_file="$RESULTS_DIR/etcd_status.log"
-  {
-    echo "=== etcdctl member list ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl member list -w table || true
-    
-    echo -e "\n=== etcdctl endpoint status ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint status -w table --cluster || true
-    
-    echo -e "\n=== etcdctl endpoint health ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint health --cluster || true
-  } > "$status_file" 2>&1
-  
-  log_info "etcd status saved to $status_file"
-  
-  # Generate summary report
-  log_section "Generating Summary Report"
-  local summary_file="$RESULTS_DIR/summary.txt"
-  {
-    echo "=== etcd Performance Benchmark Summary ==="
-    echo "Date: $(date)"
-    echo "OpenShift Version: $(oc version -o json | jq -r .serverVersion.gitVersion 2>/dev/null || echo "Unknown")"
-    echo "Test Duration: $(( ( $(date +%s) - $(stat -c %Y "$log_file" 2>/dev/null || echo "$(date +%s)") ) )) seconds"
-    echo "Results Directory: $RESULTS_DIR"
-    echo "========================================"
-    echo
-    
-    # FIO results summary
-    echo "=== Disk Performance ==="
-    find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | while read -r f; do
-      local node_test
-      node_test=$(basename "$f" .json | sed 's/fio_//')
-      local iops
-      iops=$(jq -r '.jobs[0].write.iops // 0' "$f" 2>/dev/null || echo "0")
-      local lat
-      lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f" 2>/dev/null || echo "0")
-      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
-      
-      printf "%-40s: IOPS=%8.2f, Latency=%6.2fms\n" "$node_test" "$iops" "$lat"
-    done
-    
-    # etcd status summary
-    echo -e "\n=== etcd Cluster Status ==="
-    grep -A 10 "etcdctl member list" "$status_file" 2>/dev/null | tail -n +2 || echo "Status information not available"
-  } > "$summary_file"
-  
-  log_info "Benchmark completed successfully!"
-  log_info "Summary report: $summary_file"
-  log_info "Detailed logs: $log_file"
+  # Generate final report
+  generate_summary "$start_time"
 }
 
 # Run main function
