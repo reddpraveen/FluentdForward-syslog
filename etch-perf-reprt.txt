@@ -51,7 +51,6 @@ log_warn() {
 
 log_error() {
   log error "$@"
-  exit 1
 }
 
 log_section() {
@@ -62,147 +61,158 @@ log_section() {
 check_prerequisites() {
   log_section "Checking Prerequisites"
   
-  # Check oc is installed and logged in
   if ! command -v oc &> /dev/null; then
     log_error "OpenShift CLI (oc) is not installed or not in PATH"
+    exit 1
   fi
   
-  # Check cluster connection
   if ! oc whoami &> /dev/null; then
     log_error "Not logged into OpenShift cluster. Please run 'oc login' first."
+    exit 1
   fi
   
-  # Check if user has cluster-admin privileges
   if ! oc auth can-i '*' '*' --all-namespaces &> /dev/null; then
     log_warn "User does not have cluster-admin privileges. Some checks may fail."
   fi
 
-  # Check if jq is installed
   if ! command -v jq &> /dev/null; then
-    log_warn "jq is not installed. Some features may be limited."
-  fi
-
-  # Check if timeout is available
-  if ! command -v timeout &> /dev/null; then
-    log_warn "timeout command not found. Timeout functionality may not work as expected."
+    log_warn "jq is not installed. Installing jq is recommended for better results parsing."
   fi
   
-  log_info "All prerequisites met"
+  log_info "Prerequisites check completed"
 }
 
-# Run FIO test on node with timeout and better error handling
+# Run FIO test on node with detailed debugging
 run_fio_test() {
   local node=$1
   local test_name=$2
   local fio_params=$3
   
   local result_file="$RESULTS_DIR/fio_${node//\//_}_${test_name}.json"
-  local log_file="$RESULTS_DIR/fio_${node//\//_}_${test_name}.log"
+  local debug_file="$RESULTS_DIR/fio_${node//\//_}_${test_name}_debug.log"
   
-  log_info "Starting FIO test '$test_name' on $node (timeout: ${FIO_TIMEOUT}s)"
+  log_info "Starting FIO test '$test_name' on $node"
   
-  # Create a cleanup function
-  cleanup() {
-    local pid=$1
-    log_warn "Test '$test_name' on $node timed out after ${FIO_TIMEOUT}s"
-    kill -TERM "$pid" 2>/dev/null || true
-    return 1
-  }
-  
-  # Run FIO in background with timeout
-  (
-    echo "=== FIO Test: $test_name ==="
+  {
+    echo "=== FIO Test Debug Information ==="
+    echo "Test: $test_name"
     echo "Node: $node"
-    echo "Command: fio --output-format=json $fio_params"
     echo "Timestamp: $(date)"
-    echo "Timeout: ${FIO_TIMEOUT} seconds"
-    echo "==========================="
+    echo "Command: fio $fio_params"
+    echo "================================="
     echo
-    
-    oc debug "node/$node" --quiet -- chroot /host bash -c "
-      # Set error handling
-      set -euo pipefail
-      
-      # Install fio if not present
-      if ! command -v fio &> /dev/null; then
-        echo 'Installing fio...'
-        if command -v dnf &> /dev/null; then
-          dnf install -y fio || yum install -y fio || {
-            echo 'ERROR: Failed to install fio' >&2
-            exit 1
-          }
-        else
-          echo 'ERROR: Could not find package manager to install fio' >&2
-          exit 1
-        fi
-      fi
-      
-      # Create test directory
-      test_dir=\"/var/tmp/fio_test_$(date +%s)\"
-      mkdir -p \"\$test_dir\"
-      trap 'rm -rf \"\$test_dir\"' EXIT
-      
-      # Create test file
-      test_file=\"\$test_dir/fio_test\"
-      echo \"Creating test file: \$test_file\"
-      if ! fallocate -l 2G \"\$test_file\" 2>/dev/null; then
-        # Fallback to dd if fallocate fails
-        echo \"fallocate failed, trying dd...\"
-        if ! dd if=/dev/zero of=\"\$test_file\" bs=1M count=2048 status=none; then
-          echo 'ERROR: Failed to create test file' >&2
-          exit 1
-        fi
-      fi
-      
-      # Run fio with timeout
-      echo \"Starting FIO test...\"
-      timeout ${FIO_TIMEOUT} fio --filename=\$test_file --output-format=json $fio_params || {
-        if [ \$? -eq 124 ]; then
-          echo \"ERROR: FIO test timed out after ${FIO_TIMEOUT} seconds\" >&2
-        else
-          echo \"ERROR: FIO test failed with exit code \$?\" >&2
-        fi
-        exit 1
-      }
-    " 2>&1
-  ) > "$result_file" 2> >(tee -a "$log_file" >&2) &
-  
-  local pid=$!
-  
-  # Set timeout for the entire test
-  ( sleep "$FIO_TIMEOUT" && cleanup "$pid" ) 2>/dev/null &
-  local timeout_pid=$!
-  
-  # Wait for the test to complete
-  if wait "$pid" 2>/dev/null; then
-    # Test completed successfully
-    kill "$timeout_pid" 2>/dev/null || true
-    
-    # Verify the output is valid JSON
-    if ! jq empty "$result_file" 2>/dev/null; then
-      log_warn "Invalid JSON output from FIO test. Check $log_file for details."
-      return 1
-    fi
-    
-    # Parse and log summary
-    local iops lat
-    iops=$(jq -r '.jobs[0].write.iops // 0' "$result_file" 2>/dev/null)
-    lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$result_file" 2>/dev/null)
-    lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}") # Convert ns to ms
-    
-    log_info "Test '$test_name' completed on $node - IOPS: $iops, Latency: ${lat}ms"
-    return 0
+  } > "$debug_file"
+
+  # Run the test
+  local output
+  set +e
+  output=$(oc debug "node/$node" --quiet -- chroot /host bash <<'EOFSCRIPT'
+set -x
+echo "=== System Information ==="
+hostname
+uname -a
+df -h /var/tmp
+echo "========================="
+
+# Check if fio is installed
+if ! command -v fio &> /dev/null; then
+  echo "Installing fio..."
+  if command -v dnf &> /dev/null; then
+    dnf install -y fio 2>&1 || yum install -y fio 2>&1
+  elif command -v yum &> /dev/null; then
+    yum install -y fio 2>&1
   else
-    # Test failed or timed out
-    log_error "FIO test '$test_name' failed on $node. Check $log_file for details."
-    return 1
+    echo "ERROR: No package manager found"
+    exit 1
   fi
+fi
+
+# Verify fio is now available
+if ! command -v fio &> /dev/null; then
+  echo "ERROR: Failed to install fio"
+  exit 1
+fi
+
+# Create test directory
+test_dir="/var/tmp/fio_test_$$"
+mkdir -p "$test_dir"
+cd "$test_dir"
+
+# Create test file
+test_file="$test_dir/testfile"
+echo "Creating test file: $test_file"
+
+if fallocate -l 2G "$test_file" 2>/dev/null; then
+  echo "Test file created with fallocate"
+elif dd if=/dev/zero of="$test_file" bs=1M count=2048 2>&1; then
+  echo "Test file created with dd"
+else
+  echo "ERROR: Failed to create test file"
+  cd /
+  rm -rf "$test_dir"
+  exit 1
+fi
+
+# Verify file exists
+ls -lh "$test_file"
+
+# Run FIO test
+echo "Running FIO test..."
+echo "=== FIO OUTPUT START ==="
+EOFSCRIPT
+)
+
+  # Add the fio command
+  output="${output}$(oc debug "node/$node" --quiet -- chroot /host bash -c "
+    test_dir=\"/var/tmp/fio_test_\$\$\"
+    test_file=\"\$test_dir/testfile\"
+    cd \$test_dir 2>/dev/null || exit 1
+    fio --filename=\$test_file --output-format=json $fio_params 2>&1
+    fio_exit=\$?
+    echo \"=== FIO OUTPUT END ===\"
+    echo \"FIO exit code: \$fio_exit\"
+    cd /
+    rm -rf \$test_dir
+    exit \$fio_exit
+  " 2>&1)"
+  
+  local exit_code=$?
+  set -e
+  
+  # Save debug output
+  echo "$output" >> "$debug_file"
+  
+  # Try to extract JSON
+  local json_start json_end json_output
+  json_start=$(echo "$output" | grep -n "=== FIO OUTPUT START ===" | cut -d: -f1)
+  json_end=$(echo "$output" | grep -n "=== FIO OUTPUT END ===" | cut -d: -f1)
+  
+  if [ -n "$json_start" ] && [ -n "$json_end" ]; then
+    json_output=$(echo "$output" | sed -n "$((json_start + 1)),$((json_end - 1))p")
+    
+    # Validate and save JSON
+    if echo "$json_output" | jq empty 2>/dev/null; then
+      echo "$json_output" > "$result_file"
+      
+      # Parse results
+      local iops lat
+      iops=$(echo "$json_output" | jq -r '.jobs[0].write.iops // 0' 2>/dev/null || echo "0")
+      lat=$(echo "$json_output" | jq -r '.jobs[0].write.lat_ns.mean // 0' 2>/dev/null || echo "0")
+      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
+      
+      log_info "Test '$test_name' completed - IOPS: $iops, Latency: ${lat}ms"
+      return 0
+    fi
+  fi
+  
+  log_warn "Test '$test_name' on $node may have failed or produced invalid output. Check $debug_file"
+  return 1
 }
 
 # Collect etcd metrics
 collect_etcd_metrics() {
   log_section "Collecting etcd Metrics"
-  local metrics_file="$RESULTS_DIR/etcd_metrics.json"
+  local metrics_file="$RESULTS_DIR/etcd_metrics.txt"
   if oc get --raw /metrics > "$metrics_file" 2>/dev/null; then
     log_info "Collected etcd metrics to $metrics_file"
   else
@@ -215,15 +225,23 @@ collect_etcd_status() {
   log_section "Collecting etcd Status"
   local status_file="$RESULTS_DIR/etcd_status.log"
   
+  local etcd_pod
+  etcd_pod=$(oc get pods -n openshift-etcd -l app=etcd -o name 2>/dev/null | head -1)
+  
+  if [ -z "$etcd_pod" ]; then
+    log_warn "No etcd pods found"
+    return 1
+  fi
+  
   {
     echo "=== etcdctl member list ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl member list -w table 2>&1 || true
+    oc rsh -n openshift-etcd "$etcd_pod" etcdctl member list -w table 2>&1 || echo "Failed to get member list"
     
     echo -e "\n=== etcdctl endpoint status ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint status -w table --cluster 2>&1 || true
+    oc rsh -n openshift-etcd "$etcd_pod" etcdctl endpoint status -w table --cluster 2>&1 || echo "Failed to get endpoint status"
     
     echo -e "\n=== etcdctl endpoint health ==="
-    oc rsh -n openshift-etcd "$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)" etcdctl endpoint health --cluster 2>&1 || true
+    oc rsh -n openshift-etcd "$etcd_pod" etcdctl endpoint health --cluster 2>&1 || echo "Failed to get endpoint health"
   } > "$status_file"
   
   log_info "etcd status saved to $status_file"
@@ -241,40 +259,45 @@ generate_summary() {
   {
     echo "=== etcd Performance Benchmark Summary ==="
     echo "Date: $(date)"
-    echo "OpenShift Version: $(oc version -o json 2>/dev/null | jq -r .serverVersion.gitVersion || echo "Unknown")"
+    echo "OpenShift Version: $(oc version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion' 2>/dev/null || echo "Unknown")"
     echo "Test Duration: $((duration / 60)) minutes $((duration % 60)) seconds"
     echo "Results Directory: $RESULTS_DIR"
     echo "========================================"
     echo
     
-    # FIO results summary
-    echo "=== Disk Performance ==="
-    find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | while read -r f; do
-      local node_test
-      node_test=$(basename "$f" .json | sed 's/fio_//')
-      local iops
-      iops=$(jq -r '.jobs[0].write.iops // 0' "$f" 2>/dev/null || echo "0")
-      local lat
-      lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f" 2>/dev/null || echo "0")
-      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
-      
-      printf "%-40s: IOPS=%8.2f, Latency=%6.2fms\n" "$node_test" "$iops" "$lat"
-    done
-    
-    # etcd status summary
-    echo -e "\n=== etcd Cluster Status ==="
-    local status_file="$RESULTS_DIR/etcd_status.log"
-    if [ -f "$status_file" ]; then
-      grep -A 10 "etcdctl member list" "$status_file" 2>/dev/null | tail -n +2 || 
-        echo "No etcd member list found in status file"
+    echo "=== Disk Performance Results ==="
+    if command -v jq &> /dev/null; then
+      find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | sort | while read -r f; do
+        local node_test
+        node_test=$(basename "$f" .json | sed 's/fio_//')
+        local iops lat
+        iops=$(jq -r '.jobs[0].write.iops // 0' "$f" 2>/dev/null || echo "0")
+        lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f" 2>/dev/null || echo "0")
+        lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
+        
+        printf "%-50s: IOPS=%10.2f, Latency=%8.2fms\n" "$node_test" "$iops" "$lat"
+      done
     else
-      echo "Status file not found: $status_file"
+      echo "jq not available - check individual JSON files for results"
+      find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | sort
+    fi
+    
+    echo
+    echo "=== etcd Cluster Status ==="
+    if [ -f "$RESULTS_DIR/etcd_status.log" ]; then
+      cat "$RESULTS_DIR/etcd_status.log"
+    else
+      echo "Status information not available"
     fi
   } > "$summary_file"
   
-  log_info "Benchmark completed successfully!"
-  log_info "Summary report: $summary_file"
-  log_info "Detailed logs: $log_file"
+  log_info "Benchmark completed!"
+  log_info "Summary: $summary_file"
+  log_info "Full logs: $log_file"
+  
+  # Display summary
+  echo
+  cat "$summary_file"
 }
 
 # Main function
@@ -283,22 +306,23 @@ main() {
   start_time=$(date +%s)
   
   log_section "Starting etcd Performance Benchmark"
-  log_info "Results will be saved to: $RESULTS_DIR"
+  log_info "Results directory: $RESULTS_DIR"
   
   check_prerequisites
   
   # Get etcd nodes
   log_section "Discovering etcd Nodes"
   local etcd_nodes
-  etcd_nodes=$(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+  etcd_nodes=$(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)
   
   if [ -z "$etcd_nodes" ]; then
     log_error "No etcd nodes found"
+    exit 1
   fi
   
   log_info "Found etcd nodes:"
   echo "$etcd_nodes" | while read -r node; do
-    log_info "- $node"
+    log_info "  - $node"
   done
   
   # Run FIO tests on each etcd node
@@ -317,7 +341,7 @@ main() {
       --numjobs=1 \
       --time_based \
       --direct=1 \
-      --group_reporting"
+      --group_reporting" || log_warn "seq_write test had issues on $node"
     
     # Random write test
     run_fio_test "$node" "rand_write" "\
@@ -330,7 +354,7 @@ main() {
       --numjobs=$FIO_JOBS \
       --time_based \
       --direct=1 \
-      --group_reporting"
+      --group_reporting" || log_warn "rand_write test had issues on $node"
     
     # Fsync test
     run_fio_test "$node" "fsync" "\
@@ -345,7 +369,7 @@ main() {
       --time_based \
       --runtime=30 \
       --direct=1 \
-      --group_reporting"
+      --group_reporting" || log_warn "fsync test had issues on $node"
   done
   
   # Collect additional diagnostics
