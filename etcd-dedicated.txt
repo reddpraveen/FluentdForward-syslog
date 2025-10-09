@@ -1,3 +1,499 @@
+###job
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etcd-disk-migration
+  namespace: openshift-etcd
+  labels:
+    app.kubernetes.io/name: etcd-disk-migration
+    app.kubernetes.io/component: etcd
+spec:
+  template:
+    metadata:
+      labels:
+        app: etcd-disk-migration
+    spec:
+      imagePullSecrets:
+      - name: artifactory
+      containers:
+      - name: etcd-disk-migration
+        image: artifactory.devops.com/local-docker-ocp4aas-certified-releases/ocp4-argocd/azure-oc-cli:latest
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          # Color codes for output
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m'
+          
+          # Logging functions
+          log_info() {
+            echo -e "${GREEN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} INFO: $*"
+          }
+          
+          log_error() {
+            echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} ERROR: $*" >&2
+          }
+          
+          log_warn() {
+            echo -e "${YELLOW}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} WARN: $*"
+          }
+          
+          log_section() {
+            echo ""
+            echo -e "${BLUE}====== $* ======${NC}"
+          }
+          
+          # Error handling
+          trap 'handle_error $? $LINENO' ERR
+          
+          handle_error() {
+            local exit_code=$1
+            local line_number=$2
+            log_error "Script failed with exit code $exit_code at line $line_number"
+            log_error "Check logs and consider rollback if necessary"
+            exit $exit_code
+          }
+          
+          # Configuration
+          DISK_SIZE="200G"
+          ETCD_DEVICE="/dev/sdc"
+          MOUNT_PATH="/var/lib/etcd"
+          
+          # Export environment variables for govc
+          export GOVC_URL="https://${vcnServer}"
+          export GOVC_USERNAME="${vcnUser}"
+          export GOVC_PASSWORD="${vcnPwd}"
+          export GOVC_INSECURE=true
+          
+          log_section "Starting etcd Disk Migration Process"
+          log_info "Disk size: $DISK_SIZE"
+          log_info "Mount path: $MOUNT_PATH"
+          
+          # Get master nodes
+          log_info "Retrieving master node information..."
+          masterVM1=$(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[0].metadata.name}')
+          masterVM2=$(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[1].metadata.name}')
+          masterVM3=$(oc get nodes -l node-role.kubernetes.io/master= -o jsonpath='{.items[2].metadata.name}')
+          
+          if [[ -z "$masterVM1" ]] || [[ -z "$masterVM2" ]] || [[ -z "$masterVM3" ]]; then
+            log_error "Failed to retrieve all three master nodes"
+            exit 1
+          fi
+          
+          log_info "Master nodes identified:"
+          log_info "  Master 1: $masterVM1"
+          log_info "  Master 2: $masterVM2"
+          log_info "  Master 3: $masterVM3"
+          
+          # Verify initial etcd health
+          log_section "Verifying Initial etcd Cluster Health"
+          etcd_available=$(oc get co etcd -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+          etcd_degraded=$(oc get co etcd -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}')
+          
+          if [[ "$etcd_available" != "True" ]] || [[ "$etcd_degraded" != "False" ]]; then
+            log_error "etcd cluster is not healthy before migration. Aborting."
+            log_error "Available: $etcd_available, Degraded: $etcd_degraded"
+            exit 1
+          fi
+          log_info "PASS - etcd cluster is healthy"
+          
+          # Get datastore information
+          log_info "Retrieving datastore information..."
+          DATASTORE=$(govc vm.info -json "$masterVM1" | jq -r '.VirtualMachines[0].Config.DatastoreUrl[0].Name')
+          
+          if [[ -z "$DATASTORE" ]]; then
+            log_error "Failed to retrieve datastore information"
+            exit 1
+          fi
+          
+          log_info "Using datastore: $DATASTORE"
+          
+          # Function to create and attach disk
+          create_and_attach_disk() {
+            local node=$1
+            local disk_name="${node}_dedicated_etcd_disk.vmdk"
+            
+            log_info "Processing node: $node"
+            
+            # Check if disk already exists
+            if govc datastore.ls -ds "$DATASTORE" "${node}/" 2>/dev/null | grep -q "dedicated_etcd_disk.vmdk"; then
+              log_warn "Dedicated etcd disk already exists for $node, skipping creation"
+              return 0
+            fi
+            
+            # Create disk
+            log_info "Creating ${DISK_SIZE} disk for $node..."
+            if ! govc vm.disk.create -vm "$node" -name "${node}/${disk_name}" -size "$DISK_SIZE" -ds "$DATASTORE"; then
+              log_error "Failed to create disk for $node"
+              return 1
+            fi
+            log_info "PASS - Disk created successfully"
+            
+            # Wait for disk to be recognized
+            sleep 5
+            
+            # Verify disk attachment
+            if ! govc vm.info -json "$node" | jq -e '.VirtualMachines[0].Config.Hardware.Device[] | select(.Backing.FileName? and (.Backing.FileName | contains("dedicated_etcd_disk")))' > /dev/null; then
+              log_error "Disk verification failed for $node"
+              return 1
+            fi
+            log_info "PASS - Disk attachment verified"
+            
+            return 0
+          }
+          
+          # Create and attach disks for all master nodes
+          log_section "Creating and Attaching Disks to Master Nodes"
+          
+          for master in "$masterVM1" "$masterVM2" "$masterVM3"; do
+            if ! create_and_attach_disk "$master"; then
+              log_error "Failed to setup disk for $master"
+              exit 1
+            fi
+            log_info "Successfully completed disk setup for $master"
+            echo ""
+          done
+          
+          log_info "PASS - All disks created and attached successfully"
+          
+          # Wait for disks to be recognized by the OS
+          log_info "Waiting 30 seconds for OS to recognize new disks..."
+          sleep 30
+          
+          # Create etcd-find-secondary-device.sh script
+          log_section "Creating Device Discovery Script"
+          cat > /tmp/etcd-find-secondary-device.sh <<'EOF_DEVICE_SCRIPT'
+          #!/bin/bash
+          
+          # Find the device with the specific size (200GB in this case)
+          EXPECTED_SIZE_BYTES=$((200 * 1024 * 1024 * 1024))
+          TOLERANCE=$((10 * 1024 * 1024 * 1024))
+          
+          for device in /dev/sd*; do
+            if [[ ! "$device" =~ [0-9]$ ]] && [[ -b "$device" ]]; then
+              size=$(blockdev --getsize64 "$device" 2>/dev/null || echo 0)
+              diff=$((size > EXPECTED_SIZE_BYTES ? size - EXPECTED_SIZE_BYTES : EXPECTED_SIZE_BYTES - size))
+              
+              if [[ $diff -lt $TOLERANCE ]]; then
+                if ! mount | grep -q "$device" && ! pvdisplay "$device" &>/dev/null; then
+                  echo "$device"
+                  exit 0
+                fi
+              fi
+            fi
+          done
+          
+          exit 1
+          EOF_DEVICE_SCRIPT
+          
+          chmod +x /tmp/etcd-find-secondary-device.sh
+          log_info "PASS - Device discovery script created"
+          
+          # Encode the script to base64
+          SCRIPT_B64=$(base64 -w0 /tmp/etcd-find-secondary-device.sh)
+          
+          # Create and apply MachineConfig for etcd disk
+          log_section "Creating MachineConfig for etcd Disk"
+          cat > /tmp/etcd-mc.yaml <<EOF_MACHINECONFIG
+          apiVersion: machineconfiguration.openshift.io/v1
+          kind: MachineConfig
+          metadata:
+            labels:
+              machineconfiguration.openshift.io/role: master
+            name: 98-etcd-devices
+          spec:
+            config:
+              ignition:
+                version: 3.2.0
+              systemd:
+                units:
+                - contents: |
+                    [Unit]
+                    Description=Make etcd filesystem on secondary disk
+                    DefaultDependencies=no
+                    After=local-fs-pre.target
+                    Before=local-fs.target
+                    ConditionPathExists=!/var/lib/etcd_migrated
+                    
+                    [Service]
+                    Type=oneshot
+                    RemainAfterExit=yes
+                    ExecStart=/usr/local/bin/etcd-find-secondary-device.sh
+                    ExecStart=/usr/sbin/mkfs.xfs -L etcd-secondary -f \$(cat /tmp/etcd-device)
+                    ExecStart=/bin/touch /var/lib/etcd_migrated
+                    
+                    [Install]
+                    RequiredBy=local-fs.target
+                  enabled: true
+                  name: etcd-format.service
+                - contents: |
+                    [Unit]
+                    Description=Mount etcd filesystem
+                    Before=local-fs.target
+                    Requires=etcd-format.service
+                    After=etcd-format.service
+                    
+                    [Mount]
+                    What=/dev/disk/by-label/etcd-secondary
+                    Where=/var/lib/etcd
+                    Type=xfs
+                    Options=defaults,prjquota
+                    
+                    [Install]
+                    RequiredBy=local-fs.target
+                  enabled: true
+                  name: var-lib-etcd.mount
+              storage:
+                files:
+                - contents:
+                    source: data:text/plain;charset=utf-8;base64,$SCRIPT_B64
+                  mode: 0755
+                  overwrite: true
+                  path: /usr/local/bin/etcd-find-secondary-device.sh
+          EOF_MACHINECONFIG
+          
+          log_info "Applying MachineConfig..."
+          if ! oc apply -f /tmp/etcd-mc.yaml; then
+            log_error "Failed to apply MachineConfig"
+            exit 1
+          fi
+          log_info "PASS - MachineConfig applied successfully"
+          
+          # Monitor MachineConfig rollout
+          log_section "Monitoring MachineConfig Rollout"
+          log_warn "This may take 15-30 minutes per node"
+          
+          check_mcp_status() {
+            local updated=$(oc get mcp master -o jsonpath='{.status.updatedMachineCount}')
+            local total=$(oc get mcp master -o jsonpath='{.status.machineCount}')
+            local degraded=$(oc get mcp master -o jsonpath='{.status.degradedMachineCount}')
+            local updating=$(oc get mcp master -o jsonpath='{.status.updatingMachineCount}')
+            
+            log_info "Status: Updated=$updated/$total, Updating=$updating, Degraded=$degraded"
+            
+            if [[ "$degraded" -gt 0 ]]; then
+              log_error "MachineConfigPool is degraded"
+              return 2
+            fi
+            
+            if [[ "$updated" -eq "$total" ]]; then
+              return 0
+            fi
+            
+            return 1
+          }
+          
+          timeout=3600
+          elapsed=0
+          interval=30
+          
+          while [[ $elapsed -lt $timeout ]]; do
+            status_result=0
+            check_mcp_status || status_result=$?
+            
+            if [[ $status_result -eq 0 ]]; then
+              log_info "PASS - All master nodes updated successfully"
+              break
+            elif [[ $status_result -eq 2 ]]; then
+              log_error "MachineConfigPool degraded, aborting"
+              exit 1
+            fi
+            
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
+          
+          if [[ $elapsed -ge $timeout ]]; then
+            log_error "Timeout waiting for MachineConfig rollout"
+            exit 1
+          fi
+          
+          # Wait for cluster stabilization
+          log_info "Waiting for cluster to stabilize..."
+          sleep 120
+          
+          # Verify etcd is using new disk
+          log_section "Verifying etcd Disk Migration"
+          
+          verify_etcd_mount() {
+            local node=$1
+            log_info "Verifying $node..."
+            
+            # Check mount point
+            local mount_check=$(oc debug "node/$node" --quiet -- chroot /host df -h /var/lib/etcd 2>/dev/null | grep '/dev/sd' || echo "")
+            if [[ -z "$mount_check" ]]; then
+              log_error "etcd not mounted on dedicated disk for $node"
+              return 1
+            fi
+            
+            # Check filesystem type
+            local fs_check=$(oc debug "node/$node" --quiet -- chroot /host mount 2>/dev/null | grep '/var/lib/etcd' | grep 'xfs' || echo "")
+            if [[ -z "$fs_check" ]]; then
+              log_error "etcd filesystem is not xfs on $node"
+              return 1
+            fi
+            
+            # Check disk label
+            local label_check=$(oc debug "node/$node" --quiet -- chroot /host blkid 2>/dev/null | grep 'etcd-secondary' || echo "")
+            if [[ -z "$label_check" ]]; then
+              log_warn "Could not verify disk label on $node"
+            fi
+            
+            log_info "PASS - $node verified successfully"
+            return 0
+          }
+          
+          all_verified=true
+          for master in "$masterVM1" "$masterVM2" "$masterVM3"; do
+            if ! verify_etcd_mount "$master"; then
+              all_verified=false
+            fi
+          done
+          
+          if [[ "$all_verified" != "true" ]]; then
+            log_error "Verification failed for one or more nodes"
+            exit 1
+          fi
+          
+          # Final etcd health check
+          log_section "Final etcd Health Verification"
+          
+          log_info "Checking etcd cluster operator status..."
+          etcd_available=$(oc get co etcd -o jsonpath='{.status.conditions[?(@.type=="Available")].status}')
+          etcd_degraded=$(oc get co etcd -o jsonpath='{.status.conditions[?(@.type=="Degraded")].status}')
+          etcd_progressing=$(oc get co etcd -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}')
+          
+          if [[ "$etcd_available" != "True" ]]; then
+            log_error "etcd cluster operator is not available"
+            exit 1
+          fi
+          
+          if [[ "$etcd_degraded" != "False" ]]; then
+            log_error "etcd cluster operator is degraded"
+            exit 1
+          fi
+          
+          log_info "PASS - etcd cluster operator is healthy"
+          log_info "  Available: $etcd_available"
+          log_info "  Degraded: $etcd_degraded"
+          log_info "  Progressing: $etcd_progressing"
+          
+          # Check etcd pod health
+          log_info "Checking etcd pod health..."
+          etcd_pods=$(oc get pods -n openshift-etcd -l app=etcd --no-headers 2>/dev/null | wc -l)
+          etcd_running=$(oc get pods -n openshift-etcd -l app=etcd --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+          
+          if [[ "$etcd_pods" -ne "$etcd_running" ]]; then
+            log_error "Not all etcd pods are running ($etcd_running/$etcd_pods)"
+            exit 1
+          fi
+          
+          log_info "PASS - All $etcd_pods etcd pods are running"
+          
+          # Check etcd endpoints
+          log_info "Checking etcd member list..."
+          etcd_pod=$(oc get pods -n openshift-etcd -l app=etcd -o name 2>/dev/null | head -1)
+          
+          if [[ -n "$etcd_pod" ]]; then
+            member_list=$(oc rsh -n openshift-etcd "$etcd_pod" etcdctl member list -w table 2>/dev/null || echo "")
+            if [[ -n "$member_list" ]] && echo "$member_list" | grep -q "started"; then
+              log_info "PASS - etcd members verified"
+              echo "$member_list"
+            else
+              log_error "Failed to verify etcd members"
+              exit 1
+            fi
+          else
+            log_error "Could not find etcd pod"
+            exit 1
+          fi
+          
+          # Display disk usage
+          log_section "Disk Usage Summary"
+          for master in "$masterVM1" "$masterVM2" "$masterVM3"; do
+            log_info "Disk usage for $master:"
+            oc debug "node/$master" --quiet -- chroot /host df -h /var/lib/etcd 2>/dev/null || log_warn "Could not get disk usage for $master"
+          done
+          
+          log_section "etcd Disk Migration Completed Successfully"
+          log_info "Next steps:"
+          log_info "1. Monitor etcd performance using Grafana dashboard"
+          log_info "2. Run FIO performance tests to verify disk performance"
+          log_info "3. Keep this Job manifest for documentation"
+          log_info "4. Consider creating a backup of the MachineConfig"
+          
+          exit 0
+        
+        workingDir: /tmp
+        env:
+        - name: vcnServer
+          valueFrom:
+            secretKeyRef:
+              key: server
+              name: vsphere-creds
+        - name: vcnDatacenter
+          valueFrom:
+            secretKeyRef:
+              key: datacenter
+              name: vsphere-creds
+        - name: vcnUser
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: vsphere-creds
+        - name: vcnPwd
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: vsphere-creds
+      restartPolicy: Never
+      serviceAccountName: etcd-migration-sa
+  backoffLimit: 1
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-migration-sa
+  namespace: openshift-etcd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: etcd-migration-sa-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: etcd-migration-sa
+  namespace: openshift-etcd
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vsphere-creds
+  namespace: openshift-etcd
+type: Opaque
+stringData:
+  server: "vcenter.example.com"
+  datacenter: "DC1"
+  username: "administrator@vsphere.local"
+  password: "CHANGEME"
+
+
+
+
+
 ####performance
 
 #!/bin/bash
