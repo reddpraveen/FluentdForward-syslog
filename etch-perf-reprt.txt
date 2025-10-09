@@ -270,29 +270,29 @@ main() {
   {
     echo "=== etcd Performance Benchmark Summary ==="
     echo "Date: $(date)"
-    echo "OpenShift Version: $(oc version -o json | jq -r .serverVersion.gitVersion)"
-    echo "Test Duration: $(( ( $(date +%s) - $(date -d @"$(stat -c %Y "$log_file")" +%s) )) seconds"
+    echo "OpenShift Version: $(oc version -o json | jq -r .serverVersion.gitVersion 2>/dev/null || echo "Unknown")"
+    echo "Test Duration: $(( ( $(date +%s) - $(stat -c %Y "$log_file" 2>/dev/null || echo "$(date +%s)") ) )) seconds"
     echo "Results Directory: $RESULTS_DIR"
     echo "========================================"
     echo
     
     # FIO results summary
     echo "=== Disk Performance ==="
-    find "$RESULTS_DIR" -name "fio_*.json" | while read -r f; do
+    find "$RESULTS_DIR" -name "fio_*.json" 2>/dev/null | while read -r f; do
       local node_test
       node_test=$(basename "$f" .json | sed 's/fio_//')
       local iops
-      iops=$(jq -r '.jobs[0].write.iops // 0' "$f")
+      iops=$(jq -r '.jobs[0].write.iops // 0' "$f" 2>/dev/null || echo "0")
       local lat
-      lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f")
-      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}") # Convert ns to ms
+      lat=$(jq -r '.jobs[0].write.lat_ns.mean // 0' "$f" 2>/dev/null || echo "0")
+      lat=$(awk "BEGIN {printf \"%.2f\", $lat/1000000}" 2>/dev/null || echo "0.00")
       
       printf "%-40s: IOPS=%8.2f, Latency=%6.2fms\n" "$node_test" "$iops" "$lat"
     done
     
     # etcd status summary
     echo -e "\n=== etcd Cluster Status ==="
-    grep -A 10 "etcdctl member list" "$status_file" | tail -n +2
+    grep -A 10 "etcdctl member list" "$status_file" 2>/dev/null | tail -n +2 || echo "Status information not available"
   } > "$summary_file"
   
   log_info "Benchmark completed successfully!"
