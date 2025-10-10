@@ -1,4 +1,39 @@
-        volumeMounts:
+Steps to Correct the Disk Attachments:
+1. First, identify which disks were wrongly attached
+bash# Check what disks are on each VM
+govc vm.info -json $masterVM1 | jq '.VirtualMachines[].Config.Hardware.Device[] | select(.Backing.FileName? | contains("dedicated_etcd"))'
+govc vm.info -json $masterVM2 | jq '.VirtualMachines[].Config.Hardware.Device[] | select(.Backing.FileName? | contains("dedicated_etcd"))'
+govc vm.info -json $masterVM3 | jq '.VirtualMachines[].Config.Hardware.Device[] | select(.Backing.FileName? | contains("dedicated_etcd"))'
+
+# Or simpler - list all disks
+govc device.ls -vm $masterVM1 | grep disk
+govc device.ls -vm $masterVM2 | grep disk
+govc device.ls -vm $masterVM3 | grep disk
+2. Remove the incorrectly attached disks from VM2 and VM3
+bash# For VM2 - find the disk device name first
+govc device.info -vm $masterVM2 disk-* | grep -A5 "dedicated_etcd"
+
+# Remove the wrong disk from VM2 (keep the VMDK file, don't delete it yet)
+govc device.remove -vm $masterVM2 -keep=true disk-1000-1
+
+# For VM3 - same process
+govc device.info -vm $masterVM3 disk-* | grep -A5 "dedicated_etcd"
+
+# Remove the wrong disk from VM3
+govc device.remove -vm $masterVM3 -keep=true disk-1000-1
+3. Delete the incorrectly created VMDK files
+bash# List the incorrect VMDKs in the datastore
+govc datastore.ls "[${vcnDatastore}] ${ID}/"
+
+# Delete the wrong VMDK files for VM2 and VM3
+govc datastore.rm "[${vcnDatastore}] ${ID}/master-0_dedicated_etcd_disk.vmdk"
+# (This was meant for VM1 but might have been used for VM2/VM3)
+
+
+
+
+
+volumeMounts:
         - name: machineconfig
           mountPath: /etc/machineconfig
           readOnly: true
