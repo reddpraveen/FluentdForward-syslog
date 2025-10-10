@@ -1,3 +1,30 @@
+        volumeMounts:
+        - name: machineconfig
+          mountPath: /etc/machineconfig
+          readOnly: true
+        env:
+        - name: vcnServer
+          valueFrom:
+            secretKeyRef:
+              key: server
+              name: vsphere-creds
+        - name: vcnUser
+          valueFrom:
+            secretKeyRef:
+              key: username
+              name: vsphere-creds
+        - name: vcnPwd
+          valueFrom:
+            secretKeyRef:
+              key: password
+              name: vsphere-creds
+      volumes:
+      - name: machineconfig
+        configMap:
+          name: etcd-machineconfig
+      restartPolicy: Never
+      serviceAccountName: etcd-migration-sa
+
 
 apiVersion: v1
 kind: ConfigMap
