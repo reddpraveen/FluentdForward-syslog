@@ -1,3 +1,16 @@
+for node in $(oc get nodes -l node-role.kubernetes.io/master -o name); do
+  echo "========================================="
+  echo "Node: $node"
+  echo "========================================="
+  echo "--- lsblk ---"
+  oc debug $node -- chroot /host lsblk
+  echo ""
+  echo "--- df -h /var/lib/etcd ---"
+  oc debug $node -- chroot /host df -h /var/lib/etcd
+  echo ""
+done
+
+
 Steps to Correct the Disk Attachments:
 1. First, identify which disks were wrongly attached
 bash# Check what disks are on each VM
