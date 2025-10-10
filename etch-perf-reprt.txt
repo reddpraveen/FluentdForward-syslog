@@ -1,3 +1,32 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-machineconfig
+  namespace: openshift-etcd
+data:
+  98-var-lib-etcd.yaml: |
+    apiVersion: machineconfiguration.openshift.io/v1
+    kind: MachineConfig
+    metadata:
+      labels:
+        machineconfiguration.openshift.io/role: master
+      name: 98-var-lib-etcd
+
+          if [[ ! -f /etc/machineconfig/98-var-lib-etcd.yaml ]]; then
+            log_error "MachineConfig file not found in ConfigMap mount"
+            exit 1
+          fi
+
+          log_info "Applying MachineConfig from ConfigMap..."
+          oc apply -f /etc/machineconfig/98-var-lib-etcd.yaml || { log_error "Failed to apply MachineConfig"; exit 1; }
+          log_info "PASS - MachineConfig applied"
+          
+          log_section "Monitoring MachineConfig Rollout"
+          log_warn "This may take 15-30 minutes per node"
+
+
+
 #!/bin/bash
 set -euo pipefail
 
