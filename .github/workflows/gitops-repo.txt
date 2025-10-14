@@ -1,3 +1,6 @@
+            if $GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' > target_branches.txt; then
+
+
 name: GitHub Enterprise Repository Management
 
 on:
