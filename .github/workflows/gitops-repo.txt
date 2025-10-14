@@ -1,4 +1,54 @@
-            if $GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' > target_branches.txt; then
+
+
+
+          echo "Source branches found: $(cat source_branches.txt | tr '\n' ' ')"
+          
+          # Get target branches with retry using absolute path
+          echo "Using gh command: $GH_CMD"
+          echo "Verifying gh is still accessible: $($GH_CMD --version | head -n1)"
+          echo "Target repo full path: ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching target branches attempt $attempt/$max_attempts"
+            
+            # Capture both stdout and stderr for debugging
+            if output=$($GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' 2>&1); then
+              echo "$output" > target_branches.txt
+              echo "Target branches fetched successfully"
+              break
+            else
+              echo "ERROR: Failed to fetch target branches (attempt $attempt/$max_attempts)"
+              echo "GH_CMD variable: $GH_CMD"
+              echo "Error output: $output"
+              echo "Testing direct execution: $($GH_CMD --version 2>&1 || echo 'FAILED')"
+              
+              # Check if it's an authentication issue
+              if echo "$output" | grep -q "authentication\|401\|403"; then
+                echo "Authentication issue detected, re-authenticating..."
+                if [ "$GH_HOST" = "github.com" ]; then
+                  echo "$GH_TOKEN" | $GH_CMD auth login --with-token
+                else
+                  echo "$GH_TOKEN" | $GH_CMD auth login --hostname "$GH_HOST" --with-token
+                fi
+              fi
+              
+              # Check if repository doesn't exist yet or has no branches
+              if echo "$output" | grep -q "404\|Not Found\|empty repository"; then
+                echo "Repository may be empty or newly created, creating empty file"
+                touch target_branches.txt
+                break
+              fi
+              
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch target branches after $max_attempts attempts"
+                echo "Final error: $output"
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+
+if $GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' > target_branches.txt; then
 
 
 name: GitHub Enterprise Repository Management
