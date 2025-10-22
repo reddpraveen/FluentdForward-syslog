@@ -1,0 +1,499 @@
+# Setup Guide - RHDH Container Image Builder
+
+## Overview
+
+This template creates a GitHub repository with:
+- **Dockerfile** - Builds container with your chosen tools (oc, kubectl, ansible, etc.)
+- **GitHub Actions** - Builds and pushes image automatically
+- **OpenShift Deployment** - Deploys the image to your cluster
+- **AAP Integration** - (Optional) Pushes to Automation Hub as Execution Environment
+
+**No Tekton Required** - Everything runs on GitHub Actions runners.
+
+---
+
+## Prerequisites
+
+### 1. RHDH Access
+- Red Hat Developer Hub installed
+- Access to create components
+
+### 2. GitHub Enterprise
+- Organization/team access
+- Ability to create repositories
+- Admin access to set secrets
+
+### 3. OpenShift Cluster
+- Cluster access with admin rights
+- Namespace created or ability to create one
+
+### 4. Container Registry
+- Quay.io or GitHub Container Registry account
+- Robot account (Quay) or Personal Access Token (GitHub)
+
+### 5. AAP 2.6 (Optional)
+- Access to Automation Hub
+- Credentials to push execution environments
+
+---
+
+## Step 1: Install Template in RHDH
+
+### Option A: Direct URL Registration
+
+1. Copy the template YAML (the first artifact above)
+2. Save it to your template repository as `template.yaml`
+3. In RHDH, go to **Create** → **Register Existing Component**
+4. Enter: `https://github.example.com/your-org/templates/blob/main/container-builder/template.yaml`
+5. Click **Import**
+
+### Option B: Add to Catalog Configuration
+
+Edit your RHDH `app-config.yaml`:
+
+```yaml
+catalog:
+  locations:
+    - type: url
+      target: https://github.example.com/your-org/templates/blob/main/container-builder/template.yaml
+      rules:
+        - allow: [Template]
+```
+
+---
+
+## Step 2: Prepare GitHub Secrets
+
+You need to set up organization-level secrets that all repositories can use.
+
+### Get OpenShift Token
+
+```bash
+# Create namespace
+oc create namespace utility-images
+
+# Create service account
+oc create sa github-actions -n utility-images
+
+# Grant permissions
+oc adm policy add-cluster-role-to-user edit \
+  system:serviceaccount:utility-images:github-actions
+
+# Create long-lived token (1 year)
+oc create token github-actions -n utility-images --duration=8760h
+```
+
+Copy the token output.
+
+### Get Registry Credentials
+
+**For Quay.io:**
+```bash
+# Create robot account in Quay UI:
+# 1. Go to your organization
+# 2. Click "Robot Accounts" → "Create Robot Account"
+# 3. Name: github-actions
+# 4. Grant: Write to repositories
+# 5. Copy username (e.g., myorg+github-actions) and token
+```
+
+**For GitHub Container Registry:**
+```bash
+# Create Personal Access Token:
+# 1. GitHub Settings → Developer Settings → Personal Access Tokens
+# 2. Generate new token (classic)
+# 3. Scopes: write:packages, read:packages
+# 4. Username: your GitHub username
+# 5. Password: the token
+```
+
+### Set GitHub Secrets
+
+```bash
+# Using GitHub CLI (recommended)
+gh secret set OPENSHIFT_SERVER --org your-org --body "https://api.cluster.example.com:6443"
+gh secret set OPENSHIFT_TOKEN --org your-org --body "sha256~xxxxx"
+gh secret set REGISTRY_USERNAME --org your-org --body "myorg+github-actions"
+gh secret set REGISTRY_PASSWORD --org your-org --body "your-token"
+
+# For AAP (optional)
+gh secret set AAP_HUB_USERNAME --org your-org --body "admin"
+gh secret set AAP_HUB_PASSWORD --org your-org --body "your-password"
+```
+
+**Or via GitHub UI:**
+1. Go to Organization Settings → Secrets and variables → Actions
+2. Click "New organization secret"
+3. Add each secret listed above
+
+---
+
+## Step 3: Create Your First Image
+
+### In RHDH:
+
+1. Click **Create** button
+2. Select: **"Container Image Builder - GitHub Actions + OpenShift + AAP"**
+
+### Fill in the Form:
+
+**Project Information:**
+- Component Name: `ansible-utility`
+- Description: `Utility image with Ansible, oc, and kubectl`
+- Owner: Select your team
+
+**GitHub Configuration:**
+- GitHub Organization: `platform-team`
+- Repository Name: `ansible-utility`
+
+**Container Configuration:**
+- Base Image: `registry.access.redhat.com/ubi9/ubi:latest`
+- Container Registry: `quay.io`
+- Registry Namespace: `myorg` (your Quay organization)
+- Tools: Check `oc`, `kubectl`, `ansible`
+
+**OpenShift Configuration:**
+- OpenShift API Server: `https://api.cluster.example.com:6443`
+- Namespace: `utility-images`
+
+**AAP Integration:**
+- Enable AAP: `No` (start simple, add later)
+
+### Click "Create"
+
+RHDH will:
+1. Create GitHub repository
+2. Add all necessary files
+3. Trigger first build automatically
+
+---
+
+## Step 4: Monitor the Build
+
+### Check GitHub Actions:
+
+```bash
+# Using GitHub CLI
+gh run list --repo platform-team/ansible-utility
+
+# Watch live
+gh run watch --repo platform-team/ansible-utility
+```
+
+### Or via UI:
+1. Go to repository: `https://github.example.com/platform-team/ansible-utility`
+2. Click **Actions** tab
+3. Watch the workflow progress
+
+### Expected Steps:
+```
+✓ Build & Push Image       (2-5 minutes)
+✓ Test Image              (1 minute)
+✓ Deploy to OpenShift     (1 minute)
+```
+
+---
+
+## Step 5: Verify Deployment
+
+### Check the Image:
+
+```bash
+# Login to registry
+podman login quay.io
+
+# Pull the image
+podman pull quay.io/myorg/ansible-utility:latest
+
+# Test it locally
+podman run --rm quay.io/myorg/ansible-utility:latest oc version --client
+podman run --rm quay.io/myorg/ansible-utility:latest kubectl version --client
+podman run --rm quay.io/myorg/ansible-utility:latest ansible --version
+
+# Interactive shell
+podman run --rm -it quay.io/myorg/ansible-utility:latest bash
+```
+
+### Check OpenShift:
+
+```bash
+# Switch to namespace
+oc project utility-images
+
+# Check deployment
+oc get deployment ansible-utility
+oc get pods -l app=ansible-utility
+
+# View deployment details
+oc describe deployment ansible-utility
+
+# Test in OpenShift
+oc run test-pod --image=quay.io/myorg/ansible-utility:latest --rm -it -- bash
+```
+
+Inside the pod, verify tools work:
+```bash
+oc version --client
+kubectl version --client
+ansible --version
+```
+
+---
+
+## Step 6: Use Your Image
+
+### As a Job in OpenShift:
+
+```yaml
+# Save as ansible-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: run-ansible-playbook
+  namespace: utility-images
+spec:
+  template:
+    spec:
+      serviceAccountName: ansible-sa  # Create with needed permissions
+      containers:
+      - name: ansible
+        image: quay.io/myorg/ansible-utility:latest
+        command:
+          - ansible-playbook
+          - /path/to/playbook.yml
+      restartPolicy: Never
+```
+
+Apply:
+```bash
+oc apply -f ansible-job.yaml
+oc logs job/run-ansible-playbook -n utility-images
+```
+
+### As a CronJob:
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-automation
+  namespace: utility-images
+spec:
+  schedule: "0 2 * * *"  # 2 AM daily
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: automation
+            image: quay.io/myorg/ansible-utility:latest
+            command: ["/home/automation/scripts/daily-tasks.sh"]
+          restartPolicy: OnFailure
+```
+
+---
+
+## Step 7: Add AAP Integration (Optional)
+
+If you want to use the image in Ansible Automation Platform:
+
+### Enable AAP in Template:
+
+When creating a new image through RHDH, enable AAP integration and provide:
+- Automation Hub URL (usually your Quay.io or private hub)
+- Execution Environment Name
+
+### Or Manually Push:
+
+```bash
+# Tag for AAP
+podman tag quay.io/myorg/ansible-utility:latest \
+  quay.io/ansible-hub/ansible-utility-ee:latest
+
+# Login to Automation Hub
+podman login quay.io/ansible-hub
+
+# Push
+podman push quay.io/ansible-hub/ansible-utility-ee:latest
+```
+
+### Register in AAP Controller:
+
+1. Login to AAP Controller UI
+2. Go to **Administration** → **Execution Environments**
+3. Click **Add**
+4. Fill in:
+   - Name: `Ansible Utility EE`
+   - Image: `quay.io/ansible-hub/ansible-utility-ee:latest`
+   - Pull: `Always`
+   - Organization: Select your org
+5. Click **Save**
+
+### Use in Job Template:
+
+1. Go to **Resources** → **Templates** → **Add** → **Job Template**
+2. Select your new Execution Environment
+3. The job will now run with your custom tools available
+
+---
+
+## Customization Examples
+
+### Add More Tools:
+
+Edit the Dockerfile in your repository:
+
+```dockerfile
+# Add awscli
+RUN pip3 install --no-cache-dir awscli && \
+    aws --version
+
+# Add gcloud
+RUN curl https://sdk.cloud.google.com | bash && \
+    ln -s /root/google-cloud-sdk/bin/gcloud /usr/local/bin/
+```
+
+Commit and push - GitHub Actions will rebuild automatically.
+
+### Add Custom Scripts:
+
+```bash
+# In your repo
+mkdir scripts
+cat > scripts/deploy-app.sh << 'EOF'
+#!/bin/bash
+oc apply -f /manifests/deployment.yaml
+oc rollout status deployment/myapp
+EOF
+
+chmod +x scripts/deploy-app.sh
+git add scripts/
+git commit -m "Add deployment script"
+git push
+```
+
+The script will be at `/home/automation/scripts/deploy-app.sh` in the image.
+
+### Add Ansible Playbooks:
+
+```bash
+mkdir -p playbooks/roles
+cat > playbooks/deploy.yml << 'EOF'
+---
+- name: Deploy Application
+  hosts: localhost
+  tasks:
+    - name: Apply Kubernetes manifests
+      kubernetes.core.k8s:
+        src: /manifests/app.yaml
+        state: present
+EOF
+
+git add playbooks/
+git commit -m "Add Ansible playbook"
+git push
+```
+
+---
+
+## Troubleshooting
+
+### Build Fails
+
+**Check logs:**
+```bash
+gh run view --repo platform-team/ansible-utility --log-failed
+```
+
+**Common issues:**
+- Invalid Dockerfile syntax → Test locally: `podman build -t test .`
+- Registry auth failed → Check `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`
+- Base image not accessible → Verify base image exists
+
+### Deployment Fails
+
+**Check OpenShift token:**
+```bash
+# Test token manually
+oc login --token=<your-token> --server=https://api.cluster.example.com:6443
+```
+
+**Check namespace:**
+```bash
+# Ensure namespace exists
+oc get namespace utility-images
+
+# If not, create it
+oc create namespace utility-images
+```
+
+### Image Pull Errors in OpenShift
+
+**Make registry public** (Quay.io):
+1. Go to repository settings
+2. Change visibility to Public
+
+**Or create pull secret:**
+```bash
+oc create secret docker-registry quay-pull-secret \
+  --docker-server=quay.io \
+  --docker-username='myorg+github-actions' \
+  --docker-password='token' \
+  -n utility-images
+
+oc secrets link default quay-pull-secret --for=pull -n utility-images
+```
+
+---
+
+## Best Practices
+
+1. **Use Specific Tags**: Reference images by SHA, not just `latest`
+2. **Test Locally First**: Always test with `podman build` before pushing
+3. **Minimal Images**: Only install tools you need
+4. **Update Regularly**: Rebuild monthly for security patches
+5. **Service Accounts**: Use proper RBAC in OpenShift
+6. **Secrets Management**: Rotate tokens quarterly
+7. **Documentation**: Update README when adding tools
+
+---
+
+## Next Steps
+
+- [ ] Create service accounts in OpenShift with proper RBAC
+- [ ] Add health check scripts
+- [ ] Set up monitoring/alerting for failed builds
+- [ ] Create reusable Ansible playbooks
+- [ ] Configure AAP job templates
+- [ ] Add more tools as needed
+- [ ] Set up scheduled image rebuilds
+
+---
+
+## Quick Reference
+
+### Image Location
+```
+quay.io/myorg/ansible-utility:latest
+quay.io/myorg/ansible-utility:<git-sha>
+```
+
+### Common Commands
+```bash
+# Trigger manual build
+gh workflow run build-deploy.yaml --repo platform-team/ansible-utility
+
+# View latest run
+gh run list --repo platform-team/ansible-utility --limit 1
+
+# Pull and test
+podman pull quay.io/myorg/ansible-utility:latest
+podman run --rm -it quay.io/myorg/ansible-utility:latest bash
+
+# Deploy to OpenShift
+oc run test --image=quay.io/myorg/ansible-utility:latest --rm -it -- bash
+```
+
+---
+
+**That's it! You now have a fully automated container image builder with OpenShift deployment.** 🚀
