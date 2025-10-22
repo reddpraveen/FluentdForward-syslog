@@ -1,0 +1,478 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: container-image-builder-simple
+  title: Container Image Builder - GitHub Actions + OpenShift + AAP
+  description: Build container images from Dockerfiles using GitHub Actions, deploy to OpenShift, and optionally push to AAP 2.6
+  tags:
+    - container
+    - docker
+    - openshift
+    - ansible
+    - github-actions
+spec:
+  owner: platform-team
+  type: service
+  
+  parameters:
+    - title: Project Information
+      required:
+        - component_id
+        - description
+        - owner
+      properties:
+        component_id:
+          title: Component Name
+          type: string
+          description: Unique name for your container image
+          pattern: '^[a-z0-9-]+$'
+          ui:autofocus: true
+        description:
+          title: Description
+          type: string
+          description: What does this container image do?
+        owner:
+          title: Owner
+          type: string
+          description: Team or individual owner
+          ui:field: OwnerPicker
+    
+    - title: GitHub Configuration
+      required:
+        - github_org
+        - repo_name
+      properties:
+        github_org:
+          title: GitHub Organization
+          type: string
+          description: Your GitHub Enterprise organization
+        repo_name:
+          title: Repository Name
+          type: string
+          pattern: '^[a-z0-9-]+$'
+    
+    - title: Container Configuration
+      required:
+        - base_image
+        - image_registry
+        - image_namespace
+      properties:
+        base_image:
+          title: Base Image
+          type: string
+          default: registry.access.redhat.com/ubi9/ubi:latest
+          enum:
+            - registry.access.redhat.com/ubi9/ubi:latest
+            - registry.access.redhat.com/ubi9/ubi-minimal:latest
+            - registry.access.redhat.com/ubi8/ubi:latest
+        image_registry:
+          title: Container Registry
+          type: string
+          default: quay.io
+          enum:
+            - quay.io
+            - ghcr.io
+        image_namespace:
+          title: Registry Namespace
+          type: string
+          description: Your registry organization/namespace
+        tools_to_install:
+          title: Tools to Install
+          type: array
+          items:
+            type: string
+            enum:
+              - oc
+              - kubectl
+              - helm
+              - ansible
+              - terraform
+              - git
+              - curl
+              - jq
+          default: ['oc', 'kubectl', 'ansible']
+    
+    - title: OpenShift Configuration
+      required:
+        - openshift_server
+        - namespace
+      properties:
+        openshift_server:
+          title: OpenShift API Server
+          type: string
+          description: 'Example: https://api.cluster.example.com:6443'
+        namespace:
+          title: Namespace
+          type: string
+          pattern: '^[a-z0-9-]+$'
+    
+    - title: AAP Integration (Optional)
+      properties:
+        enable_aap:
+          title: Enable AAP Integration
+          type: boolean
+          default: false
+        aap_hub_url:
+          title: Automation Hub URL
+          type: string
+          description: 'Example: quay.io/ansible-hub or your private hub'
+          default: quay.io
+        aap_ee_name:
+          title: Execution Environment Name
+          type: string
+
+  steps:
+    - id: fetch-base
+      name: Fetch Base Template
+      action: fetch:template
+      input:
+        url: ./content
+        values:
+          component_id: ${{ parameters.component_id }}
+          description: ${{ parameters.description }}
+          owner: ${{ parameters.owner }}
+          github_org: ${{ parameters.github_org }}
+          repo_name: ${{ parameters.repo_name }}
+          base_image: ${{ parameters.base_image }}
+          image_registry: ${{ parameters.image_registry }}
+          image_namespace: ${{ parameters.image_namespace }}
+          tools: ${{ parameters.tools_to_install }}
+          openshift_server: ${{ parameters.openshift_server }}
+          namespace: ${{ parameters.namespace }}
+          enable_aap: ${{ parameters.enable_aap }}
+          aap_hub_url: ${{ parameters.aap_hub_url }}
+          aap_ee_name: ${{ parameters.aap_ee_name }}
+
+    - id: publish
+      name: Publish to GitHub
+      action: publish:github
+      input:
+        allowedHosts: ['github.example.com']
+        description: ${{ parameters.description }}
+        repoUrl: github.example.com?owner=${{ parameters.github_org }}&repo=${{ parameters.repo_name }}
+        defaultBranch: main
+        repoVisibility: internal
+
+    - id: register
+      name: Register in Catalog
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: '/catalog-info.yaml'
+
+  output:
+    links:
+      - title: Repository
+        url: ${{ steps.publish.output.remoteUrl }}
+      - title: Open in Catalog
+        icon: catalog
+        entityRef: ${{ steps.register.output.entityRef }}
+      - title: GitHub Actions
+        url: ${{ steps.publish.output.remoteUrl }}/actions
+
+---
+# This section would be in: content/catalog-info.yaml
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: ${{ values.component_id }}
+  description: ${{ values.description }}
+  annotations:
+    github.com/project-slug: ${{ values.github_org }}/${{ values.repo_name }}
+  tags:
+    - container
+{%- for tool in values.tools %}
+    - {{ tool }}
+{%- endfor %}
+  links:
+    - url: https://github.example.com/${{ values.github_org }}/${{ values.repo_name }}
+      title: Source Code
+    - url: ${{ values.image_registry }}/${{ values.image_namespace }}/${{ values.component_id }}
+      title: Container Registry
+    - url: ${{ values.openshift_server }}/k8s/ns/${{ values.namespace }}/deployments
+      title: OpenShift Console
+spec:
+  type: container-image
+  lifecycle: production
+  owner: ${{ values.owner }}
+
+---
+# This section would be in: content/Dockerfile
+FROM ${{ values.base_image }}
+
+LABEL maintainer="${{ values.owner }}" \
+      description="${{ values.description }}"
+
+USER root
+
+# Install base tools
+RUN dnf install -y python3 python3-pip git curl wget jq tar && dnf clean all
+
+{%- if 'ansible' in values.tools %}
+# Install Ansible
+RUN pip3 install --no-cache-dir ansible-core ansible-runner && \
+    ansible-galaxy collection install kubernetes.core ansible.posix community.general
+{%- endif %}
+
+{%- if 'oc' in values.tools %}
+# Install OpenShift CLI
+RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz | \
+    tar xzf - -C /usr/local/bin oc && chmod +x /usr/local/bin/oc
+{%- endif %}
+
+{%- if 'kubectl' in values.tools %}
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && rm kubectl
+{%- endif %}
+
+{%- if 'helm' in values.tools %}
+# Install Helm
+RUN curl -fsSL https://get.helm.sh/helm-v3.13.0-linux-amd64.tar.gz | \
+    tar xzf - linux-amd64/helm --strip-components=1 && \
+    mv helm /usr/local/bin/ && chmod +x /usr/local/bin/helm
+{%- endif %}
+
+{%- if 'terraform' in values.tools %}
+# Install Terraform
+RUN curl -fsSL https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip -o terraform.zip && \
+    unzip terraform.zip -d /usr/local/bin && rm terraform.zip && chmod +x /usr/local/bin/terraform
+{%- endif %}
+
+# Create non-root user
+RUN useradd -m -u 1001 -g 0 automation && \
+    mkdir -p /home/automation/{.kube,playbooks,scripts} && \
+    chown -R 1001:0 /home/automation && \
+    chmod -R g=u /home/automation
+
+WORKDIR /home/automation
+USER 1001
+
+CMD ["/bin/bash"]
+
+---
+# This section would be in: content/.github/workflows/build-deploy.yaml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ${{ values.component_id }}
+  IMAGE_REGISTRY: ${{ values.image_registry }}
+  IMAGE_NAMESPACE: ${{ values.image_namespace }}
+  OPENSHIFT_NAMESPACE: ${{ values.namespace }}
+
+jobs:
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.build.outputs.image }}:${{ steps.build.outputs.tags }}
+      
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Image
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          tags: latest ${{ github.sha }}
+          containerfiles: ./Dockerfile
+
+      - name: Login to Registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Push to Registry
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAMESPACE }}
+
+  test-image:
+    name: Test Image
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    
+    steps:
+      - name: Login to Registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Test Tools
+        run: |
+          IMAGE="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${GITHUB_SHA}"
+          echo "Testing: $IMAGE"
+          
+{%- if 'oc' in values.tools %}
+          podman run --rm $IMAGE oc version --client
+{%- endif %}
+{%- if 'kubectl' in values.tools %}
+          podman run --rm $IMAGE kubectl version --client
+{%- endif %}
+{%- if 'ansible' in values.tools %}
+          podman run --rm $IMAGE ansible --version
+{%- endif %}
+{%- if 'helm' in values.tools %}
+          podman run --rm $IMAGE helm version
+{%- endif %}
+{%- if 'terraform' in values.tools %}
+          podman run --rm $IMAGE terraform version
+{%- endif %}
+          
+          echo "✓ All tools verified"
+
+  deploy-openshift:
+    name: Deploy to OpenShift
+    runs-on: ubuntu-latest
+    needs: test-image
+    
+    steps:
+      - name: Install oc CLI
+        uses: redhat-actions/openshift-tools-installer@v1
+        with:
+          oc: latest
+
+      - name: Login to OpenShift
+        uses: redhat-actions/oc-login@v1
+        with:
+          openshift_server_url: ${{ secrets.OPENSHIFT_SERVER }}
+          openshift_token: ${{ secrets.OPENSHIFT_TOKEN }}
+          insecure_skip_tls_verify: true
+
+      - name: Deploy
+        run: |
+          IMAGE="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${GITHUB_SHA}"
+          
+          if oc get deployment ${IMAGE_NAME} -n ${OPENSHIFT_NAMESPACE} 2>/dev/null; then
+            echo "Updating deployment..."
+            oc set image deployment/${IMAGE_NAME} ${IMAGE_NAME}=${IMAGE} -n ${OPENSHIFT_NAMESPACE}
+          else
+            echo "Creating deployment..."
+            oc create deployment ${IMAGE_NAME} --image=${IMAGE} -n ${OPENSHIFT_NAMESPACE}
+          fi
+          
+          oc rollout status deployment/${IMAGE_NAME} -n ${OPENSHIFT_NAMESPACE}
+
+{%- if values.enable_aap %}
+
+  push-to-aap:
+    name: Push to AAP
+    runs-on: ubuntu-latest
+    needs: deploy-openshift
+    
+    steps:
+      - name: Login to Automation Hub
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ values.aap_hub_url }}
+          username: ${{ secrets.AAP_HUB_USERNAME }}
+          password: ${{ secrets.AAP_HUB_PASSWORD }}
+
+      - name: Tag for AAP
+        run: |
+          SOURCE="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${GITHUB_SHA}"
+          TARGET="${{ values.aap_hub_url }}/${{ values.aap_ee_name }}:latest"
+          
+          podman pull ${SOURCE}
+          podman tag ${SOURCE} ${TARGET}
+          podman push ${TARGET}
+          
+          echo "✓ Pushed to Automation Hub: ${TARGET}"
+          echo "Register in AAP Controller UI as Execution Environment"
+{%- endif %}
+
+---
+# This section would be in: content/README.md
+# ${{ values.component_id }}
+
+${{ values.description }}
+
+## Installed Tools
+
+{%- for tool in values.tools %}
+- {{ tool }}
+{%- endfor %}
+
+## Quick Start
+
+### Prerequisites
+
+Set these GitHub secrets in your repository:
+
+- `OPENSHIFT_SERVER` - OpenShift API URL
+- `OPENSHIFT_TOKEN` - Service account token
+- `REGISTRY_USERNAME` - Container registry username
+- `REGISTRY_PASSWORD` - Container registry password
+{%- if values.enable_aap %}
+- `AAP_HUB_USERNAME` - Automation Hub username
+- `AAP_HUB_PASSWORD` - Automation Hub password
+{%- endif %}
+
+### Get OpenShift Token
+
+```bash
+oc create sa github-actions -n ${{ values.namespace }}
+oc policy add-role-to-user edit system:serviceaccount:${{ values.namespace }}:github-actions
+oc create token github-actions -n ${{ values.namespace }} --duration=8760h
+```
+
+### Usage in OpenShift
+
+```bash
+oc run test --image=${{ values.image_registry }}/${{ values.image_namespace }}/${{ values.component_id }}:latest -n ${{ values.namespace }} --rm -it -- bash
+```
+
+{%- if values.enable_aap %}
+
+### Usage in AAP
+
+1. Go to AAP Controller → **Execution Environments** → **Add**
+2. Name: `${{ values.aap_ee_name }}`
+3. Image: `${{ values.aap_hub_url }}/${{ values.aap_ee_name }}:latest`
+4. Pull: `Always`
+5. Use in Job Templates
+
+{%- endif %}
+
+## Local Testing
+
+```bash
+# Build locally
+podman build -t ${{ values.component_id }}:test .
+
+# Test tools
+{%- if 'oc' in values.tools %}
+podman run --rm ${{ values.component_id }}:test oc version --client
+{%- endif %}
+{%- if 'ansible' in values.tools %}
+podman run --rm ${{ values.component_id }}:test ansible --version
+{%- endif %}
+
+# Interactive shell
+podman run --rm -it ${{ values.component_id }}:test bash
+```
+
+## Image Details
+
+- **Registry**: ${{ values.image_registry }}/${{ values.image_namespace }}/${{ values.component_id }}
+- **Base Image**: ${{ values.base_image }}
+- **OpenShift**: ${{ values.namespace }}
+- **User**: non-root (UID 1001)
+
+## Support
+
+Owner: ${{ values.owner }}
+Repository: https://github.example.com/${{ values.github_org }}/${{ values.repo_name }}
