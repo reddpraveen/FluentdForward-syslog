@@ -1,4 +1,233 @@
 {
+  "annotations": { "list": [] },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "((container_memory_working_set_bytes{container=~\".*java.*|.*jvm.*\"} / container_spec_memory_limit_bytes{container=~\".*java.*|.*jvm.*\"}) > 0.9) or (rate(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[1h]) > 0 and on(pod) container_memory_working_set_bytes{container=~\".*java.*\"} > 0)",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "Java Memory Sizing",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 5, "y": 0 },
+      "id": 2,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "(max by() (container_memory_working_set_bytes{pod=~\"etcd-.*|kube-apiserver-.*\"} / container_spec_memory_limit_bytes{pod=~\"etcd-.*|kube-apiserver-.*\"}) or vector(0)) >= 0.85",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "Control Plane Memory",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 10, "y": 0 },
+      "id": 3,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "histogram_quantile(0.99, rate(etcd_disk_backend_commit_duration_seconds_bucket[5m])) > 0.1",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "etcd Commit Latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 15, "y": 0 },
+      "id": 4,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "histogram_quantile(0.99, rate(etcd_disk_wal_fsync_duration_seconds_bucket[5m])) > 0.01",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "etcd WAL Fsync Latency",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 4, "x": 20, "y": 0 },
+      "id": 5,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "rate(etcd_server_leader_changes_seen_total[10m]) > 0.1",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "etcd Leader Changes",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 0, "y": 6 },
+      "id": 6,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "count(count by(node) (kube_pod_info) > 50) > 0",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "High-Density Nodes",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 5, "y": 6 },
+      "id": 7,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "(max by() (rate(container_cpu_cfs_throttled_periods_total[5m]) / rate(container_cpu_cfs_periods_total[5m])) or vector(0)) > 0.25",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "CPU Throttling",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 10, "y": 6 },
+      "id": 8,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "count(rate(kube_horizontalpodautoscaler_status_condition{condition=\"ScalingLimited\"}[5m]) > 0) > 0",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "HPA Scaling Limited",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "options": { "0": { "text": "OK" }, "1": { "text": "IMPACTED" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 5, "x": 15, "y": 6 },
+      "id": 9,
+      "options": { "colorMode": "value", "graphMode": "none", "justifyMode": "center", "textMode": "auto" },
+      "pluginVersion": "10.4.0",
+      "targets": [{
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "expr": "count(rate(container_tasks_state{state=\"running\"}[5m]) > 3500 and on(pod) kube_pod_container_status_ready == 1) > 0",
+        "instant": true,
+        "refId": "A"
+      }],
+      "title": "Thread/PID Pressure",
+      "type": "stat"
+    }
+  ],
+  "refresh": "5m",
+  "schemaVersion": 39,
+  "tags": ["openshift", "performance", "tuning", "multi-cluster"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": true,
+        "label": "Cluster",
+        "multi": true,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "OpenShift 4.16 Full Tuning Status (Multi-Cluster)",
+  "uid": "ocp416-full-tuning",
+  "version": 1
+}
+
+
+
+
+
+=====================================================
+{
   "annotations": {
     "list": []
   },
