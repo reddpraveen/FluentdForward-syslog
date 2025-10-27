@@ -1,4 +1,123 @@
 {
+  "datasource": { "type": "prometheus", "uid": "${datasource}" },
+  "fieldConfig": {
+    "defaults": {
+      "unit": "percent",
+      "decimals": 1,
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [
+          { "color": "green", "value": null },
+          { "color": "red", "value": 85 }
+        ]
+      }
+    }
+  },
+  "gridPos": { "h": 7, "w": 6, "x": 8, "y": 12 },
+  "id": 11,
+  "options": {
+    "colorMode": "value",
+    "graphMode": "none",
+    "justifyMode": "auto",
+    "textMode": "auto"
+  },
+  "pluginVersion": "10.4.0",
+  "targets": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "expr": "max by(pod) (container_memory_working_set_bytes{pod=~\"etcd-.*|kube-apiserver-.*\"} / ignoring(container,resource) group_left kube_pod_container_resource_limits{pod=~\"etcd-.*|kube-apiserver-.*\", resource=\"memory\"}) * 100",
+      "instant": true,
+      "refId": "A"
+    }
+  ],
+  "title": "Control Plane Memory Pressure (%)",
+  "type": "stat"
+}
+
+
+
+{
+  "datasource": { "type": "prometheus", "uid": "${datasource}" },
+  "gridPos": { "h": 7, "w": 10, "x": 0, "y": 19 },
+  "id": 14,
+  "options": {
+    "showHeader": true,
+    "sortBy": [ { "desc": true, "displayName": "Usage (GiB)" } ]
+  },
+  "pluginVersion": "10.4.0",
+  "targets": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "expr": "container_memory_working_set_bytes{pod=~\"etcd-.*|kube-apiserver-.*\"} / 1024 / 1024 / 1024",
+      "format": "table",
+      "instant": true,
+      "legendFormat": "Usage",
+      "refId": "A"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "expr": "kube_pod_container_resource_limits{pod=~\"etcd-.*|kube-apiserver-.*\", resource=\"memory\"} / 1024 / 1024 / 1024",
+      "format": "table",
+      "instant": true,
+      "legendFormat": "Limit",
+      "refId": "B"
+    }
+  ],
+  "title": "Control Plane Memory Details (GiB)",
+  "type": "table",
+  "transformations": [
+    {
+      "id": "merge",
+      "options": {}
+    },
+    {
+      "id": "organize",
+      "options": {
+        "excludeByName": {
+          "Time": true,
+          "container": true,
+          "endpoint": true,
+          "instance": true,
+          "job": true,
+          "namespace": true,
+          "node": true,
+          "resource": true,
+          "service": true
+        },
+        "renameByName": {
+          "Value #A": "Usage (GiB)",
+          "Value #B": "Limit (GiB)",
+          "pod": "Pod"
+        }
+      }
+    },
+    {
+      "id": "calculateField",
+      "options": {
+        "alias": "Usage %",
+        "binary": {
+          "left": "Usage (GiB)",
+          "operator": "/",
+          "reducer": "sum",
+          "right": "Limit (GiB)"
+        },
+        "mode": "binary",
+        "reduce": { "reducer": "sum" },
+        "replaceFields": false
+      }
+    },
+    {
+      "id": "filterFieldsByName",
+      "options": {
+        "include": {
+          "names": ["Pod", "Usage (GiB)", "Limit (GiB)", "Usage %"]
+        }
+      }
+    }
+  ]
+}
+=========
+{
   "annotations": {
     "list": []
   },
