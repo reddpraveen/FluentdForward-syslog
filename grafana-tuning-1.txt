@@ -1,0 +1,96 @@
+{
+  "datasource": {
+    "type": "prometheus",
+    "uid": "${datasource}"
+  },
+  "gridPos": {
+    "h": 7,
+    "w": 10,
+    "x": 0,
+    "y": 19
+  },
+  "id": 14,
+  "options": {
+    "showHeader": true,
+    "sortBy": [
+      {
+        "desc": true,
+        "displayName": "Usage (GiB)"
+      }
+    ]
+  },
+  "pluginVersion": "10.4.0",
+  "targets": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "expr": "container_memory_working_set_bytes{pod=~\"etcd-.*|kube-apiserver-.*\", container!=\"\", container!=\"POD\"} / 1024 / 1024 / 1024",
+      "format": "table",
+      "instant": true,
+      "legendFormat": "{{pod}} / {{container}}",
+      "refId": "A"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "expr": "kube_pod_container_resource_limits{pod=~\"etcd-.*|kube-apiserver-.*\", resource=\"memory\", container!=\"\", container!=\"POD\"} / 1024 / 1024 / 1024",
+      "format": "table",
+      "instant": true,
+      "legendFormat": "{{pod}} / {{container}}",
+      "refId": "B"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "expr": "(\n  container_memory_working_set_bytes{pod=~\"etcd-.*|kube-apiserver-.*\", container!=\"\", container!=\"POD\"}\n  /\n  on(pod, container)\n  (kube_pod_container_resource_limits{pod=~\"etcd-.*|kube-apiserver-.*\", resource=\"memory\", container!=\"\", container!=\"POD\"} > 0)\n) * 100",
+      "format": "table",
+      "instant": true,
+      "legendFormat": "{{pod}} / {{container}}",
+      "refId": "C"
+    }
+  ],
+  "title": "Control Plane Memory Details (GiB)",
+  "type": "table",
+  "transformations": [
+    {
+      "id": "merge",
+      "options": {}
+    },
+    {
+      "id": "organize",
+      "options": {
+        "excludeByName": {
+          "Time": true,
+          "endpoint": true,
+          "instance": true,
+          "job": true,
+          "namespace": true,
+          "node": true,
+          "resource": true,
+          "service": true
+        },
+        "renameByName": {
+          "Value #A": "Usage (GiB)",
+          "Value #B": "Limit (GiB)",
+          "Value #C": "Usage %",
+          "pod": "Pod",
+          "container": "Container"
+        }
+      }
+    },
+    {
+      "id": "filterFieldsByName",
+      "options": {
+        "include": {
+          "names": ["Pod", "Container", "Usage (GiB)", "Limit (GiB)", "Usage %"]
+        }
+      }
+    }
+  ]
+}
