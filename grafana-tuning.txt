@@ -1,3 +1,13 @@
+max(
+  (
+    container_memory_working_set_bytes{pod=~"etcd-.*|kube-apiserver-.*", container!="", container!="POD"}
+    /
+    on(pod, container)
+    container_spec_memory_limit_bytes{pod=~"etcd-.*|kube-apiserver-.*", container!="", container!="POD", container_spec_memory_limit_bytes > 0}
+  ) * 100
+)
+
+------------------------------------
 max by(pod) (
   (
     container_memory_working_set_bytes{pod=~"etcd-.*|kube-apiserver-.*", container!="", container!="POD"}
