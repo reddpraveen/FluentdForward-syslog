@@ -1,3 +1,15 @@
+oc create -f - <<EOF && sleep 2 && oc get secret <service-account-name>-token -n <namespace> -o jsonpath='{.data.token}' | base64 -d && echo
+apiVersion: v1
+kind: Secret
+metadata:
+  name: <service-account-name>-token
+  namespace: <namespace>
+  annotations:
+    kubernetes.io/service-account.name: <service-account-name>
+type: kubernetes.io/service-account-token
+EOF
+
+
 apiVersion: scaffolder.backstage.io/v1beta3
 kind: Template
 metadata:
