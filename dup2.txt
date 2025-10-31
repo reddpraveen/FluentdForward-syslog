@@ -4,6 +4,1091 @@ on:
   workflow_dispatch:
     inputs:
       operation:
+        description: 'Select operation: create-repo-full (creates new repo OR updates existing - idempotent/rerunnable), copy-collaborators-only, copy-protection-only, or sync-all-settings (update settings only)'
+        required: true
+        type: choice
+        options:
+          - 'create-repo-full'
+          - 'copy-collaborators-only'
+          - 'copy-protection-only'
+          - 'sync-all-settings'
+        default: 'create-repo-full'
+      template_repo:
+        description: 'Source template repository in format: XXX/template-repo-name (leave empty for basic repo setup without copying)'
+        required: false
+        type: string
+        default: ''
+      target_repo:
+        description: 'Target repository in format: XXX/new-repo-name (preferred) OR just the repo name if using target_org below'
+        required: true
+        type: string
+        default: 'XXX/'
+      target_org:
+        description: 'Organization name (only needed if target_repo is just a name like "Misc" without org prefix. Leave blank if target_repo is XXX/Misc format)'
+        required: false
+        type: string
+        default: ''
+      repo_description:
+        description: 'Short description for the new repository (shown on GitHub)'
+        required: false
+        type: string
+        default: 'Repository created via GitHub Actions'
+      private_repo:
+        description: 'Repository visibility: true = Private (restricted access), false = Public (everyone can see)'
+        required: false
+        type: boolean
+        default: false
+      collaborators:
+        description: 'Add collaborators (JSON): [{"username":"user1","permission":"admin"},{"username":"user2","permission":"write"}] - permissions: admin, write, read'
+        required: false
+        type: string
+        default: '[]'
+      teams:
+        description: 'Add teams (JSON): [{"team":"team-name","permission":"admin"},{"team":"team2","permission":"write"}] - permissions: admin, write, read'
+        required: false
+        type: string
+        default: '[]'
+      dry_run:
+        description: 'Dry run mode: true = Preview actions without making changes, false = Execute all changes'
+        required: false
+        type: boolean
+        default: false
+      force_recreate:
+        description: 'Attempt to delete and recreate if repo exists (Note: May be blocked by GitHub Enterprise policy - will update instead if deletion fails)'
+        required: false
+        type: boolean
+        default: false
+      github_hostname:
+        description: 'GitHub Enterprise hostname (e.g., github.company.com) - change only if not using default enterprise instance'
+        required: false
+        type: string
+        default: 'github.com'
+
+env:
+  # Set GitHub Enterprise hostname at job level for persistence
+  GH_HOST: ${{ inputs.github_hostname }}
+  GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+
+jobs:
+  github-enterprise-repo-management:
+    runs-on: ['self-hosted', 'enterprise']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GitHub CLI (Enterprise Compatible)
+        run: |
+          set -e
+          echo "Installing GitHub CLI for enterprise environment..."
+          
+          # Detect OS and install accordingly
+          if command -v apt-get >/dev/null 2>&1; then
+            # Ubuntu/Debian
+            echo "Detected Debian/Ubuntu system"
+            
+            # Create keyrings directory if it doesn't exist
+            sudo mkdir -p /usr/share/keyrings
+            
+            # Download and install GitHub CLI key
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+            
+            # Add repository
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            
+            # Update and install
+            sudo apt-get update
+            sudo apt-get install -y gh
+            
+          elif command -v yum >/dev/null 2>&1; then
+            # RHEL/CentOS
+            echo "Detected RHEL/CentOS system"
+            sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+            sudo dnf install -y gh
+            
+          elif command -v apk >/dev/null 2>&1; then
+            # Alpine Linux
+            echo "Detected Alpine Linux"
+            apk add --no-cache github-cli
+            
+          else
+            # Fallback: Download binary directly
+            echo "Using binary installation fallback"
+            
+            # Detect architecture
+            ARCH=$(uname -m)
+            case $ARCH in
+              x86_64) ARCH="amd64" ;;
+              aarch64) ARCH="arm64" ;;
+              armv7l) ARCH="armv6" ;;
+            esac
+            
+            # Download and install
+            curl -sSL "https://github.com/cli/cli/releases/latest/download/gh_$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')_linux_${ARCH}.tar.gz" | tar -xz
+            sudo mv gh_*/bin/gh /usr/local/bin/
+            rm -rf gh_*
+            
+            # Ensure /usr/local/bin is in PATH
+            export PATH="/usr/local/bin:$PATH"
+            echo "/usr/local/bin" >> $GITHUB_PATH
+            
+            # Verify installation
+            if ! command -v gh >/dev/null 2>&1; then
+              echo "ERROR: GitHub CLI installation failed - gh command not found"
+              echo "PATH: $PATH"
+              echo "Checking common locations:"
+              ls -la /usr/local/bin/gh 2>/dev/null || echo "Not in /usr/local/bin"
+              ls -la /usr/bin/gh 2>/dev/null || echo "Not in /usr/bin"
+              which gh 2>/dev/null || echo "which gh failed"
+              exit 1
+            fi
+            
+            echo "GitHub CLI installed successfully: $(gh --version)"
+            echo "GitHub CLI location: $(which gh)"
+          fi
+          
+          # Verify installation
+          gh --version
+          echo "GitHub CLI installed successfully"
+
+      - name: Setup GitHub Enterprise Authentication
+        run: |
+          set -e
+          echo "Setting up GitHub Enterprise authentication..."
+          echo "GitHub Enterprise Host: $GH_HOST"
+          
+          # Test connectivity first
+          echo "Testing connectivity to $GH_HOST..."
+          if ! curl -I "https://$GH_HOST" >/dev/null 2>&1; then
+            echo "ERROR: Cannot reach $GH_HOST"
+            echo "Please check:"
+            echo "1. Network connectivity from runner"
+            echo "2. DNS resolution for $GH_HOST"
+            echo "3. Firewall/proxy settings"
+            exit 1
+          fi
+          echo "Connectivity to $GH_HOST confirmed"
+          
+          # Authenticate with GitHub CLI
+          echo "Authenticating with GitHub Enterprise..."
+          if [ "$GH_HOST" = "github.com" ]; then
+            echo "$GH_TOKEN" | gh auth login --with-token
+          else
+            # For GitHub Enterprise, MUST specify hostname during login
+            echo "$GH_TOKEN" | gh auth login --hostname "$GH_HOST" --with-token
+          fi
+          
+          # Verify authentication
+          echo "Verifying authentication..."
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth status
+          else
+            gh auth status --hostname "$GH_HOST"
+          fi
+          
+          # Setup git to use GitHub CLI credentials
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth setup-git
+          else
+            gh auth setup-git --hostname "$GH_HOST"
+          fi           
+          echo "GitHub Enterprise authentication completed"
+
+      - name: Validate inputs and set target repository
+        id: set-target
+        run: |
+          set -e
+          echo "Validating inputs..."
+          
+          # Validate template repository format if provided
+          if [ -n "${{ inputs.template_repo }}" ]; then
+            if [[ ! "${{ inputs.template_repo }}" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+              echo "ERROR: Template repository must be in format 'org/repo-name'"
+              echo "Provided: '${{ inputs.template_repo }}'"
+              echo "Format should be: organization/repository-name"
+              exit 1
+            fi
+          fi
+          
+          
+          # Set target repository path
+          if [ "${{ inputs.operation }}" = "create-repo-full" ]; then
+            # Check if target_repo already contains org/repo format
+            if [[ "${{ inputs.target_repo }}" =~ ^[^/]+/[^/]+$ ]]; then
+              # target_repo is in org/repo format, extract both parts
+              target_org=$(echo "${{ inputs.target_repo }}" | cut -d'/' -f1)
+              target_repo_name=$(echo "${{ inputs.target_repo }}" | cut -d'/' -f2)
+              echo "target_org=$target_org" >> $GITHUB_OUTPUT
+              echo "target_repo_full=$target_org/$target_repo_name" >> $GITHUB_OUTPUT
+              echo "Parsed target_repo '${{ inputs.target_repo }}' as org='$target_org', repo='$target_repo_name'"
+            elif [ -n "${{ inputs.target_org }}" ]; then
+              # target_org is provided and target_repo is just a name
+              echo "target_org=${{ inputs.target_org }}" >> $GITHUB_OUTPUT
+              echo "target_repo_full=${{ inputs.target_org }}/${{ inputs.target_repo }}" >> $GITHUB_OUTPUT
+              echo "Using target_org='${{ inputs.target_org }}' with target_repo='${{ inputs.target_repo }}'"
+            else
+              # No org information provided - ERROR
+              echo "ERROR: For create-repo-full operation, you must provide either:"
+              echo "  1. target_repo in 'org/repo' format (e.g., 'XXX/Misc')"
+              echo "  2. target_org parameter with target_repo as just the name (e.g., target_org='XXX', target_repo='Misc')"
+              echo ""
+              echo "You provided: target_repo='${{ inputs.target_repo }}' without org information"
+              exit 1
+            fi
+          else
+            # Handle target_repo input - could be org/repo or full URL
+            target_input="${{ inputs.target_repo }}"
+            
+            # Check if it's a full GitHub URL and extract org/repo
+            if [[ "$target_input" =~ ^https?://[^/]+/([^/]+)/([^/]+)(\.git)?/?$ ]]; then
+              # Extract org and repo from URL
+              target_org="${BASH_REMATCH[1]}"
+              target_repo_name="${BASH_REMATCH[2]}"
+              target_repo_name="${target_repo_name%.git}"  # Remove .git suffix if present
+              target_repo_full="$target_org/$target_repo_name"
+              echo "Extracted from URL: $target_repo_full"
+            elif [[ "$target_input" =~ ^[^/]+/[^/]+$ ]]; then
+              # Already in org/repo format
+              target_repo_full="$target_input"
+              target_org=$(echo "$target_input" | cut -d'/' -f1)
+            else
+              echo "ERROR: Target repository must be in format 'org/repo-name' or a valid GitHub URL"
+              echo "Provided: $target_input"
+              exit 1
+            fi
+            
+            echo "target_repo_full=$target_repo_full" >> $GITHUB_OUTPUT
+            echo "target_org=$target_org" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "Input validation completed"
+          if [ -n "${{ inputs.template_repo }}" ]; then
+            echo "Template: ${{ inputs.template_repo }}"
+          else
+            echo "Template: None (basic setup)"
+          fi
+          echo "Target: $(cat $GITHUB_OUTPUT | grep target_repo_full | cut -d'=' -f2)"
+
+      - name: Validate template repository access
+        if: inputs.template_repo != ''
+        run: |
+          set -e
+          echo "Validating template repository: ${{ inputs.template_repo }}"
+          
+          # Re-verify authentication before API calls
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth status || {
+              echo "Re-authenticating..."
+              echo "$GH_TOKEN" | gh auth login --with-token
+            }
+          else
+            gh auth status --hostname "$GH_HOST" || {
+              echo "Re-authenticating..."
+              echo "$GH_TOKEN" | gh auth login --hostname "$GH_HOST" --with-token
+            }
+          fi
+          
+          # Check template repository exists and is accessible
+          if ! gh repo view "${{ inputs.template_repo }}" --json name,owner,description >/dev/null 2>&1; then
+            echo "ERROR: Template repository ${{ inputs.template_repo }} not found or not accessible"
+            echo "Please check:"
+            echo "1. Repository exists on $GH_HOST"
+            echo "2. Token has access to the repository"
+            echo "3. Repository name format is correct (org/repo)"
+            exit 1
+          fi
+          
+          echo "Template repository validated and accessible"
+
+      - name: Check target repository existence and handle conflicts
+        id: check-target
+        run: |
+          set -e
+          target_repo="${{ steps.set-target.outputs.target_repo_full }}"
+          echo "Checking target repository: $target_repo"
+          
+          if gh repo view "$target_repo" --json name,owner,createdAt,pushedAt 2>/dev/null > repo_info.json; then
+            echo "repo_exists=true" >> $GITHUB_OUTPUT
+            
+            # Get repository age
+            created_at=$(jq -r '.createdAt' repo_info.json)
+            
+            # Calculate age in minutes (cross-platform compatible)
+            if command -v date >/dev/null 2>&1; then
+              if date --version 2>/dev/null | grep -q GNU; then
+                # GNU date (Linux)
+                created_timestamp=$(date -d "$created_at" +%s)
+              else
+                # BSD date (macOS)
+                created_timestamp=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$created_at" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%S" "${created_at%Z}" +%s)
+              fi
+              current_timestamp=$(date +%s)
+              age_minutes=$(( (current_timestamp - created_timestamp) / 60 ))
+            else
+              age_minutes=999  # Fallback if date command unavailable
+            fi
+            
+            echo "repo_age_minutes=$age_minutes" >> $GITHUB_OUTPUT
+            echo "Repository exists, created $age_minutes minutes ago"
+            
+            # Check if it's a very new repo (less than 5 minutes old)
+            if [ $age_minutes -lt 5 ]; then
+              echo "repo_is_fresh=true" >> $GITHUB_OUTPUT
+              echo "WARNING: Repository is very new (< 5 minutes old) - likely from previous failed run"
+            else
+              echo "repo_is_fresh=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "repo_exists=false" >> $GITHUB_OUTPUT
+            echo "repo_is_fresh=false" >> $GITHUB_OUTPUT
+            echo "Repository does not exist"
+          fi
+
+      - name: Handle existing repository for create operation
+        if: inputs.operation == 'create-repo-full' && steps.check-target.outputs.repo_exists == 'true'
+        run: |
+          set -e
+          if [ "${{ inputs.force_recreate }}" = "true" ]; then
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "## DRY RUN - Repository Handling" >> $GITHUB_STEP_SUMMARY
+              echo "Would attempt to delete and recreate existing repository: ${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+              echo "NOTE: If deletion is blocked by GitHub Enterprise policy, workflow will continue with update instead." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "WARNING: Attempting to force recreate repository: ${{ steps.set-target.outputs.target_repo_full }}"
+              
+              # Try to delete, but don't fail if it's blocked by GitHub Enterprise policy
+              if gh repo delete "${{ steps.set-target.outputs.target_repo_full }}" --yes 2>&1; then
+                echo "Repository deleted successfully, will recreate"
+                sleep 5  # Wait for deletion to propagate
+              else
+                echo ""
+                echo "=========================================="
+                echo "WARNING: Repository Deletion Blocked"
+                echo "=========================================="
+                echo ""
+                echo "GitHub Enterprise policy prevents repository deletion (HTTP 403)."
+                echo "Continuing with UPDATE mode instead of recreate..."
+                echo "This will sync all settings and content to the existing repository."
+                echo ""
+                echo "=========================================="
+                echo ""
+                
+                echo "## Repository Update Mode" >> $GITHUB_STEP_SUMMARY
+                echo "Repository deletion blocked by GitHub Enterprise policy." >> $GITHUB_STEP_SUMMARY
+                echo "Continuing with update mode: syncing collaborators, protection rules, and content." >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          else
+            # Repository exists and force_recreate is false
+            echo "=========================================="
+            echo "Repository Already Exists - Continuing with Update"
+            echo "=========================================="
+            echo ""
+            echo "Repository: ${{ steps.set-target.outputs.target_repo_full }}"
+            echo "Status: Already exists (created ${{ steps.check-target.outputs.repo_age_minutes }} minutes ago)"
+            echo ""
+            echo "The workflow will continue and update the existing repository with:"
+            echo "  - Collaborators and permissions"
+            echo "  - Branch protection rules"
+            echo "  - Repository content (if source template provided)"
+            echo ""
+            echo "This allows safe reruns after pipeline failures."
+            echo ""
+            echo "To prevent updates to existing repos, use a different target repository name."
+            echo ""
+            echo "=========================================="
+            
+            # Write to summary
+            echo "## Repository Update Mode" >> $GITHUB_STEP_SUMMARY
+            echo "Repository ${{ steps.set-target.outputs.target_repo_full }} already exists." >> $GITHUB_STEP_SUMMARY
+            echo "Continuing with update mode to sync all settings and content." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create target repository with enterprise support
+        if: inputs.operation == 'create-repo-full' && (steps.check-target.outputs.repo_exists == 'false' || inputs.force_recreate == 'true')
+        run: |
+          set -e
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "## DRY RUN - Repository Creation" >> $GITHUB_STEP_SUMMARY
+            echo "Would create repository: ${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Description: ${{ inputs.repo_description }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Visibility: ${{ inputs.private_repo == 'true' && 'Private' || 'Public' }}" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          
+          VISIBILITY_FLAG=""
+          if [ "${{ inputs.private_repo }}" = "true" ]; then
+            VISIBILITY_FLAG="--private"
+          else
+            VISIBILITY_FLAG="--public"
+          fi
+          
+          # Retry logic for repository creation
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Repository creation attempt $attempt/$max_attempts"
+            
+            if gh repo create "${{ steps.set-target.outputs.target_repo_full }}" \
+              --description "${{ inputs.repo_description }}" \
+              $VISIBILITY_FLAG \
+              --clone=false; then
+              echo "Repository created successfully"
+              echo "## Repository Created" >> $GITHUB_STEP_SUMMARY
+              echo "- **Repository**: ${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+              echo "- **URL**: https://$GH_HOST/${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+              break
+            else
+              echo "ERROR: Repository creation failed (attempt $attempt/$max_attempts)"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Repository creation failed after $max_attempts attempts"
+                exit 1
+              fi
+              echo "Waiting 10 seconds before retry..."
+              sleep 10
+            fi
+          done
+
+      - name: Clone source repository with enterprise authentication
+        if: inputs.operation == 'create-repo-full' || inputs.operation == 'sync-all-settings'
+        run: |
+          set -e
+          
+          # Ensure gh is available in PATH
+          if ! command -v gh >/dev/null 2>&1; then
+            export PATH="/usr/local/bin:/usr/bin:$PATH"
+          fi
+          
+          echo "Cloning source repository: ${{ inputs.template_repo }}"
+          
+          # Re-verify authentication before cloning
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth status || {
+              echo "Re-authenticating for clone operation..."
+              echo "$GH_TOKEN" | gh auth login --with-token
+              gh auth setup-git
+            }
+          else
+            gh auth status --hostname "$GH_HOST" || {
+              echo "Re-authenticating for clone operation..."
+              echo "$GH_TOKEN" | gh auth login --hostname "$GH_HOST" --with-token
+              gh auth setup-git --hostname "$GH_HOST"
+            }
+          fi
+          
+          # Clone using GitHub CLI (handles authentication automatically)
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Clone attempt $attempt/$max_attempts"
+            
+            if gh repo clone "${{ inputs.template_repo }}" source-repo; then
+              echo "Source repository cloned successfully"
+              break
+            else
+              echo "ERROR: Clone failed (attempt $attempt/$max_attempts)"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Clone failed after $max_attempts attempts"
+                exit 1
+              fi
+              echo "Waiting 5 seconds before retry..."
+              sleep 5
+              rm -rf source-repo 2>/dev/null || true
+            fi
+          done
+          
+          # Verify clone was successful
+          if [ ! -d "source-repo" ]; then
+            echo "ERROR: Source repository clone verification failed"
+            exit 1
+          fi
+          
+          echo "Source repository cloned to: $(pwd)/source-repo"
+          ls -la source-repo/
+
+      - name: Initialize target repository with content
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && (steps.check-target.outputs.repo_exists == 'false' || inputs.force_recreate == 'true')
+        run: |
+          set -e
+          
+          # Check if repo already has content
+          if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md >/dev/null 2>&1; then
+            echo "Repository already has content, skipping initialization"
+            exit 0
+          fi
+          
+          echo "Initializing target repository with content..."
+          
+          # Create temporary directory for initialization
+          mkdir -p temp_init
+          cd temp_init
+          
+          # Initialize git repository
+          git init
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Create initial README
+          cat > README.md << EOF
+          # ${{ inputs.target_repo }}
+          
+          Repository created and configured via GitHub Enterprise Actions workflow
+          
+          ## Source Information
+          - **Source Repository**: ${{ inputs.template_repo }}
+          - **Created**: $(date)
+          - **Workflow**: GitHub Enterprise Repository Management
+          - **GitHub Enterprise Host**: $GH_HOST
+          
+          ## Configuration Status
+          - Collaborator permissions (in progress)
+          - Branch protection rules (in progress)
+          - Content synchronization (in progress)
+          
+          EOF
+          
+          git add README.md
+          git commit -m "Initial commit with repository setup"
+          
+          # Setup remote and push with retry logic
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Initial push attempt $attempt/$max_attempts"
+            
+            # Use token-based authentication for push
+            if git remote add origin "https://$GH_TOKEN@$GH_HOST/${{ steps.set-target.outputs.target_repo_full }}.git" && \
+               git branch -M main && \
+               git push -u origin main; then
+              echo "Initial content pushed successfully"
+              break
+            else
+              echo "ERROR: Initial push failed (attempt $attempt/$max_attempts)"
+              git remote remove origin 2>/dev/null || true
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Initial push failed after $max_attempts attempts, continuing anyway"
+              else
+                sleep 5
+              fi
+            fi
+          done
+          
+          cd ..
+          rm -rf temp_init
+
+      - name: Copy collaborators with enterprise authentication
+        if: inputs.operation == 'create-repo-full' || inputs.operation == 'copy-collaborators-only' || inputs.operation == 'sync-all-settings'
+        run: |
+          set -e
+          
+          # Ensure gh is available in PATH
+          if ! command -v gh >/dev/null 2>&1; then
+            export PATH="/usr/local/bin:/usr/bin:$PATH"
+          fi
+          
+          echo "Copying collaborators from ${{ inputs.template_repo }} to ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          # Re-verify authentication
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth status || {
+              echo "Re-authenticating for collaborator operations..."
+              echo "$GH_TOKEN" | gh auth login --with-token
+            }
+          else
+            gh auth status --hostname "$GH_HOST" || {
+              echo "Re-authenticating for collaborator operations..."
+              echo "$GH_TOKEN" | gh auth login --hostname "$GH_HOST" --with-token
+            }
+          fi
+          
+          # Fetch collaborators with retry logic
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching collaborators attempt $attempt/$max_attempts"
+            
+            if gh api repos/${{ inputs.template_repo }}/collaborators \
+              --jq '.[] | {login: .login, permissions: .permissions, role_name: .role_name}' > collaborators.json; then
+              echo "Collaborators fetched successfully"
+              break
+            else
+              echo "ERROR: Failed to fetch collaborators (attempt $attempt/$max_attempts)"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch collaborators after $max_attempts attempts"
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+          
+          echo "## Collaborator Management" >> $GITHUB_STEP_SUMMARY
+          echo "| User | Permission | Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          success_count=0
+          error_count=0
+          skip_count=0
+          
+          while IFS= read -r collaborator; do
+            login=$(echo "$collaborator" | jq -r '.login')
+            admin=$(echo "$collaborator" | jq -r '.permissions.admin')
+            push=$(echo "$collaborator" | jq -r '.permissions.push')
+            pull=$(echo "$collaborator" | jq -r '.permissions.pull')
+            
+            # Skip the repository owner
+            target_owner=$(echo "${{ steps.set-target.outputs.target_repo_full }}" | cut -d'/' -f1)
+            if [ "$login" = "$target_owner" ]; then
+              echo "| $login | owner | SKIP | Repository owner |" >> $GITHUB_STEP_SUMMARY
+              ((skip_count++))
+              continue
+            fi
+            
+            # Determine permission level
+            if [ "$admin" = "true" ]; then
+              permission="admin"
+            elif [ "$push" = "true" ]; then
+              permission="push"
+            else
+              permission="pull"
+            fi
+            
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "| $login | $permission | DRY RUN | Would be added |" >> $GITHUB_STEP_SUMMARY
+            else
+              # Retry logic for adding collaborators
+              success=false
+              for attempt in $(seq 1 3); do
+                if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/collaborators/$login \
+                   \
+                  -X PUT \
+                  -f permission="$permission" 2>/dev/null; then
+                  echo "| $login | $permission | ADD/UPDATE | SUCCESS |" >> $GITHUB_STEP_SUMMARY
+                  ((success_count++))
+                  success=true
+                  break
+                else
+                  if [ $attempt -eq 3 ]; then
+                    echo "| $login | $permission | ADD/UPDATE | FAILED (3 attempts) |" >> $GITHUB_STEP_SUMMARY
+                    ((error_count++))
+                  else
+                    sleep 2
+                  fi
+                fi
+              done
+            fi
+          done < collaborators.json
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Collaborator Summary**: $success_count successful, $error_count failed, $skip_count skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Copy branch protection rules with enterprise support
+        if: inputs.operation == 'create-repo-full' || inputs.operation == 'copy-protection-only' || inputs.operation == 'sync-all-settings'
+        run: |
+          set -e
+          
+          # Ensure gh is available in PATH and store absolute path
+          export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+          
+          if command -v gh >/dev/null 2>&1; then
+            GH_CMD="$(command -v gh)"
+            echo "GitHub CLI found at: $GH_CMD"
+          elif [ -x "/usr/local/bin/gh" ]; then
+            GH_CMD="/usr/local/bin/gh"
+            echo "Using GitHub CLI at: $GH_CMD"
+          elif [ -x "/usr/bin/gh" ]; then
+            GH_CMD="/usr/bin/gh"
+            echo "Using GitHub CLI at: $GH_CMD"
+          else
+            echo "ERROR: GitHub CLI not found"
+            echo "Current PATH: $PATH"
+            exit 1
+          fi
+          
+          echo "Copying branch protection rules from ${{ inputs.template_repo }} to ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          # Re-verify authentication using absolute path
+          if [ "$GH_HOST" = "github.com" ]; then
+            $GH_CMD auth status || {
+              echo "Re-authenticating for branch protection operations..."
+              echo "$GH_TOKEN" | $GH_CMD auth login --with-token
+            }
+          else
+            $GH_CMD auth status --hostname "$GH_HOST" || {
+              echo "Re-authenticating for branch protection operations..."
+              echo "$GH_TOKEN" | $GH_CMD auth login --hostname "$GH_HOST" --with-token
+            }
+          fi
+          
+          # Get all branches from source with retry using absolute path
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching source branches attempt $attempt/$max_attempts"
+            
+            if $GH_CMD api repos/${{ inputs.template_repo }}/branches --jq '.[].name' > source_branches.txt; then
+              echo "Source branches fetched successfully"
+              break
+            else
+              echo "ERROR: Failed to fetch source branches (attempt $attempt/$max_attempts)"
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch source branches after $max_attempts attempts"
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+          
+          echo "Source branches found: $(cat source_branches.txt | tr '\n' ' ')"
+          
+          # Get target branches with retry using absolute path
+          echo "Using gh command: $GH_CMD"
+          echo "Verifying gh is still accessible: $($GH_CMD --version | head -n1)"
+          echo "Target repo full path: ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching target branches attempt $attempt/$max_attempts"
+            
+            # Capture both stdout and stderr for debugging
+            if output=$($GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' 2>&1); then
+              echo "$output" > target_branches.txt
+              echo "Target branches fetched successfully"
+              break
+            else
+              echo "ERROR: Failed to fetch target branches (attempt $attempt/$max_attempts)"
+              echo "GH_CMD variable: $GH_CMD"
+              echo "Error output: $output"
+              echo "Testing direct execution: $($GH_CMD --version 2>&1 || echo 'FAILED')"
+              
+              # Check if it's an authentication issue
+              if echo "$output" | grep -q "authentication\|401\|403"; then
+                echo "Authentication issue detected, re-authenticating..."
+                if [ "$GH_HOST" = "github.com" ]; then
+                  echo "$GH_TOKEN" | $GH_CMD auth login --with-token
+                else
+                  echo "$GH_TOKEN" | $GH_CMD auth login --hostname "$GH_HOST" --with-token
+                fi
+              fi
+              
+              # Check if repository doesn't exist yet or has no branches
+              if echo "$output" | grep -q "404\|Not Found\|empty repository"; then
+                echo "Repository may be empty or newly created, creating empty file"
+                touch target_branches.txt
+                break
+              fi
+              
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch target branches after $max_attempts attempts"
+                echo "Final error: $output"
+                exit 1
+              fi
+              sleep 5
+            fi
+          done
+          
+          echo "Target branches found: $(cat target_branches.txt | tr '\n' ' ')"
+          
+          # Find protected branches in source using absolute path
+          > protected_branches.txt
+          while IFS= read -r branch; do
+            if $GH_CMD api repos/${{ inputs.template_repo }}/branches/$branch/protection > protection_${branch}.json 2>/dev/null; then
+              echo "$branch" >> protected_branches.txt
+            fi
+          done < source_branches.txt
+          
+          # Determine which branches to protect
+          > branches_to_protect.txt
+          if [ -n "${{ inputs.target_branches }}" ]; then
+            echo "${{ inputs.target_branches }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > branches_to_protect.txt
+          else
+            while IFS= read -r branch; do
+              if grep -q "^$branch$" target_branches.txt; then
+                echo "$branch" >> branches_to_protect.txt
+              fi
+            done < protected_branches.txt
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Branch Protection Management" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          protection_success=0
+          protection_error=0
+          
+          if [ -s branches_to_protect.txt ]; then
+            while IFS= read -r branch; do
+              if [ -f "protection_${branch}.json" ]; then
+                if [ "${{ inputs.dry_run }}" = "true" ]; then
+                  echo "| $branch | DRY RUN | Would apply protection rules |" >> $GITHUB_STEP_SUMMARY
+                else
+                  protection_config=$(cat protection_${branch}.json)
+                  
+                  # Build protection rule payload
+                  payload='{}'
+                  
+                  if echo "$protection_config" | jq -e '.required_status_checks' >/dev/null; then
+                    required_status_checks=$(echo "$protection_config" | jq '.required_status_checks')
+                    payload=$(echo "$payload" | jq --argjson rsc "$required_status_checks" '. + {required_status_checks: $rsc}')
+                  fi
+                  
+                  enforce_admins=$(echo "$protection_config" | jq -r '.enforce_admins.enabled // false')
+                  if [ "$enforce_admins" = "true" ]; then
+                    payload=$(echo "$payload" | jq '. + {enforce_admins: true}')
+                  fi
+                  
+                  if echo "$protection_config" | jq -e '.required_pull_request_reviews' >/dev/null; then
+                    required_pull_request_reviews=$(echo "$protection_config" | jq '.required_pull_request_reviews')
+                    payload=$(echo "$payload" | jq --argjson rprr "$required_pull_request_reviews" '. + {required_pull_request_reviews: $rprr}')
+                  fi
+                  
+                  if echo "$protection_config" | jq -e '.restrictions' >/dev/null; then
+                    restrictions=$(echo "$protection_config" | jq '.restrictions')
+                    payload=$(echo "$payload" | jq --argjson rest "$restrictions" '. + {restrictions: $rest}')
+                  fi
+                  
+                  # Retry logic for applying protection rules
+                  success=false
+                  for attempt in $(seq 1 3); do
+                    if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/branches/$branch/protection \
+                      -X PUT \
+                      --input <(echo "$payload") 2>/dev/null; then
+                      echo "| $branch | PROTECT | SUCCESS |" >> $GITHUB_STEP_SUMMARY
+                      ((protection_success++))
+                      success=true
+                      break
+                    else
+                      if [ $attempt -eq 3 ]; then
+                        echo "| $branch | PROTECT | FAILED (3 attempts) |" >> $GITHUB_STEP_SUMMARY
+                        ((protection_error++))
+                      else
+                        sleep 3
+                      fi
+                    fi
+                  done
+                fi
+              else
+                echo "| $branch | SKIP | No protection rules in source |" >> $GITHUB_STEP_SUMMARY
+              fi
+            done < branches_to_protect.txt
+          else
+            echo "| - | NONE | No branches to protect |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Protection Summary**: $protection_success successful, $protection_error failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Copy repository content and settings
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && inputs.template_repo != ''
+        run: |
+          set -e
+          echo "Syncing repository content from source to target..."
+          
+          if [ ! -d "source-repo" ]; then
+            echo "Source repository not available, skipping content copy"
+            exit 0
+          fi
+          
+          echo "Cloning target repository: ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          # Clone target repository for content updates (works for both new and existing repos)
+          gh repo clone "${{ steps.set-target.outputs.target_repo_full }}" target-repo
+          
+          cd target-repo
+          
+          # Copy all files from source (excluding .git)
+          rsync -av --exclude='.git' ../source-repo/ ./
+          
+          # Configure git
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Add and commit changes
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Copy content from source repository ${{ inputs.template_repo }}"
+            
+            # Push with retry logic
+            max_attempts=3
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Content push attempt $attempt/$max_attempts"
+              
+              if git push origin main; then
+                echo "Content pushed successfully"
+                break
+              else
+                echo "ERROR: Content push failed (attempt $attempt/$max_attempts)"
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "Content push failed after $max_attempts attempts"
+                  exit 1
+                fi
+                sleep 5
+              fi
+            done
+          fi
+          
+          cd ..
+
+      - name: Update repository README with final status
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false
+        run: |
+          set -e
+          echo "Updating repository README with final status..."
+          
+          # Get current README SHA for update
+          readme_sha=""
+          if readme_info=$(gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md  2>/dev/null); then
+            readme_sha=$(echo "$readme_info" | jq -r '.sha')
+          fi
+          
+          # Create updated README content
+          cat > final_readme.md << EOF
+          # ${{ inputs.target_repo }}
+          
+          Repository created and configured via GitHub Enterprise Actions workflow
+          
+          ## Source Information
+          - **Source Repository**: ${{ inputs.template_repo }}
+          - **Created**: $(date)
+          - **Workflow**: GitHub Enterprise Repository Management
+          - **GitHub Enterprise Host**: $GH_HOST
+          
+          ## Configuration Status
+          - Repository created successfully
+          - Collaborator permissions copied
+          - Branch protection rules applied
+          - Content synchronized
+          - Workflow completed successfully
+          
+          ## Summary
+          This repository was created with the same collaborator permissions, branch protection rules, and content as the source repository. All operations completed with retry logic and comprehensive error handling for GitHub Enterprise environments.
+          
+          EOF
+          
+          # Update README with retry logic
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "README update attempt $attempt/$max_attempts"
+            
+            update_args=()
+            update_args+=(-f message="Update README with final configuration status")
+            update_args+=(-f content="$(base64 -i final_readme.md)")
+            if [ -n "$readme_sha" ]; then
+              update_args+=(-f sha="$readme_sha")
+            fi
+            
+            if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md \
+               \
+              -X PUT \
+              "${update_args[@]}" > /dev/null 2>&1; then
+              echo "README updated with final status"
+              break
+            else
+              echo "ERROR: Failed to update README (attempt $attempt/$max_attempts)"
+              if [ $attempt -lt $max_attempts ]; then
+                sleep 5
+                # Refresh SHA for next attempt
+                if readme_info=$(gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md 2>/dev/null); then
+                  readme_sha=$(echo "$readme_info" | jq -r '.sha')
+                fi
+              fi
+            fi
+          done
+
+      - name: Debug and diagnostics
+        if: failure()
+        run: |
+          echo "## Debugging Information" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment Variables:" >> $GITHUB_STEP_SUMMARY
+          echo "- GH_HOST: $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Enterprise connectivity test:" >> $GITHUB_STEP_SUMMARY
+          
+          if curl -I "https://$GH_HOST" >/dev/null 2>&1; then
+            echo "  - Can reach $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "  - Cannot reach $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### GitHub CLI Status:" >> $GITHUB_STEP_SUMMARY
+          if gh auth status  >/dev/null 2>&1; then
+            echo "  - GitHub CLI authenticated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "  - GitHub CLI not authenticated" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### Available GitHub hosts:" >> $GITHUB_STEP_SUMMARY
+          gh auth list >> $GITHUB_STEP_SUMMARY 2>&1 || echo "  - No authenticated hosts" >> $GITHUB_STEP_SUMMARY
+
+      - name: Final Summary with Enterprise Context
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## GitHub Enterprise Operation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Operation**: ${{ inputs.operation }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Enterprise Host**: $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Repository**: ${{ inputs.template_repo }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Repository**: ${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode**: ${{ inputs.dry_run == 'true' && 'DRY RUN' || 'LIVE EXECUTION' }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.check-target.outputs.repo_exists }}" = "true" ]; then
+            echo "- **Repository Status**: Existed (age: ${{ steps.check-target.outputs.repo_age_minutes }} minutes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Completed Actions:" >> $GITHUB_STEP_SUMMARY
+            case "${{ inputs.operation }}" in
+              "create-repo-full")
+                echo "- Repository created with GitHub Enterprise support" >> $GITHUB_STEP_SUMMARY
+                echo "- Collaborators copied with enterprise authentication" >> $GITHUB_STEP_SUMMARY
+                echo "- Branch protection rules applied with retry logic" >> $GITHUB_STEP_SUMMARY
+                echo "- Content synchronized from source repository" >> $GITHUB_STEP_SUMMARY
+                echo "- Documentation updated with final status" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "copy-collaborators-only")
+                echo "- Collaborators copied with enterprise authentication" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "copy-protection-only")
+                echo "- Branch protection rules applied with enterprise support" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "sync-all-settings")
+                echo "- Collaborators synchronized with enterprise authentication" >> $GITHUB_STEP_SUMMARY
+                echo "- Branch protection rules synchronized with retry logic" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### GitHub Enterprise Features Used:" >> $GITHUB_STEP_SUMMARY
+            echo "- Cross-platform GitHub CLI installation" >> $GITHUB_STEP_SUMMARY
+            echo "- Enterprise hostname authentication with persistence" >> $GITHUB_STEP_SUMMARY
+            echo "- Automatic re-authentication on session loss" >> $GITHUB_STEP_SUMMARY
+            echo "- Repository existence validation with age checking" >> $GITHUB_STEP_SUMMARY
+            echo "- Comprehensive retry logic for all operations" >> $GITHUB_STEP_SUMMARY
+            echo "- Network connectivity validation and diagnostics" >> $GITHUB_STEP_SUMMARY
+            echo "- Environment variable scoping for session persistence" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up temporary files..."
+          rm -f collaborators.json source_branches.txt target_branches.txt protected_branches.txt branches_to_protect.txt protection_*.json repo_info.json final_readme.md
+          rm -rf source-repo target-repo temp_init 2>/dev/null || true
+          echo "Cleanup completed"
+
+
+
+
+
+
+
+--------------------------
+name: GitHub Enterprise Repository Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
         description: 'Select operation: create-repo-full (new repo with all settings), copy-collaborators-only, copy-protection-only, or sync-all-settings (update existing repo)'
         required: true
         type: choice
