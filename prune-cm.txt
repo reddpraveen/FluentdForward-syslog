@@ -1,0 +1,183 @@
+cluster-addons/
+└── configmap-secret-pruner/
+    ├── kustomization.yaml
+    ├── cronjob.yaml
+    ├── configmap.yaml
+    └── rbac.yaml
+
+
+
+resources:
+- cronjob.yaml
+- configmap.yaml
+- rbac.yaml
+
+
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: cm-secret-pruner-config
+  namespace: openshift-operators
+
+  # Regex: namespaces to skip (one per line)
+  excludedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^default$
+    ^openshift$
+
+  # Labels that protect resources (key[=value], pipe-separated)
+  protectedLabels: "app.kubernetes.io/managed-by=argocd|meta.helm.sh/release-name|prune.protected=true"
+
+  # Min age in days (0 = disable)
+  minAgeDays: "30"
+
+  # Dry-run mode: "true" = log only, "false" = delete
+  dryRun: "true"
+
+
+apiVersion: v1
+kind: ServiceAccount
+meta
+  name: cm-secret-pruner
+  namespace: openshift-operators
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+meta
+  name: cm-secret-pruner-role
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "configmaps", "secrets", "pods", "serviceaccounts"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+- apiGroups: ["argoproj.io"]
+  resources: ["rollouts"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["delete"]  # Only delete, no create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+meta
+  name: cm-secret-pruner-binding
+subjects:
+- kind: ServiceAccount
+  name: cm-secret-pruner
+  namespace: openshift-operators
+roleRef:
+  kind: ClusterRole
+  name: cm-secret-pruner-role
+  apiGroup: rbac.authorization.k8s.io
+
+
+
+apiVersion: batch/v1
+kind: CronJob
+meta
+  name: cm-secret-pruner
+  namespace: openshift-operators
+spec:
+  schedule: "0 3 * * 0"  # Weekly at 3 AM UTC
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cm-secret-pruner
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+              
+              NS="openshift-operators"
+              CM="cm-secret-pruner-config"
+              
+              dry_run() { oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "true"; }
+              min_age() { oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "30"; }
+              excluded_ns() { oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "^openshift-.*|^kube-.*|^default$|^openshift$"; }
+              protected_labels() { oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "app.kubernetes.io/managed-by=argocd|meta.helm.sh/release-name|prune.protected=true"; }
+              
+              DRY_RUN=$(dry_run)
+              MIN_AGE_DAYS=$(min_age)
+              EXCLUDED_NS=$(excluded_ns)
+              PROTECTED_LABELS=$(protected_labels)
+              
+              total_deleted=0
+              total_skipped=0
+              
+              while IFS= read -r ns; do
+                [[ -z "$ns" ]] && continue
+                if echo "$ns" | grep -Eq "$EXCLUDED_NS"; then
+                  log INFO "Skipping excluded namespace namespace=$ns"
+                  continue
+                fi
+                
+                log INFO "Processing namespace namespace=$ns"
+                oc get cm -n "$ns" -o name 2>/dev/null | cut -d'/' -f2 > /tmp/candidates.txt || true
+                
+                deleted_in_ns=0
+                skipped_in_ns=0
+                
+                while IFS= read -r name; do
+                  # Skip protected by label
+                  labels=$(oc get cm "$name" -n "$ns" -o jsonpath='{.metadata.labels}' 2>/dev/null || echo "")
+                  skip=false
+                  for label in $(echo "$PROTECTED_LABELS" | tr '|' '\n'); do
+                    key="${label%=*}"
+                    if [[ "$labels" == *"$key"* ]]; then
+                      log INFO "Skipping protected ConfigMap namespace=$ns configmap=$name reason=\"label: $label\""
+                      skip=true; break
+                    fi
+                  done
+                  [[ "$skip" == "true" ]] && { ((skipped_in_ns++)); continue; }
+                  
+                  # Check age
+                  if [[ "$MIN_AGE_DAYS" -gt 0 ]]; then
+                    created=$(oc get cm "$name" -n "$ns" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null)
+                    if [[ -n "$created" ]]; then
+                      age_days=$(( ($(date +%s) - $(date -d "$created" +%s)) / 86400 ))
+                      if [[ "$age_days" -lt "$MIN_AGE_DAYS" ]]; then
+                        log INFO "Skipping ConfigMap (too new) namespace=$ns configmap=$name age_days=$age_days"
+                        ((skipped_in_ns++))
+                        continue
+                      fi
+                    fi
+                  fi
+                  
+                  # Check if referenced
+                  if oc get pod,deploy,ds,sts,job,cronjob,rs -n "$ns" -o yaml 2>/dev/null | grep -q "name: $name"; then
+                    log INFO "Skipping referenced ConfigMap namespace=$ns configmap=$name"
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # DELETE
+                  if [[ "$DRY_RUN" == "false" ]]; then
+                    log INFO "Deleting unreferenced ConfigMap namespace=$ns configmap=$name"
+                    oc delete cm "$name" -n "$ns" >/dev/null
+                    ((deleted_in_ns++))
+                  else
+                    log DRYRUN "Would delete unreferenced ConfigMap namespace=$ns configmap=$name"
+                  fi
+                done < /tmp/candidates.txt
+                
+                log INFO "Namespace pruning summary namespace=$ns deleted=$deleted_in_ns skipped=$skipped_in_ns"
+                ((total_deleted += deleted_in_ns))
+                ((total_skipped += skipped_in_ns))
+                
+              done < <(oc get ns -o name 2>/dev/null | cut -d'/' -f2)
+              
+              log INFO "Cluster pruning completed total_deleted=$total_deleted total_skipped=$total_skipped dry_run=$DRY_RUN"
+          restartPolicy: OnFailure  
