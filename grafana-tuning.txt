@@ -17,8 +17,89 @@ max by(pod) (
   ) * 100
 )
 
+The priority matrix for the recommendations was reviewed, with encryption being a high priority. The next steps involve deploying monitoring to identify affected clusters, document current resource utilization patterns, and implement tunings. Additionally, there is a need for a centralized alert system, correlation of activities to metrics, and a framework for AIOps exercises.
+
+To receive some alert. Of course, there will be a protocol alert, but I am pretty sure there can be warnings to us. And of course, those are pretty defined.
+
+And for these custom alerts, they are sometimes warning, sometimes even informational. And you know, if we have a place to store them on a centralized, that would be powerful for lower, I think. It is not a KP, it is not just part of this recommendation, but I think that is something else. We could look at, so can I get Chris.. Yes, sure yes.
+
+Yes. You? Yes, yes, it makes sense. It looks to me like a good approach to a good solution to our future events.
 
 
+	•	Custom Alerts Storage: Proposal to centralize storage for custom alerts, which can be informational or warning-type, separate from protocol alerts.
+	•	Future Events Solution: Agreement on a good approach to address future events, with Alex taking the lead on exploring it.
+	•	Criticality of Prioritized Items: Discussion on the criticality of prioritized items, particularly encryption, and whether existing measures like SCD are sufficient.
+	•	Encryption and Memory Management: Discussion about the use of encryption in back-end commits, its impact on CPU memory, and the need for encryption key rotation.
+	•	Correlating Events and Activities: The need to find a way to correlate events, such as instance failures, with specific activities like API updates or key rotations.
+	•	Performance and Stability Improvements: Mentioning the use of Sat nodes, limits, and suspensions to improve efficiency, handle speed times, and enhance stability.
+	•	Next Steps for Deployment Monitoring: Identify affected clusters, document current resource utilization patterns, and implement tunings.
+	•	Analyzing Resource Utilization: Analyze dashboard data to identify patterns, issues, and important areas for action.
+	•	Alerting and Tuning Strategy: Avoid unnecessary alerts and focus on actionable insights. Prioritize identifying problems and solutions before implementing tunings.
+	•	Focus of Analysis: Prioritize infrastructure analysis over control plane, considering accountability and potential impacts.
+	•	Documentation and Monitoring: Ongoing documentation and analysis of issues per cluster, including impact assessment and validation.
+	•	Next Steps: Transition from data collection to identifying potential issues and creating mitigation strategies.
+	•	Data Monitoring and Analysis: Monitoring environmental and tax issues, potentially through AIO exercises, and correlating data for insights.
+	•	Data Storage and Signatures: Storing relevant events, product metrics (FCD, PPI), and alerts, and correlating them for analysis.
+	•	Potential Tools and Technologies: Exploring tools like Ketder and considering the scalability of options like JBM and HPA.
+	•	Next Steps Confirmation: Agreement on the next steps to be taken.
+	•	Meeting Summary: A 10-minute meeting that was considered productive.
+	•	Post-Meeting Discussion: An invitation for further discussion after the meeting concludes.
+
+
+
+Summary:
+
+The discussion focused on improving alert protocols, prioritizing monitoring systems, and refining resource utilization analysis. Key topics included the necessity for custom alerts, encryption-related monitoring, correlation of events with activities, resource efficiency improvements, and the development of a comprehensive framework for event tracking and analysis. The team emphasized the importance of meaningful alerts, accurate correlation of activities, and systematic monitoring to preempt potential issues.
+
+Action Items and Next Steps:
+Custom Alert Development:
+Next Steps: Define parameters for custom alerts, differentiate between warning and informational types, and centralize storage for better accessibility.
+Encryption Monitoring:
+Next Steps: Review existing systems (e.g., back-end commits) for encryption-related activities, assess CPU/memory impacts, and ensure proper monitoring is in place.
+Event Correlation Framework:
+Next Steps: Develop methods to correlate activities with specific incidents, focusing on key rotations, API updates, and system anomalies.
+Dashboard Analysis:
+Next Steps: Utilize the dashboard to identify patterns and resource utilization issues, document findings, and determine critical impacts.
+Monitoring and Resource Analysis:
+Next Steps:
+Phase 1: Deploy monitoring tools, identify affected clusters, and document current resource usage.
+Phase 2: Implement tuning based on Phase 1 data.
+Phase 3: Analyze identified issues and develop solutions.
+Alert Optimization:
+Next Steps: Refine alert criteria to avoid unnecessary notifications, ensuring alerts are actionable and relevant.
+Framework for Event and Alert Correlation:
+Next Steps: Design a framework to correlate metrics data with events, enhancing visibility and response strategies.
+JVM and HPA Monitoring:
+Next Steps: Assess the necessity and priority of JVM and HPA-related monitoring, focusing on scalability and impact.
+Continuous Documentation and Review:
+Next Steps: Ongoing documentation of analysis, impact assessments, and validation of recurring issues.
+Periodic Discussions and Updates:
+Next Steps: Regular check-ins to review progress, discuss findings, and adjust strategies as needed.
+
+
+	•	The next step is to identify issues in the clusters.
+	•	The first phase is to deploy monitoring and identify affected clusters.
+	•	The second phase is to implement tunings and deploy them in phase one.
+	•	The last step is to document current resource utilization patterns.
+	•	The analysis of the numbers in the dashboard is important to identify issues.
+	•	The alerts should not be sent just for the sake of it.
+	•	The focus should be on identifying important issues that need action.
+	•	The tuning phase (phase 3) will come after identifying all the problems and their solutions.
+	•	The context is a discussion about analyzing and documenting issues in a system.
+	•	The focus is on infrastructure first, not the control plane.
+	•	The speaker wants to identify contributors to issues and determine what actions can be taken.
+	•	The speaker mentions that they will continue to review documentation and monitor the system for issues.
+	•	The speaker mentions that they will create stories to track ongoing issues.
+	•	The speaker mentions that they will analyze the status of the system and take appropriate actions.
+	•	The speaker mentions that they will identify potential issues or critical components in the system.
+	•	The procedure for monitoring the environment and tax issues is not clear.
+	•	The band and alert system should be essentialized.
+	•	The AIOs exercises should include the implementation of the framework.
+	•	The events should be correlated by instant and other means.
+	•	The matrics data and signature data should be collected and correlated.
+	•	The Ketder and other HPA should be considered.
+	•	The JBM might not be considered as it is usually used by one person and is not scalable.
+	•	The next steps are being discussed.
 -------------------------------------
 {
   "datasource": {
