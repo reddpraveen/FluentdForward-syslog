@@ -1,4 +1,25 @@
-      - name: Add input-defined collaborators, teams, and triggerer as admin
+
+      - name: DEBUG: Check if token user can manage collaborators
+        if: inputs.operation == 'create-repo-full'
+        run: |
+          echo "Testing collaborator add with READ permission first..."
+          if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/collaborators/${{ github.triggering_actor }} -X PUT -f permission=pull; then
+            echo "✅ READ permission works"
+          else
+            echo "❌ Even READ fails — token lacks collaborator management rights"
+            exit 1
+          fi
+          
+          echo "Testing collaborator add with ADMIN permission..."
+          if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/collaborators/${{ github.triggering_actor }} -X PUT -f permission=admin; then
+            echo "✅ ADMIN permission works"
+          else
+            echo "❌ ADMIN permission failed — likely due to insufficient token privileges"
+            echo "→ Token user is NOT an org owner or repo admin"
+          fi
+
+
+- name: Add input-defined collaborators, teams, and triggerer as admin
         if: inputs.operation == 'create-repo-full' || inputs.operation == 'copy-collaborators-only' || inputs.operation == 'sync-all-settings'
         run: |
           set -e
