@@ -1,3 +1,36 @@
+      - name: Wait for repository to be fully available
+        if: inputs.operation == 'create-repo-full' && (steps.check-target.outputs.repo_exists == 'false' || inputs.force_recreate == 'true')
+        run: |
+          set -e
+          target_repo="${{ steps.set-target.outputs.target_repo_full }}"
+          echo "Waiting for repository $target_repo to be ready for collaborator operations..."
+
+          max_wait=60  # seconds
+          interval=5
+          elapsed=0
+
+          while [ $elapsed -lt $max_wait ]; do
+            if gh api repos/$target_repo >/dev/null 2>&1; then
+              echo "Repository is now available"
+              break
+            else
+              echo "Repository not ready yet (waited $elapsed seconds)..."
+              sleep $interval
+              elapsed=$((elapsed + interval))
+            fi
+          done
+
+          if [ $elapsed -ge $max_wait ]; then
+            echo "ERROR: Repository still not available after $max_wait seconds"
+            exit 1
+          fi
+
+
+
+
+
+
+
 
       - name: DEBUG: Check if token user can manage collaborators
         if: inputs.operation == 'create-repo-full'
