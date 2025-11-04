@@ -1,14 +1,15 @@
               success=false
               for attempt in $(seq 1 3); do
+                echo "DEBUG: Adding collaborator $login with permission $permission (attempt $attempt)"
                 if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/collaborators/$login \
-                   \
                   -X PUT \
-                  -f permission="$permission" 2>/dev/null; then
+                  -f permission="$permission"; then
                   echo "| $login | $permission | ADD/UPDATE | SUCCESS |" >> $GITHUB_STEP_SUMMARY
                   ((success_count++))
                   success=true
                   break
                 else
+                  echo "ERROR: Failed to add $login (attempt $attempt). See GitHub API error above."
                   if [ $attempt -eq 3 ]; then
                     echo "| $login | $permission | ADD/UPDATE | FAILED (3 attempts) |" >> $GITHUB_STEP_SUMMARY
                     ((error_count++))
@@ -17,7 +18,6 @@
                   fi
                 fi
               done
-
 
 
 
