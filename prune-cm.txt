@@ -1,3 +1,273 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cm-secret-pruner
+  namespace: openshift-operators
+spec:
+  schedule: "34 19 * * *"  # Daily at 7:34 PM
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600  # 1 hour timeout
+      template:
+        spec:
+          serviceAccountName: cm-secret-pruner
+          restartPolicy: Never  # Changed from OnFailure to Never
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "100m"
+              limits:
+                memory: "256Mi"
+                cpu: "500m"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              
+              # Enhanced logging with color support
+              log() {
+                level="$1"
+                shift
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*"
+              }
+              
+              # Error handler
+              error_exit() {
+                log ERROR "$1"
+                exit 1
+              }
+              
+              # Trap errors
+              trap 'error_exit "Script failed at line $LINENO"' ERR
+              
+              log INFO "========================================="
+              log INFO "ConfigMap Pruner Job Started"
+              log INFO "========================================="
+              
+              NS="openshift-operators"
+              CM="cm-secret-pruner-config"
+              
+              # Verify ConfigMap exists
+              if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+                error_exit "ConfigMap $CM not found in namespace $NS"
+              fi
+              
+              log INFO "ConfigMap found: $CM in namespace $NS"
+              
+              # Load configuration with validation
+              DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "true")
+              MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "30")
+              EXCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "^openshift-.*
+^kube-.*
+^default$
+^openshift$")
+              PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "app.kubernetes.io/managed-by=argocd
+meta.helm.sh/release-name
+prune.protected=true")
+              
+              # Validate configuration
+              if [[ ! "$MIN_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+                error_exit "Invalid minAgeDays value: $MIN_AGE_DAYS (must be a number)"
+              fi
+              
+              log INFO "Configuration loaded successfully:"
+              log INFO "  DRY_RUN: $DRY_RUN"
+              log INFO "  MIN_AGE_DAYS: $MIN_AGE_DAYS"
+              log INFO "  EXCLUDED_NS patterns: $(echo "$EXCLUDED_NS" | wc -l) patterns"
+              log INFO "  PROTECTED_LABELS: $(echo "$PROTECTED_LABELS" | wc -l) labels"
+              
+              # Verify oc command works
+              if ! oc whoami &>/dev/null; then
+                error_exit "Unable to authenticate with OpenShift cluster"
+              fi
+              
+              log INFO "Authenticated as: $(oc whoami)"
+              
+              # Get list of namespaces
+              if ! oc get ns &>/dev/null; then
+                error_exit "Unable to list namespaces - check RBAC permissions"
+              fi
+              
+              namespace_list=$(oc get ns -o name 2>/dev/null | cut -d'/' -f2)
+              namespace_count=$(echo "$namespace_list" | wc -l)
+              log INFO "Found $namespace_count namespaces to process"
+              
+              total_deleted=0
+              total_skipped=0
+              total_protected=0
+              total_too_new=0
+              total_referenced=0
+              namespaces_processed=0
+              
+              while IFS= read -r ns; do
+                [[ -z "$ns" ]] && continue
+                
+                # Check if namespace is excluded
+                excluded=false
+                while IFS= read -r pattern; do
+                  [[ -z "$pattern" ]] && continue
+                  if echo "$ns" | grep -Eq "$pattern"; then
+                    log INFO "Skipping excluded namespace: $ns (matched pattern: $pattern)"
+                    excluded=true
+                    break
+                  fi
+                done <<< "$EXCLUDED_NS"
+                
+                [[ "$excluded" == "true" ]] && continue
+                
+                ((namespaces_processed++))
+                log INFO "========================================="
+                log INFO "Processing namespace: $ns ($namespaces_processed/$namespace_count non-excluded)"
+                log INFO "========================================="
+                
+                # Get ConfigMaps in namespace
+                if ! cm_list=$(oc get cm -n "$ns" -o name 2>/dev/null); then
+                  log WARN "Unable to list ConfigMaps in namespace: $ns (skipping)"
+                  continue
+                fi
+                
+                cm_count=$(echo "$cm_list" | grep -c "configmap/" || echo "0")
+                log INFO "Found $cm_count ConfigMaps in namespace: $ns"
+                
+                [[ "$cm_count" -eq 0 ]] && continue
+                
+                deleted_in_ns=0
+                skipped_in_ns=0
+                
+                while IFS= read -r cm_name_full; do
+                  [[ -z "$cm_name_full" ]] && continue
+                  name=$(echo "$cm_name_full" | cut -d'/' -f2)
+                  
+                  log DEBUG "Evaluating ConfigMap: $name in namespace: $ns"
+                  
+                  # Get ConfigMap metadata
+                  if ! cm_json=$(oc get cm "$name" -n "$ns" -o json 2>/dev/null); then
+                    log WARN "Unable to get ConfigMap details: $name in $ns (skipping)"
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # Check for protected labels
+                  skip=false
+                  while IFS= read -r label_rule; do
+                    [[ -z "$label_rule" ]] && continue
+                    
+                    if [[ "$label_rule" == *"="* ]]; then
+                      # Key=value format
+                      key="${label_rule%=*}"
+                      value="${label_rule#*=}"
+                      actual_value=$(echo "$cm_json" | jq -r ".metadata.labels.\"$key\" // empty" 2>/dev/null || echo "")
+                      
+                      if [[ "$actual_value" == "$value" ]]; then
+                        log INFO "PROTECTED: ConfigMap has protected label [$label_rule] - namespace=$ns name=$name"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    else
+                      # Key-only format
+                      if echo "$cm_json" | jq -e ".metadata.labels.\"$label_rule\"" &>/dev/null; then
+                        log INFO "PROTECTED: ConfigMap has protected label [$label_rule] - namespace=$ns name=$name"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    fi
+                  done <<< "$PROTECTED_LABELS"
+                  
+                  if [[ "$skip" == "true" ]]; then
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # Check age
+                  if [[ "$MIN_AGE_DAYS" -gt 0 ]]; then
+                    created=$(echo "$cm_json" | jq -r '.metadata.creationTimestamp' 2>/dev/null)
+                    if [[ -n "$created" && "$created" != "null" ]]; then
+                      created_epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+                      current_epoch=$(date +%s)
+                      age_days=$(( (current_epoch - created_epoch) / 86400 ))
+                      
+                      if [[ "$age_days" -lt "$MIN_AGE_DAYS" ]]; then
+                        log INFO "TOO NEW: ConfigMap is only $age_days days old (min: $MIN_AGE_DAYS) - namespace=$ns name=$name"
+                        ((skipped_in_ns++))
+                        ((total_too_new++))
+                        continue
+                      fi
+                      log DEBUG "ConfigMap age: $age_days days - namespace=$ns name=$name"
+                    fi
+                  fi
+                  
+                  # Check if referenced by any workload
+                  log DEBUG "Checking if ConfigMap is referenced - namespace=$ns name=$name"
+                  referenced=false
+                  
+                  if workloads=$(oc get pod,deploy,ds,sts,job,cronjob,rs -n "$ns" -o yaml 2>/dev/null); then
+                    # Check for direct name reference in configMapRef or volumes
+                    if echo "$workloads" | grep -E "(configMap:|configMapRef:)" | grep -q "name: $name"; then
+                      log INFO "REFERENCED: ConfigMap is referenced by workload - namespace=$ns name=$name"
+                      referenced=true
+                      ((total_referenced++))
+                    fi
+                  else
+                    log WARN "Unable to check workload references in namespace: $ns"
+                  fi
+                  
+                  if [[ "$referenced" == "true" ]]; then
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # DELETE or DRY RUN
+                  if [[ "$DRY_RUN" == "false" ]]; then
+                    log WARN "DELETING: Unreferenced ConfigMap - namespace=$ns name=$name"
+                    if oc delete cm "$name" -n "$ns" 2>/dev/null; then
+                      ((deleted_in_ns++))
+                      ((total_deleted++))
+                      log INFO "Successfully deleted ConfigMap - namespace=$ns name=$name"
+                    else
+                      log ERROR "Failed to delete ConfigMap - namespace=$ns name=$name"
+                      ((skipped_in_ns++))
+                    fi
+                  else
+                    log INFO "DRY-RUN: Would delete unreferenced ConfigMap - namespace=$ns name=$name"
+                    ((deleted_in_ns++))
+                  fi
+                  
+                done <<< "$cm_list"
+                
+                log INFO "Namespace summary - namespace=$ns deleted=$deleted_in_ns skipped=$skipped_in_ns"
+                ((total_skipped += skipped_in_ns))
+                
+              done <<< "$namespace_list"
+              
+              log INFO "========================================="
+              log INFO "Job Completed Successfully"
+              log INFO "========================================="
+              log INFO "Summary:"
+              log INFO "  Namespaces processed: $namespaces_processed"
+              log INFO "  ConfigMaps deleted/would delete: $total_deleted"
+              log INFO "  ConfigMaps skipped: $total_skipped"
+              log INFO "    - Protected by labels: $total_protected"
+              log INFO "    - Too new: $total_too_new"
+              log INFO "    - Referenced by workloads: $total_referenced"
+              log INFO "  Dry run mode: $DRY_RUN"
+              log INFO "========================================="
+              
+              exit 0
+
+
+
+
+
 cluster-addons/
 └── configmap-secret-pruner/
     ├── kustomization.yaml
