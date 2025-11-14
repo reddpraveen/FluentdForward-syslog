@@ -1,3 +1,52 @@
+error_exit() {
+  log ERROR "$1"
+  log ERROR "Call stack (most recent call last):"
+
+  local array_length=${#BASH_SOURCE[@]}
+  if [ "$array_length" -gt 1 ]; then
+    for (( i=array_length-1; i>=1; i-- )); do
+      local line_num_idx=$((i-1))
+
+      # Safe defaults
+      local src="unknown_source"
+      local func="unknown_function"
+      local line="unknown_line"
+
+      # BASH_SOURCE[i]
+      if (( i < ${#BASH_SOURCE[@]} )); then
+        src="${BASH_SOURCE[$i]}"
+      fi
+
+      # BASH_LINENO[line_num_idx]
+      if (( line_num_idx < ${#BASH_LINENO[@]} )); then
+        line="${BASH_LINENO[$line_num_idx]}"
+      fi
+
+      # BASH_FUNCNAME[i]
+      if (( i < ${#BASH_FUNCNAME[@]} )); then
+        func="${BASH_FUNCNAME[$i]}"
+      fi
+
+      log ERROR "  ${src}:${line} in \`${func}\`"
+    done
+  fi
+
+  # Current function + line, also guarded
+  local current_func="unknown"
+  local current_line="unknown"
+
+  if (( 0 < ${#BASH_FUNCNAME[@]} )); then
+    current_func="${BASH_FUNCNAME[0]}"
+  fi
+  if (( 0 < ${#BASH_LINENO[@]} )); then
+    current_line="${BASH_LINENO[0]}"
+  fi
+
+  log ERROR "Current function: ${current_func} at line ${current_line}"
+  exit 1
+}
+
+--------
 ```bash
 #!/bin/bash
 
