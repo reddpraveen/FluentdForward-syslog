@@ -1,3 +1,34 @@
+
+# Check age (only if MIN_AGE_DAYS > 0)
+age_days="unknown"
+if [[ "$MIN_AGE_DAYS" -gt 0 ]]; then
+  created=$(echo "$cm_json" | jq -r '.metadata.creationTimestamp' 2>/dev/null || echo "")
+  if [[ -n "$created" && "$created" != "null" ]]; then
+    set +e
+    created_epoch=$(date -d "$created" +%s 2>/dev/null)
+    date_result=$?
+    set -e
+    
+    if [[ $date_result -eq 0 && -n "$created_epoch" ]]; then
+      current_epoch=$(date +%s)
+      age_days=$(( (current_epoch - created_epoch) / 86400 ))
+      
+      if [[ "$age_days" -lt "$MIN_AGE_DAYS" ]]; then
+        log INFO "TOO NEW: ConfigMap is $age_days days old (min: $MIN_AGE_DAYS) - namespace=$ns name=$name"
+        skipped_in_ns=$((skipped_in_ns + 1))
+        total_too_new=$((total_too_new + 1))
+        continue
+      fi
+      log DEBUG "ConfigMap age: $age_days days (min: $MIN_AGE_DAYS) - namespace=$ns name=$name"
+    else
+      log WARN "Unable to parse creation timestamp for ConfigMap: $name in $ns (timestamp: $created)"
+      age_days="unknown"
+    fi
+  fi
+fi
+
+
+
 #!/bin/bash
 
 set -euo pipefail
