@@ -1,0 +1,324 @@
+- name: Initialize target repository with content
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && (steps.check-target.outputs.repo_exists == 'false' || inputs.force_recreate == 'true')
+        run: |
+          set -e
+          
+          set +e
+          gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md >/dev/null 2>&1
+          has_content=$?
+          set -e
+          
+          if [ $has_content -eq 0 ]; then
+            echo "Repository already has content, skipping initialization"
+            exit 0
+          fi
+          
+          echo "Initializing target repository with master branch..."
+          mkdir -p temp_init
+          cd temp_init
+          
+          git init
+          git config user.name "${{ github.triggering_actor }}"
+          git config user.email "${{ github.triggering_actor }}@users.noreply.github.com"
+          
+          # Create README with repository name and branch information
+          repo_name=$(echo "${{ steps.set-target.outputs.target_repo_full }}" | cut -d'/' -f2)
+          
+          echo "# ${repo_name}" > README.md
+          echo "" >> README.md
+          echo "## Overview" >> README.md
+          echo "" >> README.md
+          echo "Please update this README with your project documentation." >> README.md
+          echo "" >> README.md
+          echo "## Development" >> README.md
+          echo "" >> README.md
+          echo "- **dev/initial**: Development branch - create your feature branches from here" >> README.md
+          echo "- **stable**: Production-ready code - requires pull request approval" >> README.md
+          echo "- **master**: Base branch" >> README.md
+          
+          git add README.md
+          git commit -m "Initial commit with repository setup"
+          
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Initial push to master branch attempt $attempt/$max_attempts"
+            
+            set +e
+            if git remote add origin "https://$GH_TOKEN@$GH_HOST/${{ steps.set-target.outputs.target_repo_full }}.git" && \
+               git branch -M master && \
+               git push -u origin master; then
+              echo "Initial content pushed to master branch successfully"
+              push_result=0
+            else
+              push_result=1
+            fi
+            set -e
+            
+            if [ $push_result -eq 0 ]; then
+              break
+            else
+              git remote remove origin 2>/dev/null || true
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Initial push failed, continuing anyway"
+              else
+                sleep 5
+              fi
+            fi
+          done
+          
+          cd ..
+          rm -rf temp_init
+
+
+
+- name: Copy additional branches (stable and dev/initial)
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && inputs.template_repo != ''
+        run: |
+          set -e
+          echo "Copying additional branches from source to target..."
+          
+          if [ ! -d "source-repo" ]; then
+            echo "Source repository not available, skipping branch copy"
+            exit 0
+          fi
+          
+          cd source-repo
+          
+          # Get list of branches in source
+          git fetch --all
+          
+          # Check if stable branch exists
+          stable_exists=false
+          dev_initial_exists=false
+          
+          set +e
+          git show-ref --verify --quiet refs/remotes/origin/stable
+          if [ $? -eq 0 ]; then
+            stable_exists=true
+          fi
+          
+          git show-ref --verify --quiet refs/remotes/origin/dev/initial
+          if [ $? -eq 0 ]; then
+            dev_initial_exists=true
+          fi
+          set -e
+          
+          cd ..
+          
+          if [ "$stable_exists" = "false" ] && [ "$dev_initial_exists" = "false" ]; then
+            echo "Neither stable nor dev/initial branches found in source repository"
+            exit 0
+          fi
+          
+          echo "Cloning target repository to copy branches..."
+          set +e
+          gh repo clone "${{ steps.set-target.outputs.target_repo_full }}" target-repo-branches
+          clone_result=$?
+          set -e
+          
+          if [ $clone_result -ne 0 ]; then
+            echo "Failed to clone target repository for branch copy"
+            exit 0
+          fi
+          
+          cd target-repo-branches
+          
+          git config user.name "${{ github.triggering_actor }}"
+          git config user.email "${{ github.triggering_actor }}@users.noreply.github.com"
+          
+          # Copy stable branch if it exists
+          if [ "$stable_exists" = "true" ]; then
+            echo "Copying stable branch..."
+            
+            # Copy files from source stable branch
+            cd ../source-repo
+            git checkout stable
+            cd ../target-repo-branches
+            
+            # Create stable branch from master
+            git checkout -b stable master
+            
+            # Copy all files from source stable branch
+            rsync -av --exclude='.git' ../source-repo/ ./
+            
+            git add .
+            if git diff --staged --quiet; then
+              echo "No changes to commit for stable branch"
+            else
+              git commit -m "Copy content from source repository stable branch"
+            fi
+            
+            # Push stable branch
+            max_attempts=3
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Pushing stable branch attempt $attempt/$max_attempts"
+              
+              set +e
+              git push origin stable
+              push_result=$?
+              set -e
+              
+              if [ $push_result -eq 0 ]; then
+                echo "✅ Stable branch pushed successfully"
+                break
+              else
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "⚠️ Failed to push stable branch after $max_attempts attempts"
+                else
+                  sleep 5
+                fi
+              fi
+            done
+          fi
+          
+          # Copy dev/initial branch if it exists
+          if [ "$dev_initial_exists" = "true" ]; then
+            echo "Copying dev/initial branch..."
+            
+            # Switch to master first
+            git checkout master
+            
+            # Copy files from source dev/initial branch
+            cd ../source-repo
+            git checkout dev/initial
+            cd ../target-repo-branches
+            
+            # Create dev/initial branch from master
+            git checkout -b dev/initial master
+            
+            # Copy all files from source dev/initial branch
+            rsync -av --exclude='.git' ../source-repo/ ./
+            
+            git add .
+            if git diff --staged --quiet; then
+              echo "No changes to commit for dev/initial branch"
+            else
+              git commit -m "Copy content from source repository dev/initial branch"
+            fi
+            
+            # Push dev/initial branch
+            max_attempts=3
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Pushing dev/initial branch attempt $attempt/$max_attempts"
+              
+              set +e
+              git push origin dev/initial
+              push_result=$?
+              set -e
+              
+              if [ $push_result -eq 0 ]; then
+                echo "✅ dev/initial branch pushed successfully"
+                break
+              else
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "⚠️ Failed to push dev/initial branch after $max_attempts attempts"
+                else
+                  sleep 5
+                fi
+              fi
+            done
+          fi
+          
+          cd ..
+          rm -rf target-repo-branches
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Branch Copy Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| master | ✅ Created |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$stable_exists" = "true" ]; then
+            echo "| stable | ✅ Copied and pushed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| stable | ⚠️ Not found in source |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$dev_initial_exists" = "true" ]; then
+            echo "| dev/initial | ✅ Copied and pushed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| dev/initial | ⚠️ Not found in source |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+
+# Determine which branches to protect
+          > branches_to_protect.txt
+          
+          # Always protect stable branch if it exists in target
+          if grep -q "^stable$" target_branches.txt; then
+            echo "stable" >> branches_to_protect.txt
+          fi
+          
+          # Also copy protection from any other protected branches in source
+          while IFS= read -r branch; do
+            if grep -q "^$branch$" target_branches.txt; then
+              # Avoid duplicates
+              if ! grep -q "^$branch$" branches_to_protect.txt; then
+                echo "$branch" >> branches_to_protect.txt
+              fi
+            fi
+          done < protected_branches.txt
+
+
+  
+ - name: Apply branch protection to stable branch
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false
+        run: |
+          set -e
+          
+          export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+          
+          echo "Applying branch protection to stable branch..."
+          
+          # Check if stable branch exists in target
+          set +e
+          gh api repos/${{ steps.set-target.outputs.target_repo_full }}/branches/stable >/dev/null 2>&1
+          stable_exists=$?
+          set -e
+          
+          if [ $stable_exists -ne 0 ]; then
+            echo "Stable branch doesn't exist yet, skipping protection"
+            exit 0
+          fi
+          
+          # Create branch protection payload for stable
+          # Requires pull requests from dev/initial to stable
+          protection_payload='{
+            "required_pull_request_reviews": {
+              "dismiss_stale_reviews": true,
+              "require_code_owner_reviews": false,
+              "required_approving_review_count": 1
+            },
+            "enforce_admins": false,
+            "required_status_checks": null,
+            "restrictions": null
+          }'
+          
+          echo "Applying protection rules to stable branch..."
+          
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            set +e
+            gh api repos/${{ steps.set-target.outputs.target_repo_full }}/branches/stable/protection \
+              -X PUT \
+              --input <(echo "$protection_payload") 2>/dev/null
+            api_result=$?
+            set -e
+            
+            if [ $api_result -eq 0 ]; then
+              echo "✅ Branch protection applied to stable"
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "## Stable Branch Protection" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Requires pull request approval (1 reviewer)" >> $GITHUB_STEP_SUMMARY
+              echo "- ✅ Dismisses stale reviews" >> $GITHUB_STEP_SUMMARY
+              echo "- ℹ️ Developers must create PR from dev/initial → stable" >> $GITHUB_STEP_SUMMARY
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "⚠️ Failed to apply branch protection to stable"
+              else
+                sleep 3
+              fi
+            fi
+          done 
+  
