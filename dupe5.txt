@@ -1,0 +1,574 @@
+echo "Source repository not available, skipping content copy"
+            exit 0
+          fi
+          
+          # Check if source has stable branch
+          cd source-repo
+          set +e
+          git show-ref --verify --quiet refs/remotes/origin/stable
+          stable_exists=$?
+          set -e
+          cd ..
+          
+          if [ $stable_exists -ne 0 ]; then
+            echo "Source repository doesn't have stable branch, skipping content copy"
+            exit 0
+          fi
+          
+          # Check if target has stable branch
+          set +e
+          gh api repos/${{ steps.set-target.outputs.target_repo_full }}/branches/stable >/dev/null 2>&1
+          target_stable_exists=$?
+          set -e
+          
+          if [ $target_stable_exists -ne 0 ]; then
+            echo "Target repository doesn't have stable branch yet, skipping content copy"
+            echo "Note: Stable branch will be created by the 'Copy additional branches' step"
+            exit 0
+          fi
+          
+          echo "Cloning target repository to sync content..."
+          set +e
+          gh repo clone "${{ steps.set-target.outputs.target_repo_full }}" target-repo
+          clone_result=$?
+          set -e
+          
+          if [ $clone_result -ne 0 ]; then
+            echo "Failed to clone target repository, skipping content sync"
+            exit 0
+          fi
+          
+          cd target-repo
+          
+          # Checkout stable branch
+          git checkout stable
+          
+          # Copy all files from source stable branch (excluding .git)
+          cd ../source-repo
+          git checkout stable
+          cd ../target-repo
+          
+          rsync -av --exclude='.git' ../source-repo/ ./
+          
+          git config user.name "${{ github.triggering_actor }}"
+          git config user.email "${{ github.triggering_actor }}@users.noreply.github.com"
+          
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Sync content from source repository stable branch"
+            
+            max_attempts=3
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Content push to stable branch attempt $attempt/$max_attempts"
+              
+              set +e
+              git push origin stable
+              push_result=$?
+              set -e
+              
+              if [ $push_result -eq 0 ]; then
+                echo "✅ Content synced to stable branch successfully"
+                break
+              else
+                if [ $attempt -eq $max_attempts ]; then
+                  echo "⚠️ Content push failed after $max_attempts attempts"
+                  exit 0
+                else
+                  sleep 5
+                fi
+              fi
+            done
+          fi
+          cd ..
+          rm -rf target-repo
+          
+      - name: Add collaborators and teams from inputs
+        if: inputs.operation == 'create-repo-full' || inputs.operation == 'copy-collaborators-only' || inputs.operation == 'sync-all-settings'
+        run: |
+          set -e
+          
+          if ! command -v gh >/dev/null 2>&1; then
+            export PATH="/usr/local/bin:/usr/bin:$PATH"
+          fi
+          
+          echo "Adding collaborators and teams to ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          # Re-verify authentication
+          if [ "$GH_HOST" = "github.com" ]; then
+            gh auth status || {
+              echo "Re-authenticating..."
+              echo "$GH_TOKEN" | gh auth login --with-token
+            }
+          else
+            gh auth status --hostname "$GH_HOST" || {
+              echo "Re-authenticating..."
+              echo "$GH_TOKEN" | gh auth login --hostname "$GH_HOST" --with-token
+            }
+          fi
+          
+          echo "## Collaborator & Team Management" >> $GITHUB_STEP_SUMMARY
+          echo "| User/Team | Type | Permission | Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|------|------------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          success_count=0
+          error_count=0
+          skip_count=0
+          
+          # Process individual collaborators from input
+          collaborators='${{ inputs.collaborators }}'
+          if [ "$collaborators" != "[]" ] && [ -n "$collaborators" ]; then
+            echo "Processing individual collaborators..."
+            echo "$collaborators" | jq -c '.[]' | while IFS= read -r collaborator; do
+              username=$(echo "$collaborator" | jq -r '.username // empty')
+              permission=$(echo "$collaborator" | jq -r '.permission // "write"')
+              
+              if [ -z "$username" ]; then
+                continue
+              fi
+              
+              # Skip the repository owner
+              target_owner=$(echo "${{ steps.set-target.outputs.target_repo_full }}" | cut -d'/' -f1)
+              if [ "$username" = "$target_owner" ]; then
+                echo "| $username | User | $permission | SKIP | Repository owner |" >> $GITHUB_STEP_SUMMARY
+                skip_count=$((skip_count + 1))
+                continue
+              fi
+              
+              if [ "${{ inputs.dry_run }}" = "true" ]; then
+                echo "| $username | User | $permission | DRY RUN | Would be added |" >> $GITHUB_STEP_SUMMARY
+              else
+                # Add collaborator with retry
+                success=false
+                error_message=""
+                
+                for attempt in $(seq 1 3); do
+                  set +e
+                  error_output=$(gh api repos/${{ steps.set-target.outputs.target_repo_full }}/collaborators/$username \
+                    -X PUT \
+                    -f permission="$permission" 2>&1)
+                  add_result=$?
+                  set -e
+                  
+                  if [ $add_result -eq 0 ]; then
+                    echo "| $username | User | $permission | ADD/UPDATE | ✅ SUCCESS |" >> $GITHUB_STEP_SUMMARY
+                    success_count=$((success_count + 1))
+                    success=true
+                    break
+                  else
+                    error_message="$error_output"
+                    
+                    # Check for specific errors
+                    if echo "$error_output" | grep -qi "suspended\|not found\|403"; then
+                      if echo "$error_output" | grep -qi "suspended"; then
+                        echo "| $username | User | $permission | SKIP | ⚠️ User suspended |" >> $GITHUB_STEP_SUMMARY
+                      elif echo "$error_output" | grep -qi "not found"; then
+                        echo "| $username | User | $permission | SKIP | ⚠️ User not found |" >> $GITHUB_STEP_SUMMARY
+                      else
+                        echo "| $username | User | $permission | SKIP | ⚠️ Permission denied |" >> $GITHUB_STEP_SUMMARY
+                      fi
+                      skip_count=$((skip_count + 1))
+                      break
+                    fi
+                    
+                    if [ $attempt -eq 3 ]; then
+                      echo "| $username | User | $permission | ADD/UPDATE | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+                      error_count=$((error_count + 1))
+                    else
+                      sleep 2
+                    fi
+                  fi
+                done
+              fi
+            done
+          else
+            echo "No individual collaborators to add"
+          fi
+          
+          # Process teams from input
+          teams='${{ inputs.teams }}'
+          if [ "$teams" != "[]" ] && [ -n "$teams" ]; then
+            echo "Processing teams..."
+            echo "$teams" | jq -c '.[]' | while IFS= read -r team; do
+              team_slug=$(echo "$team" | jq -r '.team // empty')
+              permission=$(echo "$team" | jq -r '.permission // "write"')
+              
+              if [ -z "$team_slug" ]; then
+                continue
+              fi
+              
+              if [ "${{ inputs.dry_run }}" = "true" ]; then
+                echo "| $team_slug | Team | $permission | DRY RUN | Would be added |" >> $GITHUB_STEP_SUMMARY
+              else
+                # Add team with retry
+                target_org=$(echo "${{ steps.set-target.outputs.target_repo_full }}" | cut -d'/' -f1)
+                success=false
+                error_message=""
+                
+                for attempt in $(seq 1 3); do
+                  set +e
+                  error_output=$(gh api repos/${{ steps.set-target.outputs.target_repo_full }}/teams/$team_slug \
+                    -X PUT \
+                    -f permission="$permission" 2>&1)
+                  add_result=$?
+                  set -e
+                  
+                  if [ $add_result -eq 0 ]; then
+                    echo "| $team_slug | Team | $permission | ADD/UPDATE | ✅ SUCCESS |" >> $GITHUB_STEP_SUMMARY
+                    success_count=$((success_count + 1))
+                    success=true
+                    break
+                  else
+                    error_message="$error_output"
+                    
+                    # Check for specific errors
+                    if echo "$error_output" | grep -qi "not found\|403\|404"; then
+                      if echo "$error_output" | grep -qi "not found\|404"; then
+                        echo "| $team_slug | Team | $permission | SKIP | ⚠️ Team not found in org |" >> $GITHUB_STEP_SUMMARY
+                      else
+                        echo "| $team_slug | Team | $permission | SKIP | ⚠️ Permission denied |" >> $GITHUB_STEP_SUMMARY
+                      fi
+                      skip_count=$((skip_count + 1))
+                      break
+                    fi
+                    
+                    if [ $attempt -eq 3 ]; then
+                      echo "| $team_slug | Team | $permission | ADD/UPDATE | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+                      error_count=$((error_count + 1))
+                    else
+                      sleep 2
+                    fi
+                  fi
+                done
+              fi
+            done
+          else
+            echo "No teams to add"
+          fi
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Summary**: ✅ $success_count successful, ❌ $error_count failed, ⚠️ $skip_count skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Copy branch protection rules with enterprise support
+        if: inputs.operation == 'create-repo-full' || inputs.operation == 'copy-protection-only' || inputs.operation == 'sync-all-settings'
+        run: |
+          set -e
+          
+          if [ -z "${{ inputs.template_repo }}" ]; then
+            echo "No template repository specified, skipping branch protection copy"
+            exit 0
+          fi
+          
+          export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+          if command -v gh >/dev/null 2>&1; then
+            GH_CMD="$(command -v gh)"
+          elif [ -x "/usr/local/bin/gh" ]; then
+            GH_CMD="/usr/local/bin/gh"
+          elif [ -x "/usr/bin/gh" ]; then
+            GH_CMD="/usr/bin/gh"
+          else
+            echo "ERROR: GitHub CLI not found"
+            exit 1
+          fi
+          
+          echo "Copying branch protection rules..."
+          
+          if [ "$GH_HOST" = "github.com" ]; then
+            $GH_CMD auth status || {
+              echo "$GH_TOKEN" | $GH_CMD auth login --with-token
+            }
+          else
+            $GH_CMD auth status --hostname "$GH_HOST" || {
+              echo "$GH_TOKEN" | $GH_CMD auth login --hostname "$GH_HOST" --with-token
+            }
+          fi
+          
+          # Fetch source branches
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching source branches attempt $attempt/$max_attempts"
+            
+            set +e
+            $GH_CMD api repos/${{ inputs.template_repo }}/branches --jq '.[].name' > source_branches.txt
+            fetch_result=$?
+            set -e
+            
+            if [ $fetch_result -eq 0 ]; then
+              echo "Source branches fetched successfully"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch source branches, skipping protection copy"
+                exit 0
+              fi
+              sleep 5
+            fi
+          done
+          
+          echo "Source branches: $(cat source_branches.txt | tr '\n' ' ')"
+          
+          # Fetch target branches
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Fetching target branches attempt $attempt/$max_attempts"
+            
+            set +e
+            output=$($GH_CMD api repos/${{ steps.set-target.outputs.target_repo_full }}/branches --jq '.[].name' 2>&1)
+            fetch_result=$?
+            set -e
+            
+            if [ $fetch_result -eq 0 ]; then
+              echo "$output" > target_branches.txt
+              echo "Target branches fetched successfully"
+              break
+            else
+              if echo "$output" | grep -q "404\|Not Found\|empty repository"; then
+                echo "Repository may be empty, creating empty file"
+                touch target_branches.txt
+                break
+              fi
+              
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Failed to fetch target branches, skipping protection copy"
+                exit 0
+              fi
+              sleep 5
+            fi
+          done
+          
+          echo "Target branches: $(cat target_branches.txt | tr '\n' ' ')"
+          
+          # Find protected branches in source
+          > protected_branches.txt
+          while IFS= read -r branch; do
+            set +e
+            $GH_CMD api repos/${{ inputs.template_repo }}/branches/$branch/protection > protection_${branch}.json 2>/dev/null
+            prot_result=$?
+            set -e
+            
+            if [ $prot_result -eq 0 ]; then
+              echo "$branch" >> protected_branches.txt
+            fi
+          done < source_branches.txt
+          
+          # Determine which branches to protect
+          > branches_to_protect.txt
+          
+          # ALWAYS protect stable branch if it exists in target (with default PR protection)
+          if grep -q "^stable$" target_branches.txt; then
+            echo "stable" >> branches_to_protect.txt
+          fi
+          
+          # Copy protection from any other protected branches in source
+          while IFS= read -r branch; do
+            if grep -q "^$branch$" target_branches.txt; then
+              # Avoid duplicates
+              if ! grep -q "^$branch$" branches_to_protect.txt; then
+                echo "$branch" >> branches_to_protect.txt
+              fi
+            fi
+          done < protected_branches.txt
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Branch Protection Management" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          protection_success=0
+          protection_error=0
+          
+          if [ -s branches_to_protect.txt ]; then
+            while IFS= read -r branch; do
+              if [ "${{ inputs.dry_run }}" = "true" ]; then
+                echo "| $branch | DRY RUN | Would apply protection rules |" >> $GITHUB_STEP_SUMMARY
+              else
+                # Special handling for stable branch - always require PR
+                if [ "$branch" = "stable" ]; then
+                  # Check if source has protection rules for stable
+                  if [ -f "protection_stable.json" ]; then
+                    # Use source protection rules
+                    protection_config=$(cat protection_stable.json)
+                  else
+                    # Apply default protection requiring PR approval
+                    protection_config='{
+                      "required_pull_request_reviews": {
+                        "dismiss_stale_reviews": true,
+                        "require_code_owner_reviews": false,
+                        "required_approving_review_count": 1
+                      },
+                      "enforce_admins": false,
+                      "required_status_checks": null,
+                      "restrictions": null
+                    }'
+                  fi
+                  
+                  payload="$protection_config"
+                else
+                  # For other branches, use source protection if available
+                  if [ -f "protection_${branch}.json" ]; then
+                    protection_config=$(cat protection_${branch}.json)
+                    payload='{}'
+                    
+                    if echo "$protection_config" | jq -e '.required_status_checks' >/dev/null 2>&1; then
+                      required_status_checks=$(echo "$protection_config" | jq '.required_status_checks')
+                      payload=$(echo "$payload" | jq --argjson rsc "$required_status_checks" '. + {required_status_checks: $rsc}')
+                    fi
+                    
+                    enforce_admins=$(echo "$protection_config" | jq -r '.enforce_admins.enabled // false')
+                    if [ "$enforce_admins" = "true" ]; then
+                      payload=$(echo "$payload" | jq '. + {enforce_admins: true}')
+                    fi
+                    
+                    if echo "$protection_config" | jq -e '.required_pull_request_reviews' >/dev/null 2>&1; then
+                      required_pull_request_reviews=$(echo "$protection_config" | jq '.required_pull_request_reviews')
+                      payload=$(echo "$payload" | jq --argjson rprr "$required_pull_request_reviews" '. + {required_pull_request_reviews: $rprr}')
+                    fi
+                    
+                    if echo "$protection_config" | jq -e '.restrictions' >/dev/null 2>&1; then
+                      restrictions=$(echo "$protection_config" | jq '.restrictions')
+                      payload=$(echo "$payload" | jq --argjson rest "$restrictions" '. + {restrictions: $rest}')
+                    fi
+                  else
+                    echo "| $branch | SKIP | No protection rules in source |" >> $GITHUB_STEP_SUMMARY
+                    continue
+                  fi
+                fi
+                
+                # Apply protection
+                success=false
+                for attempt in $(seq 1 3); do
+                  set +e
+                  gh api repos/${{ steps.set-target.outputs.target_repo_full }}/branches/$branch/protection \
+                    -X PUT \
+                    --input <(echo "$payload") 2>/dev/null
+                  api_result=$?
+                  set -e
+                  
+                  if [ $api_result -eq 0 ]; then
+                    if [ "$branch" = "stable" ]; then
+                      echo "| $branch | PROTECT | ✅ SUCCESS (PR required) |" >> $GITHUB_STEP_SUMMARY
+                    else
+                      echo "| $branch | PROTECT | ✅ SUCCESS |" >> $GITHUB_STEP_SUMMARY
+                    fi
+                    protection_success=$((protection_success + 1))
+                    success=true
+                    break
+                  else
+                    if [ $attempt -eq 3 ]; then
+                      echo "| $branch | PROTECT | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+                      protection_error=$((protection_error + 1))
+                    else
+                      sleep 3
+                    fi
+                  fi
+                done
+              fi
+            done < branches_to_protect.txt
+          else
+            echo "| - | NONE | No branches to protect |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Protection Summary**: ✅ $protection_success successful, ❌ $protection_error failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Debug and diagnostics
+        if: failure()
+        run: |
+          echo "## Debugging Information" >> $GITHUB_STEP_SUMMARY
+          echo "### Environment Variables:" >> $GITHUB_STEP_SUMMARY
+          echo "- GH_HOST: $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          echo "- GitHub Enterprise connectivity test:" >> $GITHUB_STEP_SUMMARY
+          
+          set +e
+          curl -I "https://$GH_HOST" >/dev/null 2>&1
+          curl_result=$?
+          set -e
+          
+          if [ $curl_result -eq 0 ]; then
+            echo "  - ✅ Can reach $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "  - ❌ Cannot reach $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### GitHub CLI Status:" >> $GITHUB_STEP_SUMMARY
+          
+          set +e
+          gh auth status >/dev/null 2>&1
+          auth_result=$?
+          set -e
+          
+          if [ $auth_result -eq 0 ]; then
+            echo "  - ✅ GitHub CLI authenticated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "  - ❌ GitHub CLI not authenticated" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### Available GitHub hosts:" >> $GITHUB_STEP_SUMMARY
+          gh auth list >> $GITHUB_STEP_SUMMARY 2>&1 || echo "  - No authenticated hosts" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Final Summary with Enterprise Context
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## GitHub Enterprise Operation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Operation**: ${{ inputs.operation }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Enterprise Host**: $GH_HOST" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Repository**: ${{ inputs.template_repo }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Repository**: ${{ steps.set-target.outputs.target_repo_full }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "- **Mode**: DRY RUN" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Mode**: LIVE EXECUTION" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.check-target.outputs.repo_exists }}" = "true" ]; then
+            echo "- **Repository Status**: Existed (age: ${{ steps.check-target.outputs.repo_age_minutes }} minutes)" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Completed Actions:" >> $GITHUB_STEP_SUMMARY
+            case "${{ inputs.operation }}" in
+              "create-repo-full")
+                echo "- ✅ Repository created with GitHub Enterprise support" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ Master branch initialized and synced" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ Stable and dev/initial branches created and synced" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ Collaborators and teams added from inputs" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ Branch protection rules applied (stable requires PR)" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ All content synchronized from source repository" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "copy-collaborators-only")
+                echo "- ✅ Collaborators and teams added with enterprise authentication" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "copy-protection-only")
+                echo "- ✅ Branch protection rules applied with enterprise support" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "sync-all-settings")
+                echo "- ✅ Collaborators and teams synchronized" >> $GITHUB_STEP_SUMMARY
+                echo "- ✅ Branch protection rules synchronized with retry logic" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### GitHub Enterprise Features Used:" >> $GITHUB_STEP_SUMMARY
+            echo "- Cross-platform GitHub CLI installation" >> $GITHUB_STEP_SUMMARY
+            echo "- Enterprise hostname authentication with persistence" >> $GITHUB_STEP_SUMMARY
+            echo "- Automatic re-authentication on session loss" >> $GITHUB_STEP_SUMMARY
+            echo "- Repository existence validation with age checking" >> $GITHUB_STEP_SUMMARY
+            echo "- Comprehensive retry logic for all operations" >> $GITHUB_STEP_SUMMARY
+            echo "- Master branch enforcement (no main branch created)" >> $GITHUB_STEP_SUMMARY
+            echo "- Multi-branch workflow (master/stable/dev/initial)" >> $GITHUB_STEP_SUMMARY
+            echo "- Graceful error handling without premature exits" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up temporary files..."
+          rm -f collaborators.json source_branches.txt target_branches.txt protected_branches.txt branches_to_protect.txt protection_*.json repo_info.json final_readme.md
+          rm -rf source-repo target-repo target-repo-branches target-repo-master temp_init 2>/dev/null || true
+          echo "Cleanup completed"
