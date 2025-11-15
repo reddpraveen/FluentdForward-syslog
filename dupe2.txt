@@ -1,3 +1,163 @@
+- name: Initialize target repository with content
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && (steps.check-target.outputs.repo_exists == 'false' || inputs.force_recreate == 'true')
+        run: |
+          set -e
+          # Check if repo already has content
+          if gh api repos/${{ steps.set-target.outputs.target_repo_full }}/contents/README.md >/dev/null 2>&1; then
+            echo "Repository already has content, skipping initialization"
+            exit 0
+          fi
+          echo "Initializing target repository with content..."
+          # Create temporary directory for initialization
+          mkdir -p temp_init
+          cd temp_init
+          # Initialize git repository
+          git init
+          git config user.name "${{ github.triggering_actor }}"
+          git config user.email "${{ github.triggering_actor }}@users.noreply.github.com"
+          # Create initial README
+          printf '%s\n' \
+            "# ${{ inputs.target_repo }}" \
+            "" \
+            "Repository created and configured via GitHub Enterprise Actions workflow" \
+            "" \
+            "## Source Information" \
+            "- **Source Repository**: ${{ inputs.template_repo }}" \
+            "- **Created**: $(date)" \
+            "- **Workflow**: GitHub Enterprise Repository Management" \
+            "- **GitHub Enterprise Host**: $GH_HOST" \
+            "" \
+            "## Configuration Status" \
+            "- Collaborator permissions (in progress)" \
+            "- Branch protection rules (in progress)" \
+            "- Content synchronization (in progress)" \
+            > README.md
+          git add README.md
+          git commit -m "Initial commit with repository setup"
+          # Setup remote and push with retry logic
+          max_attempts=3
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Initial push attempt $attempt/$max_attempts"
+            # Use token-based authentication for push
+            if git remote add origin "https://$GH_TOKEN@$GH_HOST/${{ steps.set-target.outputs.target_repo_full }}.git" && \
+               git branch -M master && \
+               git push -u origin master; then
+              echo "Initial content pushed successfully"
+              break
+            else
+              echo "ERROR: Initial push failed (attempt $attempt/$max_attempts)"
+              git remote remove origin 2>/dev/null || true
+              if [ $attempt -eq $max_attempts ]; then
+                echo "Initial push failed after $max_attempts attempts, continuing anyway"
+              else
+                sleep 5
+              fi
+            fi
+          done
+          cd ..
+          rm -rf temp_init
+
+
+
+- name: Copy repository content and settings
+        if: inputs.operation == 'create-repo-full' && inputs.dry_run == false && inputs.template_repo != ''
+        run: |
+          set -e
+          echo "Syncing repository content from source to target..."
+          
+          if [ ! -d "source-repo" ]; then
+            echo "Source repository not available, skipping content copy"
+            exit 0
+          fi
+          
+          echo "Cloning target repository: ${{ steps.set-target.outputs.target_repo_full }}"
+          
+          set +e
+          gh repo clone "${{ steps.set-target.outputs.target_repo_full }}" target-repo
+          clone_result=$?
+          set -e
+          
+          if [ $clone_result -ne 0 ]; then
+            echo "Failed to clone target repository, skipping content sync"
+            exit 0
+          fi
+          
+          cd target-repo
+          
+          # Check which branch exists (master or main)
+          current_branch=$(git branch --show-current)
+          echo "Current branch in target repo: $current_branch"
+          
+          # If current branch is not master, create and switch to master
+          if [ "$current_branch" != "master" ]; then
+            echo "Switching to master branch..."
+            set +e
+            git checkout master 2>/dev/null
+            checkout_result=$?
+            set -e
+            
+            if [ $checkout_result -ne 0 ]; then
+              # Master doesn't exist, create it from current branch
+              echo "Creating master branch from $current_branch..."
+              git checkout -b master
+            fi
+          fi
+          
+          # Copy all files from source (excluding .git)
+          rsync -av --exclude='.git' ../source-repo/ ./
+          
+          git config user.name "${{ github.triggering_actor }}"
+          git config user.email "${{ github.triggering_actor }}@users.noreply.github.com"
+          
+          git add .
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Copy content from source repository ${{ inputs.template_repo }}"
+            
+            max_attempts=3
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Content push to master branch attempt $attempt/$max_attempts"
+              
+              set +e
+              git push origin master
+              push_result=$?
+              set -e
+              
+              if [ $push_result -eq 0 ]; then
+                echo "Content pushed to master branch successfully"
+                break
+              else
+                echo "Push failed, checking if we need to set upstream..."
+                set +e
+                git push --set-upstream origin master
+                push_upstream_result=$?
+                set -e
+                
+                if [ $push_upstream_result -eq 0 ]; then
+                  echo "Content pushed to master branch with upstream set"
+                  break
+                elif [ $attempt -eq $max_attempts ]; then
+                  echo "Content push failed after $max_attempts attempts"
+                  echo "Trying to push current branch as fallback..."
+                  git push origin HEAD:master || {
+                    echo "All push attempts failed, but continuing workflow"
+                    exit 0
+                  }
+                  break
+                else
+                  sleep 5
+                fi
+              fi
+            done
+          fi
+          cd ..
+
+
+
+
+
+
 name: GitHub Enterprise Repository Management
 on:
   workflow_dispatch:
