@@ -1,3 +1,122 @@
+name: Debug Team Access
+on:
+workflow_dispatch:
+inputs:
+org_name:
+description: ‘Organization name (e.g., XXX)’
+required: true
+type: string
+team_slug:
+description: ‘Team slug to test (e.g., team1)’
+required: true
+type: string
+target_repo:
+description: ‘Target repository (e.g., XXX/test-repo)’
+required: true
+type: string
+
+env:
+GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+
+jobs:
+debug-team:
+runs-on: [‘self-hosted’, ‘enterprise’]
+steps:
+- name: Test Team Access
+run: |
+echo “## Team Access Debug Results” >> $GITHUB_STEP_SUMMARY
+echo “” >> $GITHUB_STEP_SUMMARY
+
+```
+      echo "### 1. List all teams in organization"
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      set +e
+      teams_output=$(gh api orgs/${{ inputs.org_name }}/teams --jq '.[] | "\(.slug) = \(.name)"' 2>&1)
+      teams_result=$?
+      set -e
+      
+      if [ $teams_result -eq 0 ]; then
+        echo "$teams_output" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ Successfully listed teams" >> $GITHUB_STEP_SUMMARY
+      else
+        echo "$teams_output" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "❌ Failed to list teams" >> $GITHUB_STEP_SUMMARY
+      fi
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      echo "" >> $GITHUB_STEP_SUMMARY
+      
+      echo "### 2. Check specific team: ${{ inputs.team_slug }}"
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      set +e
+      team_output=$(gh api orgs/${{ inputs.org_name }}/teams/${{ inputs.team_slug }} 2>&1)
+      team_result=$?
+      set -e
+      
+      if [ $team_result -eq 0 ]; then
+        echo "$team_output" | jq '{name: .name, slug: .slug, id: .id, privacy: .privacy}' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ Team exists and is accessible" >> $GITHUB_STEP_SUMMARY
+      else
+        echo "$team_output" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "❌ Cannot access team - Error above" >> $GITHUB_STEP_SUMMARY
+      fi
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      echo "" >> $GITHUB_STEP_SUMMARY
+      
+      echo "### 3. Try adding team to repository"
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      set +e
+      add_output=$(gh api repos/${{ inputs.target_repo }}/teams/${{ inputs.team_slug }} \
+        -X PUT \
+        -f permission="push" 2>&1)
+      add_result=$?
+      set -e
+      
+      if [ $add_result -eq 0 ]; then
+        echo "✅ Successfully added/updated team access" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Team now has 'push' (write) permission to the repository" >> $GITHUB_STEP_SUMMARY
+      else
+        echo "$add_output" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "❌ Failed to add team - Error above" >> $GITHUB_STEP_SUMMARY
+      fi
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      echo "" >> $GITHUB_STEP_SUMMARY
+      
+      echo "### 4. Verify team access to repository"
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      set +e
+      verify_output=$(gh api repos/${{ inputs.target_repo }}/teams --jq '.[] | "\(.slug) - \(.permission)"' 2>&1)
+      verify_result=$?
+      set -e
+      
+      if [ $verify_result -eq 0 ]; then
+        if [ -z "$verify_output" ]; then
+          echo "No teams currently have access to this repository" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "Teams with access:" >> $GITHUB_STEP_SUMMARY
+          echo "$verify_output" >> $GITHUB_STEP_SUMMARY
+        fi
+      else
+        echo "$verify_output" >> $GITHUB_STEP_SUMMARY
+      fi
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      echo "" >> $GITHUB_STEP_SUMMARY
+      echo "### Token Permissions Check"
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      gh auth status 2>&1 | head -10 >> $GITHUB_STEP_SUMMARY
+      echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+```
+
+
+
+
+///////////////
 name: GitHub Enterprise Repository Management
 on:
 workflow_dispatch:
