@@ -1,3 +1,279 @@
+name: Team Debug (Enterprise)
+on:
+  workflow_dispatch:
+    inputs:
+      org_name:
+        description: 'Organization name'
+        required: true
+        type: string
+        default: 'XXX'
+      team_slug:
+        description: 'Team slug (from team URL)'
+        required: true
+        type: string
+        default: 'team1'
+      target_repo:
+        description: 'Target repo (org/repo-name)'
+        required: true
+        type: string
+
+env:
+  GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+
+jobs:
+  debug:
+    runs-on: ['self-hosted', 'enterprise']
+    steps:
+      - name: Setup and Authenticate
+        run: |
+          echo "=========================================="
+          echo "TEAM DEBUG FOR GITHUB ENTERPRISE"
+          echo "=========================================="
+          echo "Organization: ${{ inputs.org_name }}"
+          echo "Team Slug: ${{ inputs.team_slug }}"
+          echo "Target Repo: ${{ inputs.target_repo }}"
+          echo ""
+          
+          # The GH_TOKEN environment variable is already set
+          # GitHub CLI should automatically use it
+          echo "Testing authentication..."
+          gh auth status || echo "Note: Auth status may not show details in Enterprise"
+          echo ""
+          
+      - name: Test 1 - List All Teams
+        id: list-teams
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "TEST 1: List all teams in organization"
+          echo "=========================================="
+          
+          set +e
+          output=$(gh api orgs/${{ inputs.org_name }}/teams 2>&1)
+          result=$?
+          set -e
+          
+          if [ $result -eq 0 ]; then
+            echo "$output" | jq -r '.[] | "  ✓ Team: \(.name)\n    Slug: \(.slug)\n    Privacy: \(.privacy)\n"'
+            team_count=$(echo "$output" | jq '. | length')
+            echo "✅ SUCCESS: Found $team_count team(s)"
+          else
+            echo "❌ FAILED to list teams"
+            echo ""
+            echo "Error output:"
+            echo "$output"
+            echo ""
+            echo "This usually means:"
+            echo "  - Token lacks 'admin:org' or 'read:org' permission"
+            echo "  - Organization name is incorrect"
+          fi
+          echo ""
+          
+      - name: Test 2 - Check Specific Team
+        id: check-team
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "TEST 2: Check if team '${{ inputs.team_slug }}' exists"
+          echo "=========================================="
+          
+          set +e
+          output=$(gh api orgs/${{ inputs.org_name }}/teams/${{ inputs.team_slug }} 2>&1)
+          result=$?
+          set -e
+          
+          if [ $result -eq 0 ]; then
+            echo "Team Details:"
+            echo "$output" | jq '{name: .name, slug: .slug, id: .id, privacy: .privacy, permission: .permission}'
+            echo ""
+            echo "✅ SUCCESS: Team exists and is accessible"
+            
+            # Check privacy
+            privacy=$(echo "$output" | jq -r '.privacy')
+            if [ "$privacy" = "secret" ]; then
+              echo ""
+              echo "⚠️  WARNING: Team is 'secret'"
+              echo "   Secret teams may not work with all tokens"
+              echo "   Consider changing to 'visible' in team settings"
+            fi
+          else
+            echo "❌ FAILED to access team"
+            echo ""
+            echo "Error output:"
+            echo "$output"
+            echo ""
+            echo "This usually means:"
+            echo "  - Team slug is wrong (check URL: github.xxx.com/orgs/${{ inputs.org_name }}/teams/[SLUG-HERE])"
+            echo "  - Team is 'secret' and token cannot access it"
+            echo "  - Team doesn't exist in this organization"
+          fi
+          echo ""
+          
+      - name: Test 3 - Add Team to Repository
+        id: add-team
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "TEST 3: Add team to repository"
+          echo "=========================================="
+          
+          set +e
+          output=$(gh api repos/${{ inputs.target_repo }}/teams/${{ inputs.team_slug }} \
+            -X PUT \
+            -f permission="push" 2>&1)
+          result=$?
+          set -e
+          
+          if [ $result -eq 0 ]; then
+            echo "✅ SUCCESS: Team added to repository!"
+            echo ""
+            echo "Team '${{ inputs.team_slug }}' now has 'push' (write) access"
+          else
+            echo "❌ FAILED to add team"
+            echo ""
+            echo "Error output:"
+            echo "$output"
+            echo ""
+            echo "This usually means:"
+            echo "  - Repository doesn't exist"
+            echo "  - Team doesn't exist (see Test 2)"
+            echo "  - Token lacks permission to manage repository teams"
+          fi
+          echo ""
+          
+      - name: Test 4 - List Repository Teams
+        id: list-repo-teams
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "TEST 4: List teams with access to repository"
+          echo "=========================================="
+          
+          set +e
+          output=$(gh api repos/${{ inputs.target_repo }}/teams 2>&1)
+          result=$?
+          set -e
+          
+          if [ $result -eq 0 ]; then
+            team_count=$(echo "$output" | jq '. | length')
+            
+            if [ "$team_count" -eq 0 ]; then
+              echo "⚠️  No teams currently have access to this repository"
+            else
+              echo "Teams with access:"
+              echo "$output" | jq -r '.[] | "  ✓ \(.name) (\(.slug)) - \(.permission) permission"'
+              echo ""
+              echo "✅ Found $team_count team(s) with access"
+            fi
+          else
+            echo "❌ FAILED to list repository teams"
+            echo ""
+            echo "Error output:"
+            echo "$output"
+          fi
+          echo ""
+          
+      - name: Token Information
+        continue-on-error: true
+        run: |
+          echo "=========================================="
+          echo "TOKEN INFORMATION"
+          echo "=========================================="
+          
+          echo "Authenticated user:"
+          gh api user --jq '.login' 2>&1 || echo "Cannot determine"
+          
+          echo ""
+          echo "User type:"
+          gh api user --jq '.type' 2>&1 || echo "Cannot determine"
+          
+          echo ""
+          
+      - name: Final Summary
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 FINAL SUMMARY"
+          echo "=========================================="
+          echo ""
+          
+          # Test 1 summary
+          if [ "${{ steps.list-teams.outcome }}" = "success" ]; then
+            echo "✅ TEST 1: Can list teams in organization"
+          else
+            echo "❌ TEST 1: Cannot list teams"
+            echo "   → Check token has 'admin:org' or 'read:org' permission"
+          fi
+          
+          # Test 2 summary
+          if [ "${{ steps.check-team.outcome }}" = "success" ]; then
+            echo "✅ TEST 2: Team '${{ inputs.team_slug }}' exists and is accessible"
+          else
+            echo "❌ TEST 2: Cannot access team '${{ inputs.team_slug }}'"
+            echo "   → Verify team slug from URL"
+            echo "   → Check if team is 'secret' (change to 'visible')"
+            echo "   → Confirm team exists in org '${{ inputs.org_name }}'"
+          fi
+          
+          # Test 3 summary
+          if [ "${{ steps.add-team.outcome }}" = "success" ]; then
+            echo "✅ TEST 3: Successfully added team to repository"
+          else
+            echo "❌ TEST 3: Failed to add team to repository"
+            echo "   → First fix Test 2 (team must be accessible)"
+            echo "   → Check token has repo management permissions"
+          fi
+          
+          # Test 4 summary
+          if [ "${{ steps.list-repo-teams.outcome }}" = "success" ]; then
+            echo "✅ TEST 4: Can list repository teams"
+          else
+            echo "❌ TEST 4: Cannot list repository teams"
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "🔧 TROUBLESHOOTING STEPS"
+          echo "=========================================="
+          
+          # Provide specific next steps based on results
+          if [ "${{ steps.check-team.outcome }}" != "success" ]; then
+            echo ""
+            echo "Team not accessible - Try these steps:"
+            echo "  1. Go to your GitHub Enterprise and navigate to:"
+            echo "     → Organizations → ${{ inputs.org_name }} → Teams"
+            echo ""
+            echo "  2. Find your team and click on it"
+            echo ""
+            echo "  3. Check the URL - it should be:"
+            echo "     → https://[your-github]/orgs/${{ inputs.org_name }}/teams/[EXACT-SLUG]"
+            echo ""
+            echo "  4. The [EXACT-SLUG] from the URL is what you need to use"
+            echo "     (currently using: '${{ inputs.team_slug }}')"
+            echo ""
+            echo "  5. In team Settings → check 'Privacy'"
+            echo "     → If 'Secret', change to 'Visible'"
+          fi
+          
+          if [ "${{ steps.list-teams.outcome }}" != "success" ]; then
+            echo ""
+            echo "Cannot list teams - Token permission issue:"
+            echo "  • Token needs 'admin:org' scope to manage teams"
+            echo "  • Or at minimum 'read:org' scope to view teams"
+            echo "  • Check with: Settings → Developer settings → Personal access tokens"
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "✅ Debug complete!"
+          echo "=========================================="
+
+
+
+
+=================
 name: GitHub Enterprise Repository Management
 on:
   workflow_dispatch:
