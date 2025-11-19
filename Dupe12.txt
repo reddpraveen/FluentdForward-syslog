@@ -1,3 +1,129 @@
+name: Simple Team Debug
+on:
+workflow_dispatch:
+inputs:
+org_name:
+description: ‘Organization name’
+required: true
+type: string
+default: ‘XXX’
+team_slug:
+description: ‘Team slug’
+required: true
+type: string
+default: ‘team1’
+target_repo:
+description: ‘Target repo (org/repo-name)’
+required: true
+type: string
+
+env:
+GH_TOKEN: ${{ secrets.GH_FUNC_TOKEN }}
+
+jobs:
+debug:
+runs-on: [‘self-hosted’, ‘enterprise’]
+steps:
+- name: Setup
+run: |
+echo “==========================================”
+echo “TEAM DEBUG STARTED”
+echo “==========================================”
+echo “Organization: ${{ inputs.org_name }}”
+echo “Team Slug: ${{ inputs.team_slug }}”
+echo “Target Repo: ${{ inputs.target_repo }}”
+echo “”
+
+```
+  - name: Authenticate
+    run: |
+      echo "Authenticating..."
+      echo "$GH_TOKEN" | gh auth login --with-token
+      gh auth status
+      echo ""
+      
+  - name: List All Teams
+    id: list-teams
+    continue-on-error: true
+    run: |
+      echo "=========================================="
+      echo "TEST 1: Listing all teams in org"
+      echo "=========================================="
+      gh api orgs/${{ inputs.org_name }}/teams | jq -r '.[] | "Team: \(.name) | Slug: \(.slug) | Privacy: \(.privacy)"'
+      echo ""
+      
+  - name: Check Specific Team
+    id: check-team
+    continue-on-error: true
+    run: |
+      echo "=========================================="
+      echo "TEST 2: Checking team '${{ inputs.team_slug }}'"
+      echo "=========================================="
+      gh api orgs/${{ inputs.org_name }}/teams/${{ inputs.team_slug }} | jq '.'
+      echo ""
+      
+  - name: Add Team to Repo
+    id: add-team
+    continue-on-error: true
+    run: |
+      echo "=========================================="
+      echo "TEST 3: Adding team to repository"
+      echo "=========================================="
+      gh api repos/${{ inputs.target_repo }}/teams/${{ inputs.team_slug }} \
+        -X PUT \
+        -f permission="push"
+      echo "SUCCESS: Team added!"
+      echo ""
+      
+  - name: List Repository Teams
+    id: list-repo-teams
+    continue-on-error: true
+    run: |
+      echo "=========================================="
+      echo "TEST 4: Teams with access to repository"
+      echo "=========================================="
+      gh api repos/${{ inputs.target_repo }}/teams | jq -r '.[] | "Team: \(.name) | Slug: \(.slug) | Permission: \(.permission)"'
+      echo ""
+      
+  - name: Summary
+    if: always()
+    run: |
+      echo "=========================================="
+      echo "SUMMARY"
+      echo "=========================================="
+      
+      if [ "${{ steps.list-teams.outcome }}" = "success" ]; then
+        echo "✅ Can list teams in organization"
+      else
+        echo "❌ Cannot list teams - Token may lack admin:org permission"
+      fi
+      
+      if [ "${{ steps.check-team.outcome }}" = "success" ]; then
+        echo "✅ Team '${{ inputs.team_slug }}' exists and is accessible"
+      else
+        echo "❌ Cannot access team - Team may be secret or slug is wrong"
+      fi
+      
+      if [ "${{ steps.add-team.outcome }}" = "success" ]; then
+        echo "✅ Successfully added team to repository"
+      else
+        echo "❌ Failed to add team to repository"
+      fi
+      
+      if [ "${{ steps.list-repo-teams.outcome }}" = "success" ]; then
+        echo "✅ Can list repository teams"
+      else
+        echo "❌ Cannot list repository teams"
+      fi
+      
+      echo ""
+      echo "Check the logs above for detailed output!"
+```
+
+
+
+
+
 name: Debug Team Access
 on:
 workflow_dispatch:
