@@ -1,0 +1,328 @@
+# JVM GC Logging to Splunk - OpenShift 4.16
+
+# Option B: Separate Splunk Indexes for App & GC Logs
+
+================================================================================
+
+## ARCHITECTURE
+
+================================================================================
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ POD                                                                         │
+│                                                                             │
+│  ┌──────────────────┐         ┌──────────────────┐                         │
+│  │ App Container    │         │ Sidecar          │                         │
+│  │                  │         │ gc-log-streamer  │                         │
+│  │ STDOUT ──────────┼────┐    │                  │                         │
+│  │ (app logs)       │    │    │ STDOUT ──────────┼────┐                    │
+│  │                  │    │    │ (GC logs)        │    │                    │
+│  │ JVM writes to ───┼────┼────┼─► tail -F        │    │                    │
+│  │ /var/log/gc/     │    │    │                  │    │                    │
+│  └──────────────────┘    │    └──────────────────┘    │                    │
+│                          │                            │                    │
+│                    emptyDir volume                    │                    │
+└──────────────────────────┼────────────────────────────┼────────────────────┘
+                           │                            │
+                           ▼                            ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ Vector Collector (reads /var/log/containers/*.log)                          │
+│                                                                              │
+│ Adds metadata:                                                               │
+│   kubernetes.container_name = "app" or "gc-log-streamer"                    │
+│   kubernetes.pod_name, kubernetes.namespace_name, etc.                      │
+└──────────────────────────────────────────────────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│ ClusterLogForwarder                                                          │
+│                                                                              │
+│ Filter: container_name = "gc-log-streamer" ──► splunk-gc-logs index         │
+│ Filter: container_name != "gc-log-streamer" ──► splunk-app-logs index       │
+└──────────────────────────────────────────────────────────────────────────────┘
+                           │
+            ┌──────────────┴──────────────┐
+            ▼                             ▼
+   ┌─────────────────┐           ┌─────────────────┐
+   │ Splunk Index:   │           │ Splunk Index:   │
+   │ openshift_app   │           │ openshift_gc    │
+   │ (30 day retain) │           │ (7 day retain)  │
+   └─────────────────┘           └─────────────────┘
+```
+
+================================================================================
+
+## FILE 1: deployment.yaml
+
+================================================================================
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-java-app
+  namespace: my-app-namespace
+  labels:
+    app: my-java-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: my-java-app
+  template:
+    metadata:
+      labels:
+        app: my-java-app
+    spec:
+      volumes:
+        - name: gc-logs
+          emptyDir: {}
+      
+      containers:
+        # =====================
+        # APP CONTAINER
+        # =====================
+        - name: app
+          image: my-java-app:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: JAVA_OPTS
+              value: "-Xlog:gc*:file=/var/log/gc/gc.log:time,uptime,level,tags:filecount=5,filesize=10M"
+          volumeMounts:
+            - name: gc-logs
+              mountPath: /var/log/gc
+          resources:
+            requests:
+              memory: 512Mi
+              cpu: 500m
+            limits:
+              memory: 1Gi
+              cpu: 1000m
+        
+        # =====================
+        # GC LOG SIDECAR
+        # =====================
+        - name: gc-log-streamer
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until [ -f /var/log/gc/gc.log ]; do sleep 2; done
+              tail -n+1 -F /var/log/gc/gc.log
+          volumeMounts:
+            - name: gc-logs
+              mountPath: /var/log/gc
+              readOnly: true
+          resources:
+            requests:
+              memory: 16Mi
+              cpu: 10m
+            limits:
+              memory: 32Mi
+              cpu: 50m
+```
+
+================================================================================
+
+## FILE 2: splunk-secret.yaml
+
+================================================================================
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: splunk-hec-secret
+  namespace: openshift-logging
+type: Opaque
+stringData:
+  hecToken: YOUR_SPLUNK_HEC_TOKEN
+```
+
+================================================================================
+
+## FILE 3: clusterlogforwarder.yaml
+
+================================================================================
+
+```yaml
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: collector
+  
+  # =========================================
+  # OUTPUTS - Two separate Splunk indexes
+  # =========================================
+  outputs:
+    - name: splunk-app-logs
+      type: splunk
+      splunk:
+        url: https://YOUR_SPLUNK_HEC_URL:8088
+        index: openshift_app_logs
+      secret:
+        name: splunk-hec-secret
+      tls:
+        insecureSkipVerify: false
+    
+    - name: splunk-gc-logs
+      type: splunk
+      splunk:
+        url: https://YOUR_SPLUNK_HEC_URL:8088
+        index: openshift_gc_logs
+      secret:
+        name: splunk-hec-secret
+      tls:
+        insecureSkipVerify: false
+  
+  # =========================================
+  # FILTERS - Route by container name
+  # =========================================
+  filters:
+    # Drops GC sidecar logs (for app pipeline)
+    - name: exclude-gc-logs
+      type: drop
+      drop:
+        - test:
+            - field: .kubernetes.container_name
+              matches: "gc-log-streamer"
+    
+    # Drops everything except GC sidecar logs (for GC pipeline)
+    - name: only-gc-logs
+      type: drop
+      drop:
+        - test:
+            - field: .kubernetes.container_name
+              notMatches: "gc-log-streamer"
+  
+  # =========================================
+  # PIPELINES
+  # =========================================
+  pipelines:
+    # App logs → openshift_app_logs index
+    - name: app-logs-to-splunk
+      inputRefs:
+        - application
+      filterRefs:
+        - exclude-gc-logs
+      outputRefs:
+        - splunk-app-logs
+    
+    # GC logs → openshift_gc_logs index
+    - name: gc-logs-to-splunk
+      inputRefs:
+        - application
+      filterRefs:
+        - only-gc-logs
+      outputRefs:
+        - splunk-gc-logs
+```
+
+================================================================================
+
+## APPLY COMMANDS
+
+================================================================================
+
+```bash
+# Step 1: Create secret
+oc apply -f splunk-secret.yaml
+
+# Step 2: Apply ClusterLogForwarder
+oc apply -f clusterlogforwarder.yaml
+
+# Step 3: Deploy application
+oc apply -f deployment.yaml
+
+# Step 4: Verify (should show 2/2)
+oc get pods -n my-app-namespace
+
+# Step 5: Check sidecar is streaming GC logs
+oc logs -n my-app-namespace <pod-name> -c gc-log-streamer --tail=10
+
+# Step 6: Check CLF status
+oc get clusterlogforwarder instance -n openshift-logging
+
+# Step 7: Check Vector collector
+oc logs -n openshift-logging -l component=collector --tail=50
+```
+
+================================================================================
+
+## VERIFY IN SPLUNK
+
+================================================================================
+
+```spl
+# App logs
+index=openshift_app_logs | head 100
+
+# GC logs
+index=openshift_gc_logs | head 100
+
+# GC logs for specific pod
+index=openshift_gc_logs kubernetes.pod_name="my-java-app*" | head 100
+
+# GC pause events
+index=openshift_gc_logs "GC pause" | head 100
+```
+
+================================================================================
+
+## REPLACE THESE VALUES
+
+================================================================================
+
+|Placeholder          |Your Value         |
+|---------------------|-------------------|
+|my-java-app          |Your app name      |
+|my-app-namespace     |Your namespace     |
+|my-java-app:latest   |Your image         |
+|YOUR_SPLUNK_HEC_TOKEN|Your HEC token     |
+|YOUR_SPLUNK_HEC_URL  |Your Splunk HEC URL|
+|openshift_app_logs   |Your app logs index|
+|openshift_gc_logs    |Your GC logs index |
+
+================================================================================
+
+## SPLUNK INDEX SETUP
+
+================================================================================
+
+Create two indexes in Splunk:
+
+|Index Name        |Retention|Purpose                    |
+|------------------|---------|---------------------------|
+|openshift_app_logs|30 days  |Application logs           |
+|openshift_gc_logs |7-14 days|GC logs (shorter retention)|
+
+================================================================================
+
+## TROUBLESHOOTING
+
+================================================================================
+
+```bash
+# Check if GC file is created
+oc exec -n my-app-namespace <pod> -c app -- ls -la /var/log/gc/
+
+# Check sidecar output
+oc logs -n my-app-namespace <pod> -c gc-log-streamer --tail=20
+
+# Check CLF status
+oc describe clusterlogforwarder instance -n openshift-logging
+
+# Check Vector logs for Splunk errors
+oc logs -n openshift-logging -l component=collector | grep -i splunk
+
+# Test Splunk HEC
+curl -k -H "Authorization: Splunk YOUR_TOKEN" \
+  https://YOUR_SPLUNK_HEC_URL:8088/services/collector/health
+```
