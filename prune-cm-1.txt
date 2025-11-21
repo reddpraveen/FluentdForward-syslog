@@ -2,6 +2,458 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
 name: cm-secret-pruner
+namespace: configmap-secret-pruner  # FIXED: Correct namespace
+spec:
+schedule: “34 19 * * *”  # Daily at 7:34 PM
+concurrencyPolicy: Forbid
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+jobTemplate:
+spec:
+backoffLimit: 2
+activeDeadlineSeconds: 3600  # 1 hour timeout
+template:
+spec:
+serviceAccountName: cm-secret-pruner
+restartPolicy: Never
+containers:
+- name: pruner
+image: registry.redhat.io/openshift4/ose-cli:v4.16
+resources:
+requests:
+memory: “256Mi”  # Increased for 500 namespaces
+cpu: “200m”
+limits:
+memory: “512Mi”  # Increased for 500 namespaces
+cpu: “1000m”
+command:
+- /bin/bash
+- -c
+- |
+# CRITICAL: Only use -u and pipefail, NOT -e
+set -uo pipefail
+
+```
+          # Enable debug mode for troubleshooting (uncomment to see every command)
+          # set -x
+          
+          # ================================================================
+          # CRITICAL FIX: Initialize ALL counters at the very beginning
+          # This prevents arithmetic expression failures with set -u
+          # ================================================================
+          total_deleted=0
+          total_skipped=0
+          total_protected=0
+          total_too_new=0
+          total_referenced=0
+          total_errors=0
+          namespaces_processed=0
+          namespaces_excluded=0
+          
+          # Enhanced logging with timestamps
+          log() {
+            level="$1"
+            shift
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*" >&2
+          }
+          
+          # Error handler for CRITICAL failures only
+          error_exit() {
+            log ERROR "$1"
+            log ERROR "Exiting with failure status"
+            exit 1
+          }
+          
+          # Success handler
+          success_exit() {
+            log INFO "Exiting with success status"
+            exit 0
+          }
+          
+          log INFO "========================================="
+          log INFO "ConfigMap Pruner Job Started"
+          log INFO "========================================="
+          log INFO "Script PID: $$"
+          log INFO "Running as: $(id -un)"
+          
+          # FIXED: Use correct namespace
+          NS="configmap-secret-pruner"
+          CM="cm-secret-pruner-config"
+          
+          # Verify we can access the cluster
+          log INFO "Verifying cluster access..."
+          if ! oc whoami &>/dev/null; then
+            error_exit "Unable to authenticate with OpenShift cluster"
+          fi
+          current_user=$(oc whoami 2>/dev/null || echo "unknown")
+          log INFO "Authenticated as: $current_user"
+          
+          # Verify ConfigMap exists with detailed error
+          log INFO "Looking for ConfigMap: $CM in namespace: $NS"
+          if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+            log ERROR "ConfigMap '$CM' not found in namespace '$NS'"
+            log ERROR "Please ensure the ConfigMap exists:"
+            log ERROR "  oc get cm -n $NS"
+            error_exit "Configuration ConfigMap missing"
+          fi
+          log INFO "✓ ConfigMap found: $CM"
+          
+          # ================================================================
+          # Load configuration with comprehensive error handling
+          # ================================================================
+          log INFO "Loading configuration from ConfigMap..."
+          
+          # Load DRY_RUN with explicit fallback
+          DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "")
+          if [[ -z "$DRY_RUN" ]]; then
+            log WARN "dryRun not found in ConfigMap, defaulting to: true"
+            DRY_RUN="true"
+          fi
+          
+          # Load MIN_AGE_DAYS with validation
+          MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "")
+          if [[ -z "$MIN_AGE_DAYS" ]]; then
+            log WARN "minAgeDays not found in ConfigMap, defaulting to: 7"
+            MIN_AGE_DAYS="7"
+          fi
+          
+          # Validate MIN_AGE_DAYS is a number
+          if [[ ! "$MIN_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+            error_exit "Invalid minAgeDays value: '$MIN_AGE_DAYS' (must be a positive integer)"
+          fi
+          
+          # Load excluded namespaces with fallback
+          EXCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "")
+          if [[ -z "$EXCLUDED_NS" ]]; then
+            log WARN "excludedNamespaces not found in ConfigMap, using defaults"
+            EXCLUDED_NS=$(cat <<'EOF'
+```
+
+^openshift-.*
+^kube-.*
+^default$
+^openshift$
+^configmap-secret-pruner$
+EOF
+)
+fi
+
+```
+          # Load protected labels with fallback
+          PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+          if [[ -z "$PROTECTED_LABELS" ]]; then
+            log WARN "protectedLabels not found in ConfigMap, using defaults"
+            PROTECTED_LABELS=$(cat <<'EOF'
+```
+
+app.kubernetes.io/managed-by=argocd
+meta.helm.sh/release-name
+prune.protected=true
+EOF
+)
+fi
+
+```
+          # Clean up whitespace
+          EXCLUDED_NS=$(echo "$EXCLUDED_NS" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          PROTECTED_LABELS=$(echo "$PROTECTED_LABELS" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          # Display configuration
+          log INFO "========================================="
+          log INFO "Configuration Summary:"
+          log INFO "  Namespace: $NS"
+          log INFO "  ConfigMap: $CM"
+          log INFO "  DRY_RUN: $DRY_RUN"
+          log INFO "  MIN_AGE_DAYS: $MIN_AGE_DAYS"
+          log INFO ""
+          
+          # Display excluded namespace patterns
+          excluded_count=0
+          log INFO "Excluded Namespace Patterns:"
+          while IFS= read -r pattern; do
+            if [[ -n "$pattern" ]]; then
+              ((excluded_count++))
+              log INFO "  [$excluded_count] $pattern"
+            fi
+          done <<< "$EXCLUDED_NS"
+          [[ $excluded_count -eq 0 ]] && log INFO "  (none configured)"
+          log INFO ""
+          
+          # Display protected labels
+          label_count=0
+          log INFO "Protected Labels:"
+          while IFS= read -r label; do
+            if [[ -n "$label" ]]; then
+              ((label_count++))
+              log INFO "  [$label_count] $label"
+            fi
+          done <<< "$PROTECTED_LABELS"
+          [[ $label_count -eq 0 ]] && log INFO "  (none configured)"
+          log INFO "========================================="
+          
+          # Verify RBAC permissions
+          log INFO "Verifying RBAC permissions..."
+          if ! oc get ns &>/dev/null; then
+            error_exit "Unable to list namespaces - check ClusterRole permissions for ServiceAccount '$current_user'"
+          fi
+          log INFO "✓ RBAC permissions verified"
+          
+          # Get list of all namespaces
+          log INFO "Fetching namespace list from cluster..."
+          namespace_list=$(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+          if [[ -z "$namespace_list" ]]; then
+            error_exit "No namespaces found - this is unexpected (oc get ns returned empty)"
+          fi
+          
+          # Convert space-separated to newline-separated for reliable parsing
+          namespace_list=$(echo "$namespace_list" | tr ' ' '\n' | sort)
+          namespace_count=$(echo "$namespace_list" | wc -l)
+          log INFO "✓ Found $namespace_count namespaces in cluster"
+          log INFO ""
+          
+          # ================================================================
+          # Main Processing Loop
+          # ================================================================
+          log INFO "========================================="
+          log INFO "Starting Namespace Processing"
+          log INFO "========================================="
+          
+          while IFS= read -r ns; do
+            # Skip empty lines
+            [[ -z "$ns" ]] && continue
+            
+            log DEBUG "Evaluating namespace: $ns"
+            
+            # ============================================================
+            # Check if namespace matches any exclusion pattern
+            # ============================================================
+            excluded=false
+            matched_pattern=""
+            
+            while IFS= read -r pattern; do
+              # Skip empty patterns
+              [[ -z "$pattern" ]] && continue
+              
+              # Test if namespace matches pattern (suppress grep errors)
+              if echo "$ns" | grep -Eq "$pattern" 2>/dev/null; then
+                excluded=true
+                matched_pattern="$pattern"
+                break
+              fi
+            done <<< "$EXCLUDED_NS"
+            
+            # If namespace is excluded, skip it
+            if [[ "$excluded" == "true" ]]; then
+              log DEBUG "⊘ EXCLUDED: $ns (matched pattern: $matched_pattern)"
+              ((namespaces_excluded++))
+              continue
+            fi
+            
+            # ============================================================
+            # Process this namespace
+            # ============================================================
+            ((namespaces_processed++))
+            log INFO ""
+            log INFO "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log INFO "Processing Namespace [$namespaces_processed/$namespace_count]: $ns"
+            log INFO "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            
+            # Get ConfigMaps in namespace
+            cm_list=""
+            if ! cm_list=$(oc get cm -n "$ns" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); then
+              log WARN "⚠ Unable to list ConfigMaps in namespace: $ns (permission denied or API error)"
+              ((total_errors++))
+              continue
+            fi
+            
+            # Check if namespace has any ConfigMaps
+            if [[ -z "$cm_list" ]]; then
+              log INFO "  No ConfigMaps found"
+              continue
+            fi
+            
+            # Convert space-separated to newline-separated
+            cm_list=$(echo "$cm_list" | tr ' ' '\n')
+            cm_count=$(echo "$cm_list" | wc -l)
+            log INFO "  Found $cm_count ConfigMap(s)"
+            
+            deleted_in_ns=0
+            skipped_in_ns=0
+            
+            # ============================================================
+            # Process each ConfigMap in namespace
+            # ============================================================
+            while IFS= read -r name; do
+              # Skip empty lines
+              [[ -z "$name" ]] && continue
+              
+              log DEBUG "    Evaluating: $name"
+              
+              # Get ConfigMap metadata as JSON
+              cm_json=""
+              if ! cm_json=$(oc get cm "$name" -n "$ns" -o json 2>/dev/null); then
+                log WARN "    ⚠ Unable to fetch details for: $name (skipping)"
+                ((skipped_in_ns++))
+                ((total_errors++))
+                continue
+              fi
+              
+              # ========================================================
+              # Check for protected labels
+              # ========================================================
+              skip=false
+              protected_by=""
+              
+              while IFS= read -r label_rule; do
+                [[ -z "$label_rule" ]] && continue
+                
+                if [[ "$label_rule" == *"="* ]]; then
+                  # Format: key=value (e.g., "app.kubernetes.io/managed-by=argocd")
+                  key="${label_rule%=*}"
+                  expected_value="${label_rule#*=}"
+                  actual_value=$(echo "$cm_json" | jq -r ".metadata.labels.\"${key}\" // empty" 2>/dev/null || echo "")
+                  
+                  if [[ -n "$actual_value" && "$actual_value" == "$expected_value" ]]; then
+                    log INFO "    🛡 PROTECTED by label: $key=$expected_value"
+                    skip=true
+                    protected_by="$label_rule"
+                    ((total_protected++))
+                    break
+                  fi
+                else
+                  # Format: key only (e.g., "prune.protected")
+                  if echo "$cm_json" | jq -e ".metadata.labels.\"${label_rule}\"" &>/dev/null; then
+                    actual_value=$(echo "$cm_json" | jq -r ".metadata.labels.\"${label_rule}\"" 2>/dev/null || echo "")
+                    log INFO "    🛡 PROTECTED by label: $label_rule=$actual_value"
+                    skip=true
+                    protected_by="$label_rule"
+                    ((total_protected++))
+                    break
+                  fi
+                fi
+              done <<< "$PROTECTED_LABELS"
+              
+              if [[ "$skip" == "true" ]]; then
+                ((skipped_in_ns++))
+                continue
+              fi
+              
+              # ========================================================
+              # Check age requirement
+              # ========================================================
+              age_days="unknown"
+              if [[ "$MIN_AGE_DAYS" -gt 0 ]]; then
+                created=$(echo "$cm_json" | jq -r '.metadata.creationTimestamp' 2>/dev/null || echo "")
+                
+                if [[ -n "$created" && "$created" != "null" ]]; then
+                  if created_epoch=$(date -d "$created" +%s 2>/dev/null); then
+                    current_epoch=$(date +%s)
+                    age_days=$(( (current_epoch - created_epoch) / 86400 ))
+                    
+                    if [[ "$age_days" -lt "$MIN_AGE_DAYS" ]]; then
+                      log INFO "    ⏰ TOO NEW: $age_days days old (min: $MIN_AGE_DAYS days)"
+                      ((skipped_in_ns++))
+                      ((total_too_new++))
+                      continue
+                    fi
+                  else
+                    log WARN "    ⚠ Unable to parse creationTimestamp: $created"
+                  fi
+                fi
+              fi
+              
+              # ========================================================
+              # Check if referenced by workloads
+              # ========================================================
+              log DEBUG "    Checking workload references..."
+              referenced=false
+              
+              # Get all workload types that can reference ConfigMaps
+              workloads=""
+              if workloads=$(oc get pod,deploy,sts,ds,job,cronjob -n "$ns" -o yaml 2>/dev/null); then
+                # Check for ConfigMap references in:
+                # - volumes.configMap.name
+                # - envFrom.configMapRef.name
+                # - env.valueFrom.configMapKeyRef.name
+                if echo "$workloads" | grep -E "(configMap:|configMapRef:|configMapKeyRef:)" -A 2 | grep -q "name: $name" 2>/dev/null; then
+                  log INFO "    🔗 REFERENCED by workload"
+                  referenced=true
+                  ((total_referenced++))
+                fi
+              else
+                log DEBUG "    Unable to fetch workloads (assuming safe to delete)"
+              fi
+              
+              if [[ "$referenced" == "true" ]]; then
+                ((skipped_in_ns++))
+                continue
+              fi
+              
+              # ========================================================
+              # Delete or Dry-Run
+              # ========================================================
+              if [[ "$DRY_RUN" == "false" ]]; then
+                log WARN "    🗑 DELETING: $name (age: $age_days days)"
+                if oc delete cm "$name" -n "$ns" --wait=false 2>&1 | grep -v "^$"; then
+                  ((deleted_in_ns++))
+                  ((total_deleted++))
+                  log INFO "    ✓ Deleted successfully"
+                else
+                  log ERROR "    ✗ Deletion failed"
+                  ((skipped_in_ns++))
+                  ((total_errors++))
+                fi
+              else
+                log INFO "    📋 DRY-RUN: Would delete (age: $age_days days)"
+                ((deleted_in_ns++))
+                ((total_deleted++))
+              fi
+              
+            done <<< "$cm_list"
+            
+            # Namespace summary
+            log INFO "  Summary: deleted=$deleted_in_ns skipped=$skipped_in_ns"
+            ((total_skipped += skipped_in_ns))
+            
+          done <<< "$namespace_list"
+          
+          # ================================================================
+          # Final Summary Report
+          # ================================================================
+          log INFO ""
+          log INFO "========================================="
+          log INFO "🎉 Job Completed Successfully"
+          log INFO "========================================="
+          log INFO "Cluster Statistics:"
+          log INFO "  Total namespaces: $namespace_count"
+          log INFO "  Excluded: $namespaces_excluded"
+          log INFO "  Processed: $namespaces_processed"
+          log INFO ""
+          log INFO "ConfigMap Statistics:"
+          log INFO "  Deleted/Would Delete: $total_deleted"
+          log INFO "  Skipped Total: $total_skipped"
+          log INFO "    ├─ Protected by labels: $total_protected"
+          log INFO "    ├─ Too new (< $MIN_AGE_DAYS days): $total_too_new"
+          log INFO "    └─ Referenced by workloads: $total_referenced"
+          log INFO ""
+          log INFO "Errors: $total_errors"
+          log INFO "Mode: $(if [[ "$DRY_RUN" == "true" ]]; then echo "DRY-RUN (simulation only)"; else echo "LIVE (actual deletions)"; fi)"
+          log INFO "========================================="
+          
+          success_exit
+```
+
+
+
+
+
+
+
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+name: cm-secret-pruner
 namespace: openshift-operators
 spec:
 schedule: “34 19 * * *”  # Daily at 7:34 PM
