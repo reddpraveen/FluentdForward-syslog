@@ -1,3 +1,6 @@
+
+printf '%s [%s] %s\n' "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')" "$level" "$*" >&2
+
 apiVersion: batch/v1
 kind: CronJob
 metadata:
