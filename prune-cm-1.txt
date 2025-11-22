@@ -2,6 +2,536 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+spec:
+  schedule: "34 19 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          serviceAccountName: cm-secret-pruner
+          restartPolicy: Never
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "200m"
+              limits:
+                memory: "1Gi"      # FIXED: Increased from 256Mi to 1Gi for 500 namespaces
+                cpu: "1000m"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+              
+              # Initialize ALL counters FIRST
+              total_deleted=0
+              total_skipped=0
+              total_protected=0
+              total_too_new=0
+              total_referenced=0
+              total_errors=0
+              namespaces_processed=0
+              namespaces_excluded=0
+              
+              log() {
+                level="$1"
+                shift
+                echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*" >&2
+              }
+              
+              error_exit() {
+                log ERROR "$1"
+                log ERROR "Exiting with failure status"
+                exit 1
+              }
+              
+              success_exit() {
+                log INFO "Exiting with success status"
+                exit 0
+              }
+              
+              log INFO "========================================="
+              log INFO "ConfigMap Pruner Job Started"
+              log INFO "========================================="
+              log INFO "Script PID: $$"
+              
+              NS="configmap-secret-pruner"
+              CM="cm-secret-pruner-config"
+              
+              log INFO "Verifying cluster access..."
+              if ! oc whoami &>/dev/null; then
+                error_exit "Unable to authenticate with OpenShift cluster"
+              fi
+              current_user=$(oc whoami 2>/dev/null || echo "unknown")
+              log INFO "Authenticated as: $current_user"
+              
+              log INFO "Looking for ConfigMap: $CM in namespace: $NS"
+              if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+                log ERROR "ConfigMap $CM not found in namespace $NS"
+                error_exit "Configuration ConfigMap missing"
+              fi
+              log INFO "ConfigMap found: $CM"
+              
+              log INFO "Loading configuration from ConfigMap..."
+              
+              DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "")
+              if [[ -z "$DRY_RUN" ]]; then
+                log WARN "dryRun not found in ConfigMap, defaulting to: true"
+                DRY_RUN="true"
+              fi
+              
+              MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "")
+              if [[ -z "$MIN_AGE_DAYS" ]]; then
+                log WARN "minAgeDays not found in ConfigMap, defaulting to: 7"
+                MIN_AGE_DAYS="7"
+              fi
+              
+              if [[ ! "$MIN_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+                error_exit "Invalid minAgeDays value: $MIN_AGE_DAYS (must be a positive integer)"
+              fi
+              
+              EXCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "")
+              if [[ -z "$EXCLUDED_NS" ]]; then
+                log WARN "excludedNamespaces not found in ConfigMap, using defaults"
+                EXCLUDED_NS=$(printf '%s\n' \
+                  '^openshift-.*' \
+                  '^kube-.*' \
+                  '^default$' \
+                  '^openshift$' \
+                  '^configmap-secret-pruner$')
+              fi
+              
+              PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+              if [[ -z "$PROTECTED_LABELS" ]]; then
+                log WARN "protectedLabels not found in ConfigMap, using defaults"
+                PROTECTED_LABELS=$(printf '%s\n' \
+                  'app.kubernetes.io/managed-by=argocd' \
+                  'meta.helm.sh/release-name' \
+                  'prune.protected=true')
+              fi
+              
+              EXCLUDED_NS=$(echo "$EXCLUDED_NS" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              PROTECTED_LABELS=$(echo "$PROTECTED_LABELS" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              
+              log INFO "========================================="
+              log INFO "Configuration Summary:"
+              log INFO "  Namespace: $NS"
+              log INFO "  ConfigMap: $CM"
+              log INFO "  DRY_RUN: $DRY_RUN"
+              log INFO "  MIN_AGE_DAYS: $MIN_AGE_DAYS"
+              log INFO ""
+              
+              excluded_count=0
+              log INFO "Excluded Namespace Patterns:"
+              while IFS= read -r pattern; do
+                if [[ -n "$pattern" ]]; then
+                  ((excluded_count++))
+                  log INFO "  [$excluded_count] $pattern"
+                fi
+              done <<< "$EXCLUDED_NS"
+              [[ $excluded_count -eq 0 ]] && log INFO "  (none configured)"
+              log INFO ""
+              
+              label_count=0
+              log INFO "Protected Labels:"
+              while IFS= read -r label; do
+                if [[ -n "$label" ]]; then
+                  ((label_count++))
+                  log INFO "  [$label_count] $label"
+                fi
+              done <<< "$PROTECTED_LABELS"
+              [[ $label_count -eq 0 ]] && log INFO "  (none configured)"
+              log INFO "========================================="
+              
+              log INFO "Verifying RBAC permissions..."
+              if ! oc get ns &>/dev/null; then
+                error_exit "Unable to list namespaces - check ClusterRole permissions"
+              fi
+              log INFO "RBAC permissions verified"
+              
+              log INFO "Fetching namespace list from cluster..."
+              namespace_list=$(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+              if [[ -z "$namespace_list" ]]; then
+                error_exit "No namespaces found"
+              fi
+              
+              namespace_list=$(echo "$namespace_list" | tr ' ' '\n' | sort)
+              namespace_count=$(echo "$namespace_list" | wc -l)
+              log INFO "Found $namespace_count namespaces in cluster"
+              log INFO ""
+              
+              # ================================================================
+              # Function: Check if ConfigMap is referenced by ANY resource
+              # This is COMPREHENSIVE - checks all possible references
+              # ================================================================
+              is_configmap_referenced() {
+                local ns="$1"
+                local cm_name="$2"
+                local ref_found=false
+                local ref_by=""
+                
+                # Method 1: Check Pods (includes pods from Deployments, StatefulSets, etc.)
+                local pod_refs=""
+                pod_refs=$(oc get pods -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                  .items[] | 
+                  select(
+                    (.spec.volumes[]?.configMap?.name == $name) or
+                    (.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                    (.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name) or
+                    (.spec.initContainers[]?.envFrom[]?.configMapRef?.name == $name) or
+                    (.spec.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                  ) | .metadata.name
+                ' 2>/dev/null || echo "")
+                
+                if [[ -n "$pod_refs" ]]; then
+                  ref_found=true
+                  ref_by="pod:$(echo "$pod_refs" | head -1)"
+                fi
+                
+                # Method 2: Check Deployments directly (template spec)
+                if [[ "$ref_found" == "false" ]]; then
+                  local deploy_refs=""
+                  deploy_refs=$(oc get deploy -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                    .items[] |
+                    select(
+                      (.spec.template.spec.volumes[]?.configMap?.name == $name) or
+                      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                    ) | .metadata.name
+                  ' 2>/dev/null || echo "")
+                  
+                  if [[ -n "$deploy_refs" ]]; then
+                    ref_found=true
+                    ref_by="deployment:$(echo "$deploy_refs" | head -1)"
+                  fi
+                fi
+                
+                # Method 3: Check StatefulSets
+                if [[ "$ref_found" == "false" ]]; then
+                  local sts_refs=""
+                  sts_refs=$(oc get sts -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                    .items[] |
+                    select(
+                      (.spec.template.spec.volumes[]?.configMap?.name == $name) or
+                      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                    ) | .metadata.name
+                  ' 2>/dev/null || echo "")
+                  
+                  if [[ -n "$sts_refs" ]]; then
+                    ref_found=true
+                    ref_by="statefulset:$(echo "$sts_refs" | head -1)"
+                  fi
+                fi
+                
+                # Method 4: Check DaemonSets
+                if [[ "$ref_found" == "false" ]]; then
+                  local ds_refs=""
+                  ds_refs=$(oc get ds -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                    .items[] |
+                    select(
+                      (.spec.template.spec.volumes[]?.configMap?.name == $name) or
+                      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                    ) | .metadata.name
+                  ' 2>/dev/null || echo "")
+                  
+                  if [[ -n "$ds_refs" ]]; then
+                    ref_found=true
+                    ref_by="daemonset:$(echo "$ds_refs" | head -1)"
+                  fi
+                fi
+                
+                # Method 5: Check CronJobs
+                if [[ "$ref_found" == "false" ]]; then
+                  local cj_refs=""
+                  cj_refs=$(oc get cronjob -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                    .items[] |
+                    select(
+                      (.spec.jobTemplate.spec.template.spec.volumes[]?.configMap?.name == $name) or
+                      (.spec.jobTemplate.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                      (.spec.jobTemplate.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                    ) | .metadata.name
+                  ' 2>/dev/null || echo "")
+                  
+                  if [[ -n "$cj_refs" ]]; then
+                    ref_found=true
+                    ref_by="cronjob:$(echo "$cj_refs" | head -1)"
+                  fi
+                fi
+                
+                # Method 6: Check Jobs
+                if [[ "$ref_found" == "false" ]]; then
+                  local job_refs=""
+                  job_refs=$(oc get job -n "$ns" -o json 2>/dev/null | jq -r --arg name "$cm_name" '
+                    .items[] |
+                    select(
+                      (.spec.template.spec.volumes[]?.configMap?.name == $name) or
+                      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $name) or
+                      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $name)
+                    ) | .metadata.name
+                  ' 2>/dev/null || echo "")
+                  
+                  if [[ -n "$job_refs" ]]; then
+                    ref_found=true
+                    ref_by="job:$(echo "$job_refs" | head -1)"
+                  fi
+                fi
+                
+                # Return results
+                if [[ "$ref_found" == "true" ]]; then
+                  echo "$ref_by"
+                  return 0  # Referenced
+                else
+                  return 1  # Not referenced
+                fi
+              }
+              
+              # ================================================================
+              # Main Processing Loop
+              # ================================================================
+              log INFO "========================================="
+              log INFO "Starting Namespace Processing"
+              log INFO "========================================="
+              
+              while IFS= read -r ns; do
+                [[ -z "$ns" ]] && continue
+                
+                excluded=false
+                matched_pattern=""
+                
+                while IFS= read -r pattern; do
+                  [[ -z "$pattern" ]] && continue
+                  if echo "$ns" | grep -Eq "$pattern" 2>/dev/null; then
+                    excluded=true
+                    matched_pattern="$pattern"
+                    break
+                  fi
+                done <<< "$EXCLUDED_NS"
+                
+                if [[ "$excluded" == "true" ]]; then
+                  log DEBUG "EXCLUDED: $ns (matched: $matched_pattern)"
+                  ((namespaces_excluded++))
+                  continue
+                fi
+                
+                ((namespaces_processed++))
+                log INFO ""
+                log INFO "-----------------------------------------"
+                log INFO "Processing Namespace [$namespaces_processed/$namespace_count]: $ns"
+                log INFO "-----------------------------------------"
+                
+                cm_list=""
+                if ! cm_list=$(oc get cm -n "$ns" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); then
+                  log WARN "Unable to list ConfigMaps in namespace: $ns"
+                  ((total_errors++))
+                  continue
+                fi
+                
+                if [[ -z "$cm_list" ]]; then
+                  log INFO "  No ConfigMaps found"
+                  continue
+                fi
+                
+                cm_list=$(echo "$cm_list" | tr ' ' '\n')
+                cm_count=$(echo "$cm_list" | wc -l)
+                log INFO "  Found $cm_count ConfigMap(s)"
+                
+                deleted_in_ns=0
+                skipped_in_ns=0
+                
+                while IFS= read -r name; do
+                  [[ -z "$name" ]] && continue
+                  
+                  cm_json=""
+                  if ! cm_json=$(oc get cm "$name" -n "$ns" -o json 2>/dev/null); then
+                    log WARN "    Unable to fetch: $name (skipping)"
+                    ((skipped_in_ns++))
+                    ((total_errors++))
+                    continue
+                  fi
+                  
+                  # Check protected labels
+                  skip=false
+                  while IFS= read -r label_rule; do
+                    [[ -z "$label_rule" ]] && continue
+                    
+                    if [[ "$label_rule" == *"="* ]]; then
+                      key="${label_rule%=*}"
+                      expected_value="${label_rule#*=}"
+                      actual_value=$(echo "$cm_json" | jq -r ".metadata.labels.\"${key}\" // empty" 2>/dev/null || echo "")
+                      
+                      if [[ -n "$actual_value" && "$actual_value" == "$expected_value" ]]; then
+                        log INFO "    PROTECTED: $name (label: $key=$expected_value)"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    else
+                      if echo "$cm_json" | jq -e ".metadata.labels.\"${label_rule}\"" &>/dev/null; then
+                        actual_value=$(echo "$cm_json" | jq -r ".metadata.labels.\"${label_rule}\"" 2>/dev/null || echo "")
+                        log INFO "    PROTECTED: $name (label: $label_rule=$actual_value)"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    fi
+                  done <<< "$PROTECTED_LABELS"
+                  
+                  if [[ "$skip" == "true" ]]; then
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # Check age
+                  age_days="unknown"
+                  if [[ "$MIN_AGE_DAYS" -gt 0 ]]; then
+                    created=$(echo "$cm_json" | jq -r '.metadata.creationTimestamp' 2>/dev/null || echo "")
+                    
+                    if [[ -n "$created" && "$created" != "null" ]]; then
+                      if created_epoch=$(date -d "$created" +%s 2>/dev/null); then
+                        current_epoch=$(date +%s)
+                        age_days=$(( (current_epoch - created_epoch) / 86400 ))
+                        
+                        if [[ "$age_days" -lt "$MIN_AGE_DAYS" ]]; then
+                          log INFO "    TOO-NEW: $name ($age_days days, min: $MIN_AGE_DAYS)"
+                          ((skipped_in_ns++))
+                          ((total_too_new++))
+                          continue
+                        fi
+                      fi
+                    fi
+                  fi
+                  
+                  # Check if referenced (using comprehensive function)
+                  ref_by=""
+                  if ref_by=$(is_configmap_referenced "$ns" "$name"); then
+                    log INFO "    REFERENCED: $name (by: $ref_by)"
+                    ((skipped_in_ns++))
+                    ((total_referenced++))
+                    continue
+                  fi
+                  
+                  # Delete or Dry-Run
+                  if [[ "$DRY_RUN" == "false" ]]; then
+                    log WARN "    DELETING: $name (age: $age_days days, unreferenced)"
+                    if oc delete cm "$name" -n "$ns" --wait=false 2>&1; then
+                      ((deleted_in_ns++))
+                      ((total_deleted++))
+                      log INFO "    DELETED: $name"
+                    else
+                      log ERROR "    FAILED: $name deletion failed"
+                      ((skipped_in_ns++))
+                      ((total_errors++))
+                    fi
+                  else
+                    log INFO "    DRY-RUN: Would delete $name (age: $age_days days, unreferenced)"
+                    ((deleted_in_ns++))
+                    ((total_deleted++))
+                  fi
+                  
+                done <<< "$cm_list"
+                
+                log INFO "  Namespace summary: deleted=$deleted_in_ns skipped=$skipped_in_ns"
+                ((total_skipped += skipped_in_ns))
+                
+              done <<< "$namespace_list"
+              
+              log INFO ""
+              log INFO "========================================="
+              log INFO "Job Completed Successfully"
+              log INFO "========================================="
+              log INFO "Cluster Statistics:"
+              log INFO "  Total namespaces: $namespace_count"
+              log INFO "  Excluded: $namespaces_excluded"
+              log INFO "  Processed: $namespaces_processed"
+              log INFO ""
+              log INFO "ConfigMap Statistics:"
+              log INFO "  Deleted/Would Delete: $total_deleted"
+              log INFO "  Skipped Total: $total_skipped"
+              log INFO "    - Protected by labels: $total_protected"
+              log INFO "    - Too new (less than $MIN_AGE_DAYS days): $total_too_new"
+              log INFO "    - Referenced by workloads: $total_referenced"
+              log INFO ""
+              log INFO "Errors: $total_errors"
+              if [[ "$DRY_RUN" == "true" ]]; then
+                log INFO "Mode: DRY-RUN (no actual deletions)"
+              else
+                log INFO "Mode: LIVE (actual deletions performed)"
+              fi
+              log INFO "========================================="
+              
+              success_exit
+
+
+
+==========================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-secret-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # ================================================================
+  # EXECUTION MODE
+  # ================================================================
+  # Set to "false" to perform ACTUAL deletions
+  # Set to "true" for simulation only (no deletions)
+  dryRun: "true"
+  
+  # ================================================================
+  # AGE THRESHOLD
+  # ================================================================
+  # Only delete ConfigMaps older than this many days
+  # Recommendation: 7 days minimum, 30 days for production safety
+  #
+  # 7 days  = More aggressive cleanup, recovers space faster
+  #           Risk: May delete ConfigMaps from recent failed deployments
+  #           Use if: You have good CI/CD practices and GitOps
+  #
+  # 30 days = Conservative, safer for production
+  #           Risk: Orphaned ConfigMaps accumulate longer
+  #           Use if: Manual deployments, uncertain ownership
+  #
+  minAgeDays: "7"
+  
+  # ================================================================
+  # EXCLUDED NAMESPACES (regex patterns, one per line)
+  # ================================================================
+  excludedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^default$
+    ^openshift$
+    ^configmap-secret-pruner$
+  
+  # ================================================================
+  # PROTECTED LABELS
+  # ================================================================
+  # ConfigMaps with these labels will NEVER be deleted
+  # Format: key=value (exact match) or key (label exists)
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+    operator.tekton.dev/operand-name
+
+
+-------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cm-secret-pruner
   namespace: configmap-secret-pruner  # FIXED: Correct namespace
 spec:
   schedule: "34 19 * * *"  # Daily at 7:34 PM
