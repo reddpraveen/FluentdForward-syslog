@@ -1,0 +1,669 @@
+#!/bin/bash
+# ConfigMap Pruner Pre-Flight Validation Script
+# Run this BEFORE enabling DRY_RUN=false to identify potential issues
+
+set -uo pipefail
+
+echo "========================================"
+echo "ConfigMap Pruner Pre-Flight Validation"
+echo "========================================"
+echo ""
+
+NS="configmap-secret-pruner"
+CM="cm-secret-pruner-config"
+
+# Load configuration
+EXCLUDED_CM_NAMES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedConfigMapNames}' 2>/dev/null || echo "")
+PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+
+echo "1. Identifying System-Injected ConfigMaps Across Cluster"
+echo "========================================="
+
+# Sample 10 random namespaces to check for patterns
+sample_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | shuf | head -10)
+
+echo "Sampling 10 namespaces for common system ConfigMaps:"
+echo ""
+
+system_cm_patterns=()
+for ns in $sample_namespaces; do
+  echo "Namespace: $ns"
+  cms=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '.items[] | select(.metadata.annotations["service.beta.openshift.io/inject-cabundle"] == "true" or .metadata.labels["config.openshift.io/inject-trusted-cabundle"] == "true") | .metadata.name')
+  
+  if [[ -n "$cms" ]]; then
+    while IFS= read -r cm_name; do
+      echo "  - $cm_name (CA bundle injected)"
+      system_cm_patterns+=("$cm_name")
+    done <<< "$cms"
+  fi
+done
+
+echo ""
+echo "2. Common System ConfigMap Names Found:"
+echo "========================================="
+unique_patterns=$(printf '%s\n' "${system_cm_patterns[@]}" | sort -u)
+echo "$unique_patterns"
+
+echo ""
+echo "3. Currently Excluded ConfigMap Names:"
+echo "========================================="
+echo "$EXCLUDED_CM_NAMES"
+
+echo ""
+echo "4. Missing Exclusions (CRITICAL):"
+echo "========================================="
+missing=false
+while IFS= read -r pattern; do
+  [[ -z "$pattern" ]] && continue
+  if ! echo "$EXCLUDED_CM_NAMES" | grep -q "^${pattern}$"; then
+    echo "MISSING: $pattern"
+    missing=true
+  fi
+done <<< "$unique_patterns"
+[[ "$missing" == "false" ]] && echo "None - All system ConfigMaps are excluded"
+
+echo ""
+echo "5. Finding ConfigMaps with CA Bundle Injection Annotations:"
+echo "========================================="
+
+# Check for ConfigMaps with injection annotations that should be protected
+annotated_count=0
+echo "Checking first 50 non-system namespaces..."
+check_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -50)
+
+for ns in $check_namespaces; do
+  annotated=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '.items[] | select(.metadata.annotations["service.beta.openshift.io/inject-cabundle"] == "true" or .metadata.annotations["service.alpha.openshift.io/inject-cabundle"] == "true" or .metadata.labels["config.openshift.io/inject-trusted-cabundle"] == "true") | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null)
+  
+  if [[ -n "$annotated" ]]; then
+    while IFS= read -r entry; do
+      ((annotated_count++))
+      echo "  $entry"
+    done <<< "$annotated"
+  fi
+done
+
+echo "Found $annotated_count ConfigMaps with CA injection annotations"
+
+echo ""
+echo "6. Validating Protection Logic:"
+echo "========================================="
+
+# Test a sample namespace
+test_ns=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -1)
+echo "Testing protection logic in namespace: $test_ns"
+
+if [[ -n "$test_ns" ]]; then
+  echo "ConfigMaps in $test_ns:"
+  oc get cm -n "$test_ns" -o json | jq -r '.items[] | "  - \(.metadata.name) (age: \(.metadata.creationTimestamp))"'
+  
+  echo ""
+  echo "Would be DELETED (not protected by current config):"
+  
+  # Simulate pruning logic
+  oc get cm -n "$test_ns" -o json | jq -r --arg excluded "$EXCLUDED_CM_NAMES" --arg labels "$PROTECTED_LABELS" '
+    .items[] | 
+    select(
+      (.metadata.name | IN($excluded | split("\n")[])) == false and
+      (.metadata.annotations["service.beta.openshift.io/inject-cabundle"] != "true") and
+      (.metadata.annotations["service.alpha.openshift.io/inject-cabundle"] != "true") and
+      (.metadata.labels["config.openshift.io/inject-trusted-cabundle"] != "true") and
+      ([.metadata.labels | to_entries[] | select(($labels | split("\n")[] | split("=")[0]) == .key)] | length == 0)
+    ) | "  - \(.metadata.name)"
+  '
+fi
+
+echo ""
+echo "7. Recommendations:"
+echo "========================================="
+
+if [[ "$missing" == "true" ]]; then
+  echo "CRITICAL: Update excludedConfigMapNames in your ConfigMap:"
+  echo ""
+  echo "oc patch cm $CM -n $NS --type merge -p '"
+  echo '{"data":{"excludedConfigMapNames":"'
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] && echo "$pattern"
+  done <<< "$unique_patterns"
+  echo '"}}'
+  echo "'"
+  echo ""
+fi
+
+echo "Add these annotations to protection logic:"
+echo "  - service.beta.openshift.io/inject-cabundle=true"
+echo "  - service.alpha.openshift.io/inject-cabundle=true"  
+echo "  - config.openshift.io/inject-trusted-cabundle=true"
+echo ""
+
+echo "8. Safe Testing Steps:"
+echo "========================================="
+echo "1. Run this validation script first"
+echo "2. Review the 'Would be DELETED' section"
+echo "3. Add any missing exclusions to the ConfigMap"
+echo "4. Run pruner with dryRun=true"
+echo "5. Review DRY-RUN logs carefully"
+echo "6. Only then set dryRun=false"
+echo ""
+echo "========================================"
+echo "Validation Complete"
+echo "========================================"
+
+
+-----------------------------------------------------------
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-secret-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # ================================================================
+  # EXECUTION MODE
+  # ================================================================
+  # Set to "false" to perform ACTUAL deletions
+  # Set to "true" for simulation only (no deletions)
+  dryRun: "true"
+  
+  # ================================================================
+  # AGE THRESHOLD
+  # ================================================================
+  # Only delete ConfigMaps older than this many days
+  # Recommendation: 7 days minimum, 30 days for production safety
+  #
+  # 7 days  = More aggressive cleanup, recovers space faster
+  #           Risk: May delete ConfigMaps from recent failed deployments
+  #           Use if: You have good CI/CD practices and GitOps
+  #
+  # 30 days = Conservative, safer for production
+  #           Risk: Orphaned ConfigMaps accumulate longer
+  #           Use if: Manual deployments, uncertain ownership
+  #
+  minAgeDays: "7"
+  
+  # ================================================================
+  # EXCLUDED NAMESPACES (regex patterns, one per line)
+  # ================================================================
+  excludedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^default$
+    ^openshift$
+    ^configmap-secret-pruner$
+  
+  # ================================================================
+  # PROTECTED LABELS
+  # ================================================================
+  # ConfigMaps with these labels will NEVER be deleted
+  # Format: key=value (exact match) or key (label exists)
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+    operator.tekton.dev/operand-name
+  
+  # ================================================================
+  # EXCLUDED CONFIGMAP NAMES (System-Injected)
+  # ================================================================
+  # ConfigMaps with these exact names will NEVER be deleted
+  # These are automatically injected by OpenShift/Istio into namespaces
+  excludedConfigMapNames: |
+    openshift-service-ca.crt
+    kube-root-ca.crt
+    istio-ca-root-cert
+    openshift-ca.crt
+
+
+=================================================
+
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: cm-secret-pruner
+    app.kubernetes.io/component: cleanup
+spec:
+  schedule: "0 2 * * 0"
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: cm-secret-pruner
+          restartPolicy: Never
+          tolerations:
+          - key: "node-role.kubernetes.io/infra"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "64Mi"
+                cpu: "10m"
+              limits:
+                memory: "128Mi"
+                cpu: "50m"
+            env:
+            - name: DELAY_BETWEEN_NAMESPACES
+              value: "0.5"
+            - name: DELAY_BETWEEN_DELETIONS
+              value: "0.1"
+            - name: BATCH_SIZE
+              value: "10"
+            - name: BATCH_PAUSE
+              value: "1"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -uo pipefail
+              
+              # ================================================================
+              # RATE LIMITING CONFIGURATION (values in seconds)
+              # ================================================================
+              DELAY_NS="${DELAY_BETWEEN_NAMESPACES:-0.5}"
+              DELAY_DEL="${DELAY_BETWEEN_DELETIONS:-0.1}"
+              BATCH_SIZE="${BATCH_SIZE:-10}"
+              BATCH_PAUSE="${BATCH_PAUSE:-1}"
+              
+              # Initialize counters
+              total_deleted=0
+              total_skipped=0
+              total_protected=0
+              total_too_new=0
+              total_referenced=0
+              total_system_cm=0
+              total_errors=0
+              namespaces_processed=0
+              namespaces_excluded=0
+              deletion_batch_count=0
+              
+              log() {
+                local level="$1"
+                shift
+                printf '%s [%s] %s\n' "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S %Z')" "$level" "$*" >&2
+              }
+              
+              error_exit() {
+                log ERROR "$1"
+                exit 1
+              }
+              
+              log INFO "========================================="
+              log INFO "ConfigMap Pruner - Production Mode"
+              log INFO "========================================="
+              log INFO "Rate Limiting Settings:"
+              log INFO "  Delay between namespaces: ${DELAY_NS}s"
+              log INFO "  Delay between deletions: ${DELAY_DEL}s"
+              log INFO "  Batch size: $BATCH_SIZE"
+              log INFO "  Batch pause: ${BATCH_PAUSE}s"
+              log INFO "========================================="
+              
+              NS="configmap-secret-pruner"
+              CM="cm-secret-pruner-config"
+              
+              log INFO "Verifying cluster access..."
+              if ! oc whoami &>/dev/null; then
+                error_exit "Unable to authenticate"
+              fi
+              log INFO "Authenticated as: $(oc whoami)"
+              
+              if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+                error_exit "ConfigMap $CM not found in namespace $NS"
+              fi
+              log INFO "ConfigMap found: $CM"
+              
+              # Load configuration
+              DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "true")
+              [[ -z "$DRY_RUN" ]] && DRY_RUN="true"
+              
+              MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "7")
+              [[ -z "$MIN_AGE_DAYS" ]] && MIN_AGE_DAYS="7"
+              
+              EXCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "")
+              if [[ -z "$EXCLUDED_NS" ]]; then
+                EXCLUDED_NS=$(printf '%s\n' '^openshift-.*' '^kube-.*' '^default$' '^openshift$' '^configmap-secret-pruner$')
+              fi
+              
+              PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+              if [[ -z "$PROTECTED_LABELS" ]]; then
+                PROTECTED_LABELS=$(printf '%s\n' 'app.kubernetes.io/managed-by=argocd' 'app.kubernetes.io/managed-by=Helm' 'meta.helm.sh/release-name' 'prune.protected=true')
+              fi
+              
+              # System ConfigMaps that must NEVER be deleted (injected by OpenShift/Istio)
+              EXCLUDED_CM_NAMES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedConfigMapNames}' 2>/dev/null || echo "")
+              if [[ -z "$EXCLUDED_CM_NAMES" ]]; then
+                EXCLUDED_CM_NAMES=$(printf '%s\n' \
+                  'openshift-service-ca.crt' \
+                  'kube-root-ca.crt' \
+                  'istio-ca-root-cert' \
+                  'openshift-ca.crt')
+              fi
+              
+              EXCLUDED_NS=$(echo "$EXCLUDED_NS" | sed '/^[[:space:]]*$/d')
+              PROTECTED_LABELS=$(echo "$PROTECTED_LABELS" | sed '/^[[:space:]]*$/d')
+              EXCLUDED_CM_NAMES=$(echo "$EXCLUDED_CM_NAMES" | sed '/^[[:space:]]*$/d')
+              
+              log INFO "Configuration loaded:"
+              log INFO "  DRY_RUN: $DRY_RUN"
+              log INFO "  MIN_AGE_DAYS: $MIN_AGE_DAYS"
+              
+              # Display excluded patterns
+              log INFO "Excluded namespace patterns:"
+              while IFS= read -r pattern; do
+                [[ -n "$pattern" ]] && log INFO "  - $pattern"
+              done <<< "$EXCLUDED_NS"
+              
+              # Display protected labels
+              log INFO "Protected labels:"
+              while IFS= read -r label; do
+                [[ -n "$label" ]] && log INFO "  - $label"
+              done <<< "$PROTECTED_LABELS"
+              
+              # Display excluded ConfigMap names
+              log INFO "Excluded ConfigMap names (system-injected):"
+              while IFS= read -r cm_name; do
+                [[ -n "$cm_name" ]] && log INFO "  - $cm_name"
+              done <<< "$EXCLUDED_CM_NAMES"
+              
+              # ================================================================
+              # OPTIMIZATION: Single API call to get all namespaces
+              # ================================================================
+              log INFO "Fetching namespace list..."
+              namespace_list=$(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | sort)
+              if [[ -z "$namespace_list" ]]; then
+                error_exit "No namespaces found"
+              fi
+              namespace_count=$(echo "$namespace_list" | wc -l)
+              log INFO "Found $namespace_count namespaces in cluster"
+              
+              current_epoch=$(date +%s)
+              min_age_seconds=$((MIN_AGE_DAYS * 86400))
+              
+              start_time=$(date +%s)
+              
+              while IFS= read -r ns; do
+                [[ -z "$ns" ]] && continue
+                
+                # Check exclusion
+                excluded=false
+                while IFS= read -r pattern; do
+                  [[ -z "$pattern" ]] && continue
+                  if echo "$ns" | grep -Eq "$pattern" 2>/dev/null; then
+                    excluded=true
+                    break
+                  fi
+                done <<< "$EXCLUDED_NS"
+                
+                if [[ "$excluded" == "true" ]]; then
+                  ((namespaces_excluded++))
+                  continue
+                fi
+                
+                ((namespaces_processed++))
+                
+                # Progress indicator every 50 namespaces
+                if [[ $((namespaces_processed % 50)) -eq 0 ]]; then
+                  elapsed=$(($(date +%s) - start_time))
+                  log INFO "Progress: $namespaces_processed namespaces processed in ${elapsed}s"
+                fi
+                
+                log INFO "Processing [$namespaces_processed]: $ns"
+                
+                # ============================================================
+                # OPTIMIZATION: Single API call for ALL ConfigMaps in namespace
+                # ============================================================
+                cm_json=""
+                if ! cm_json=$(oc get cm -n "$ns" -o json 2>/dev/null); then
+                  log WARN "  Unable to list ConfigMaps in: $ns"
+                  ((total_errors++))
+                  sleep "$DELAY_NS"
+                  continue
+                fi
+                
+                cm_count=$(echo "$cm_json" | jq '.items | length' 2>/dev/null || echo "0")
+                if [[ "$cm_count" -eq 0 ]]; then
+                  log INFO "  No ConfigMaps found"
+                  sleep "$DELAY_NS"
+                  continue
+                fi
+                log INFO "  Found $cm_count ConfigMap(s)"
+                
+                # ============================================================
+                # OPTIMIZATION: Single API call for ALL workloads in namespace
+                # Extract referenced ConfigMap names into a lookup list
+                # ============================================================
+                referenced_cms=""
+                referenced_cms=$(oc get deploy,sts,ds,cronjob,job,pod -n "$ns" -o json 2>/dev/null | jq -r '
+                  [
+                    .items[]? | 
+                    (
+                      # Deployments, StatefulSets, DaemonSets
+                      (select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet") |
+                        .spec.template.spec | (
+                          (.volumes[]?.configMap?.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        )
+                      ),
+                      # CronJobs
+                      (select(.kind == "CronJob") |
+                        .spec.jobTemplate.spec.template.spec | (
+                          (.volumes[]?.configMap?.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        )
+                      ),
+                      # Jobs
+                      (select(.kind == "Job") |
+                        .spec.template.spec | (
+                          (.volumes[]?.configMap?.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        )
+                      ),
+                      # Pods
+                      (select(.kind == "Pod") |
+                        .spec | (
+                          (.volumes[]?.configMap?.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        )
+                      )
+                    )
+                  ] | unique | .[]
+                ' 2>/dev/null || echo "")
+                
+                deleted_in_ns=0
+                skipped_in_ns=0
+                batch_counter=0
+                
+                # ============================================================
+                # Process ConfigMaps from cached JSON (no additional API calls)
+                # ============================================================
+                while IFS= read -r cm_data; do
+                  [[ -z "$cm_data" ]] && continue
+                  
+                  name=$(echo "$cm_data" | jq -r '.name' 2>/dev/null)
+                  [[ -z "$name" || "$name" == "null" ]] && continue
+                  
+                  annotations=$(echo "$cm_data" | jq -r '.annotations // {}' 2>/dev/null)
+                  
+                  # Check if ConfigMap has CA bundle injection annotations (auto-managed by OpenShift)
+                  inject_cabundle=$(echo "$annotations" | jq -r '."service.beta.openshift.io/inject-cabundle" // ."service.alpha.openshift.io/inject-cabundle" // empty' 2>/dev/null)
+                  if [[ "$inject_cabundle" == "true" ]]; then
+                    log INFO "    CA-INJECTED: $name (managed by service-ca-operator)"
+                    ((skipped_in_ns++))
+                    ((total_system_cm++))
+                    continue
+                  fi
+                  
+                  # Check if ConfigMap name is in excluded list (system ConfigMaps)
+                  excluded_by_name=false
+                  while IFS= read -r excluded_name; do
+                    [[ -z "$excluded_name" ]] && continue
+                    if [[ "$name" == "$excluded_name" ]]; then
+                      log INFO "    SYSTEM-CM: $name (auto-injected by OpenShift/Istio)"
+                      excluded_by_name=true
+                      ((skipped_in_ns++))
+                      ((total_system_cm++))
+                      break
+                    fi
+                  done <<< "$EXCLUDED_CM_NAMES"
+                  [[ "$excluded_by_name" == "true" ]] && continue
+                  
+                  labels=$(echo "$cm_data" | jq -r '.labels // {}' 2>/dev/null)
+                  
+                  # Check if ConfigMap has trusted CA bundle label (CNO injection)
+                  inject_trusted_ca=$(echo "$labels" | jq -r '."config.openshift.io/inject-trusted-cabundle" // empty' 2>/dev/null)
+                  if [[ "$inject_trusted_ca" == "true" ]]; then
+                    log INFO "    CA-BUNDLE: $name (managed by cluster-network-operator)"
+                    ((skipped_in_ns++))
+                    ((total_system_cm++))
+                    continue
+                  fi
+                  
+                  created=$(echo "$cm_data" | jq -r '.created' 2>/dev/null)
+                  
+                  # Check protected labels
+                  skip=false
+                  while IFS= read -r label_rule; do
+                    [[ -z "$label_rule" ]] && continue
+                    
+                    if [[ "$label_rule" == *"="* ]]; then
+                      key="${label_rule%=*}"
+                      expected="${label_rule#*=}"
+                      actual=$(echo "$labels" | jq -r ".\"$key\" // empty" 2>/dev/null)
+                      if [[ "$actual" == "$expected" ]]; then
+                        log INFO "    PROTECTED: $name (label: $key=$expected)"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    else
+                      if echo "$labels" | jq -e ".\"$label_rule\"" &>/dev/null; then
+                        log INFO "    PROTECTED: $name (label: $label_rule)"
+                        skip=true
+                        ((total_protected++))
+                        break
+                      fi
+                    fi
+                  done <<< "$PROTECTED_LABELS"
+                  
+                  if [[ "$skip" == "true" ]]; then
+                    ((skipped_in_ns++))
+                    continue
+                  fi
+                  
+                  # Check age
+                  age_days="unknown"
+                  if [[ -n "$created" && "$created" != "null" ]]; then
+                    created_epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+                    if [[ "$created_epoch" -gt 0 ]]; then
+                      age_seconds=$((current_epoch - created_epoch))
+                      age_days=$((age_seconds / 86400))
+                      
+                      if [[ "$age_seconds" -lt "$min_age_seconds" ]]; then
+                        log INFO "    TOO-NEW: $name ($age_days days, min: $MIN_AGE_DAYS)"
+                        ((skipped_in_ns++))
+                        ((total_too_new++))
+                        continue
+                      fi
+                    fi
+                  fi
+                  
+                  # Check if referenced (simple lookup in cached list)
+                  if echo "$referenced_cms" | grep -qx "$name" 2>/dev/null; then
+                    log INFO "    REFERENCED: $name"
+                    ((skipped_in_ns++))
+                    ((total_referenced++))
+                    continue
+                  fi
+                  
+                  # ========================================================
+                  # DELETION with rate limiting
+                  # ========================================================
+                  if [[ "$DRY_RUN" == "false" ]]; then
+                    log INFO "    DELETING: $name (age: $age_days days)"
+                    
+                    # Rate limit: pause between deletions
+                    sleep "$DELAY_DEL"
+                    
+                    if oc delete cm "$name" -n "$ns" --wait=false &>/dev/null; then
+                      ((deleted_in_ns++))
+                      ((total_deleted++))
+                      ((batch_counter++))
+                      ((deletion_batch_count++))
+                      
+                      # Batch pause: every BATCH_SIZE deletions, pause longer
+                      if [[ $((batch_counter % BATCH_SIZE)) -eq 0 ]]; then
+                        log INFO "    Batch pause after $batch_counter deletions..."
+                        sleep "$BATCH_PAUSE"
+                      fi
+                    else
+                      log ERROR "    FAILED: $name"
+                      ((total_errors++))
+                    fi
+                  else
+                    log INFO "    DRY-RUN: Would delete $name (age: $age_days days)"
+                    ((deleted_in_ns++))
+                    ((total_deleted++))
+                  fi
+                  
+                done < <(echo "$cm_json" | jq -c '.items[] | {name: .metadata.name, labels: .metadata.labels, annotations: .metadata.annotations, created: .metadata.creationTimestamp}' 2>/dev/null)
+                
+                if [[ "$deleted_in_ns" -gt 0 || "$skipped_in_ns" -gt 0 ]]; then
+                  log INFO "  Namespace summary: deleted=$deleted_in_ns skipped=$skipped_in_ns"
+                fi
+                ((total_skipped += skipped_in_ns))
+                
+                # Rate limit: pause between namespaces
+                sleep "$DELAY_NS"
+                
+              done <<< "$namespace_list"
+              
+              end_time=$(date +%s)
+              duration=$((end_time - start_time))
+              duration_min=$((duration / 60))
+              duration_sec=$((duration % 60))
+              
+              log INFO ""
+              log INFO "========================================="
+              log INFO "Job Completed Successfully"
+              log INFO "========================================="
+              log INFO "Duration: ${duration_min}m ${duration_sec}s"
+              log INFO ""
+              log INFO "Namespace Statistics:"
+              log INFO "  Total in cluster: $namespace_count"
+              log INFO "  Excluded by pattern: $namespaces_excluded"
+              log INFO "  Processed: $namespaces_processed"
+              log INFO ""
+              log INFO "ConfigMap Statistics:"
+              log INFO "  Deleted (or would delete): $total_deleted"
+              log INFO "  Skipped total: $total_skipped"
+              log INFO "    - System ConfigMaps (injected): $total_system_cm"
+              log INFO "    - Protected by labels: $total_protected"
+              log INFO "    - Too new (less than $MIN_AGE_DAYS days): $total_too_new"
+              log INFO "    - Referenced by workloads: $total_referenced"
+              log INFO ""
+              log INFO "Errors: $total_errors"
+              log INFO "Mode: $(if [[ "$DRY_RUN" == "true" ]]; then echo "DRY-RUN (no actual deletions)"; else echo "LIVE (deletions performed)"; fi)"
+              log INFO "========================================="
+              
+              exit 0
+    
