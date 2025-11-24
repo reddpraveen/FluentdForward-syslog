@@ -1,0 +1,459 @@
+#!/bin/bash
+# ConfigMap Label Discovery Script
+# Discovers actual labels used by ArgoCD, Helm, Operators, and other management tools
+
+set -uo pipefail
+
+echo "========================================"
+echo "ConfigMap Label Discovery"
+echo "========================================"
+echo ""
+
+# Sample namespaces (exclude system namespaces)
+sample_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -50)
+
+declare -A label_counts
+declare -A annotation_counts
+
+echo "1. Scanning ConfigMaps for Management Labels"
+echo "========================================="
+echo "Checking 50 non-system namespaces..."
+echo ""
+
+processed=0
+for ns in $sample_namespaces; do
+  ((processed++))
+  if [[ $((processed % 10)) -eq 0 ]]; then
+    echo "  Processed $processed namespaces..."
+  fi
+  
+  # Get all ConfigMap labels
+  labels=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '.items[].metadata.labels // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+  
+  if [[ -n "$labels" ]]; then
+    while IFS= read -r label; do
+      [[ -z "$label" ]] && continue
+      label_counts["$label"]=$((${label_counts["$label"]:-0} + 1))
+    done <<< "$labels"
+  fi
+  
+  # Get all ConfigMap annotations
+  annotations=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '.items[].metadata.annotations // {} | to_entries[] | "\(.key)=\(.value)"' 2>/dev/null)
+  
+  if [[ -n "$annotations" ]]; then
+    while IFS= read -r annotation; do
+      [[ -z "$annotation" ]] && continue
+      annotation_counts["$annotation"]=$((${annotation_counts["$annotation"]:-0} + 1))
+    done <<< "$annotations"
+  fi
+done
+
+echo "  Completed scanning $processed namespaces"
+echo ""
+
+echo "2. Management Tool Labels Found:"
+echo "========================================="
+echo ""
+
+echo "ArgoCD Labels:"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *"argocd"* ]] || [[ "$label" == *"argoproj"* ]]; then
+    printf "  %-60s (found %d times)\n" "$label" "${label_counts[$label]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "Helm Labels:"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *"helm"* ]]; then
+    printf "  %-60s (found %d times)\n" "$label" "${label_counts[$label]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "Tekton/Pipelines Labels:"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *"tekton"* ]] || [[ "$label" == *"pipeline"* ]]; then
+    printf "  %-60s (found %d times)\n" "$label" "${label_counts[$label]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "Operator Labels:"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *"operator"* ]]; then
+    printf "  %-60s (found %d times)\n" "$label" "${label_counts[$label]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "Kubernetes Management Labels:"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == "app.kubernetes.io/"* ]]; then
+    printf "  %-60s (found %d times)\n" "$label" "${label_counts[$label]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "3. Management Tool Annotations Found:"
+echo "========================================="
+echo ""
+
+echo "ArgoCD Annotations:"
+for annotation in "${!annotation_counts[@]}"; do
+  if [[ "$annotation" == *"argocd"* ]] || [[ "$annotation" == *"argoproj"* ]]; then
+    printf "  %-60s (found %d times)\n" "$annotation" "${annotation_counts[$annotation]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "Helm Annotations:"
+for annotation in "${!annotation_counts[@]}"; do
+  if [[ "$annotation" == *"helm"* ]]; then
+    printf "  %-60s (found %d times)\n" "$annotation" "${annotation_counts[$annotation]}"
+  fi
+done | sort -k3 -rn
+
+echo ""
+echo "4. Top 20 Most Common Labels (All Types):"
+echo "========================================="
+for label in "${!label_counts[@]}"; do
+  printf "%d %s\n" "${label_counts[$label]}" "$label"
+done | sort -rn | head -20 | while read count label; do
+  printf "  %-60s (found %d times)\n" "$label" "$count"
+done
+
+echo ""
+echo "5. Recommended Protected Labels:"
+echo "========================================="
+echo ""
+echo "Based on your cluster, consider adding these to protectedLabels:"
+echo ""
+
+# Extract unique label keys (without values)
+echo "# ArgoCD managed resources"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == app.kubernetes.io/managed-by=argocd* ]] || [[ "$label" == *argoproj* ]]; then
+    key="${label%%=*}"
+    value="${label#*=}"
+    if [[ "${label_counts[$label]}" -gt 5 ]]; then
+      echo "$label"
+    fi
+  fi
+done | sort -u
+
+echo ""
+echo "# Helm managed resources"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *helm* ]]; then
+    key="${label%%=*}"
+    value="${label#*=}"
+    if [[ "${label_counts[$label]}" -gt 5 ]]; then
+      echo "$label"
+    fi
+  fi
+done | sort -u
+
+echo ""
+echo "# Operator managed resources"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *operator* ]]; then
+    key="${label%%=*}"
+    if [[ "${label_counts[$label]}" -gt 10 ]]; then
+      # For operator labels, show just the key (label exists check)
+      echo "$key"
+    fi
+  fi
+done | sort -u
+
+echo ""
+echo "# Tekton/Pipeline resources"
+for label in "${!label_counts[@]}"; do
+  if [[ "$label" == *tekton* ]] || [[ "$label" == *pipeline* ]]; then
+    key="${label%%=*}"
+    if [[ "${label_counts[$label]}" -gt 5 ]]; then
+      echo "$key"
+    fi
+  fi
+done | sort -u
+
+echo ""
+echo "6. Sample ConfigMaps with Multiple Management Labels:"
+echo "========================================="
+echo "Finding ConfigMaps with rich label sets..."
+echo ""
+
+sample_cm_ns=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -20)
+
+for ns in $sample_cm_ns; do
+  oc get cm -n "$ns" -o json 2>/dev/null | jq -r --arg ns "$ns" '
+    .items[] | 
+    select((.metadata.labels // {} | length) > 3) | 
+    {
+      namespace: $ns,
+      name: .metadata.name,
+      labels: (.metadata.labels // {} | to_entries | map("\(.key)=\(.value)") | join(", "))
+    } | 
+    "\(.namespace)/\(.name):\n  Labels: \(.labels)"
+  ' 2>/dev/null | head -20
+done
+
+echo ""
+echo "========================================"
+echo "Discovery Complete"
+echo "========================================"
+echo ""
+echo "Next Steps:"
+echo "1. Review the 'Recommended Protected Labels' section above"
+echo "2. Add frequently occurring labels to your ConfigMap:"
+echo "   oc edit cm cm-secret-pruner-config -n configmap-secret-pruner"
+echo "3. Test with DRY-RUN before enabling live deletions"
+
+
+
+==========================================
+
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-secret-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # ================================================================
+  # EXECUTION MODE
+  # ================================================================
+  # Set to "false" to perform ACTUAL deletions
+  # Set to "true" for simulation only (no deletions)
+  dryRun: "true"
+  
+  # ================================================================
+  # AGE THRESHOLD
+  # ================================================================
+  # Only delete ConfigMaps older than this many days
+  # Recommendation: 7 days minimum, 30 days for production safety
+  #
+  # 7 days  = More aggressive cleanup, recovers space faster
+  #           Risk: May delete ConfigMaps from recent failed deployments
+  #           Use if: You have good CI/CD practices and GitOps
+  #
+  # 30 days = Conservative, safer for production
+  #           Risk: Orphaned ConfigMaps accumulate longer
+  #           Use if: Manual deployments, uncertain ownership
+  #
+  minAgeDays: "7"
+  
+  # ================================================================
+  # EXCLUDED NAMESPACES (regex patterns, one per line)
+  # ================================================================
+  excludedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^default$
+    ^openshift$
+    ^configmap-secret-pruner$
+  
+  # ================================================================
+  # PROTECTED LABELS
+  # ================================================================
+  # ConfigMaps with these labels will NEVER be deleted
+  # Format: 
+  #   key=value (exact match) - e.g., app.kubernetes.io/managed-by=argocd
+  #   key (label exists)       - e.g., operator.tekton.dev/operand-name
+  #
+  # Run discover-labels.sh to find labels actually used in your cluster
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    app.kubernetes.io/managed-by=kustomize
+    argocd.argoproj.io/instance
+    meta.helm.sh/release-name
+    helm.sh/chart
+    app.kubernetes.io/part-of
+    prune.protected=true
+    operator.tekton.dev/operand-name
+    pipelines.openshift.io/used-by
+    olm.owner
+    olm.managed
+    app.openshift.io/runtime
+    operators.coreos.com/
+
+  
+  # ================================================================
+  # EXCLUDED CONFIGMAP NAMES (System-Injected)
+  # ================================================================
+  # ConfigMaps with these exact names will NEVER be deleted
+  # These are automatically injected by OpenShift/Istio into namespaces
+  excludedConfigMapNames: |
+    openshift-service-ca.crt
+    kube-root-ca.crt
+    istio-ca-root-cert
+    openshift-ca.crt
+
+
+-----------------------------------------
+
+#!/bin/bash
+# ConfigMap Pruner Pre-Flight Validation Script
+# Run this BEFORE enabling DRY_RUN=false to identify potential issues
+
+set -uo pipefail
+
+echo "========================================"
+echo "ConfigMap Pruner Pre-Flight Validation"
+echo "========================================"
+echo ""
+
+NS="configmap-secret-pruner"
+CM="cm-secret-pruner-config"
+
+# Load configuration
+EXCLUDED_CM_NAMES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedConfigMapNames}' 2>/dev/null || echo "")
+PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+
+echo "1. Identifying System-Injected ConfigMaps Across Cluster"
+echo "========================================="
+
+# Sample 10 random namespaces to check for patterns
+sample_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | shuf | head -10)
+
+echo "Sampling 10 namespaces for common system ConfigMaps:"
+echo ""
+
+system_cm_patterns=()
+for ns in $sample_namespaces; do
+  echo "Namespace: $ns"
+  cms=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '
+    .items[] | 
+    select(
+      ((.metadata.annotations // {})["service.beta.openshift.io/inject-cabundle"] == "true") or
+      ((.metadata.labels // {})["config.openshift.io/inject-trusted-cabundle"] == "true")
+    ) | .metadata.name
+  ')
+  
+  if [[ -n "$cms" ]]; then
+    while IFS= read -r cm_name; do
+      echo "  - $cm_name (CA bundle injected)"
+      system_cm_patterns+=("$cm_name")
+    done <<< "$cms"
+  fi
+done
+
+echo ""
+echo "2. Common System ConfigMap Names Found:"
+echo "========================================="
+unique_patterns=$(printf '%s\n' "${system_cm_patterns[@]}" | sort -u)
+echo "$unique_patterns"
+
+echo ""
+echo "3. Currently Excluded ConfigMap Names:"
+echo "========================================="
+echo "$EXCLUDED_CM_NAMES"
+
+echo ""
+echo "4. Missing Exclusions (CRITICAL):"
+echo "========================================="
+missing=false
+while IFS= read -r pattern; do
+  [[ -z "$pattern" ]] && continue
+  if ! echo "$EXCLUDED_CM_NAMES" | grep -q "^${pattern}$"; then
+    echo "MISSING: $pattern"
+    missing=true
+  fi
+done <<< "$unique_patterns"
+[[ "$missing" == "false" ]] && echo "None - All system ConfigMaps are excluded"
+
+echo ""
+echo "5. Finding ConfigMaps with CA Bundle Injection Annotations:"
+echo "========================================="
+
+# Check for ConfigMaps with injection annotations that should be protected
+annotated_count=0
+echo "Checking first 50 non-system namespaces..."
+check_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -50)
+
+for ns in $check_namespaces; do
+  annotated=$(oc get cm -n "$ns" -o json 2>/dev/null | jq -r '
+    .items[] | 
+    select(
+      ((.metadata.annotations // {})["service.beta.openshift.io/inject-cabundle"] == "true") or
+      ((.metadata.annotations // {})["service.alpha.openshift.io/inject-cabundle"] == "true") or
+      ((.metadata.labels // {})["config.openshift.io/inject-trusted-cabundle"] == "true")
+    ) | "\(.metadata.namespace)/\(.metadata.name)"
+  ' 2>/dev/null)
+  
+  if [[ -n "$annotated" ]]; then
+    while IFS= read -r entry; do
+      ((annotated_count++))
+      echo "  $entry"
+    done <<< "$annotated"
+  fi
+done
+
+echo "Found $annotated_count ConfigMaps with CA injection annotations"
+
+echo ""
+echo "6. Validating Protection Logic:"
+echo "========================================="
+
+# Test a sample namespace
+test_ns=$(oc get ns -o jsonpath='{.items[*].metadata.name}' | tr ' ' '\n' | grep -v '^openshift-' | grep -v '^kube-' | head -1)
+echo "Testing protection logic in namespace: $test_ns"
+
+if [[ -n "$test_ns" ]]; then
+  echo "ConfigMaps in $test_ns:"
+  oc get cm -n "$test_ns" -o json | jq -r '.items[] | "  - \(.metadata.name) (age: \(.metadata.creationTimestamp))"'
+  
+  echo ""
+  echo "Would be DELETED (not protected by current config):"
+  
+  # Simulate pruning logic with proper null handling
+  oc get cm -n "$test_ns" -o json | jq -r --arg excluded "$EXCLUDED_CM_NAMES" '
+    .items[] | 
+    select(
+      # Check name is not in excluded list
+      ([.metadata.name] | inside([$excluded | split("\n")[] | select(length > 0)])) == false and
+      # Check annotations for CA bundle injection
+      ((.metadata.annotations // {})["service.beta.openshift.io/inject-cabundle"] // "false") != "true" and
+      ((.metadata.annotations // {})["service.alpha.openshift.io/inject-cabundle"] // "false") != "true" and
+      # Check labels for trusted CA bundle
+      ((.metadata.labels // {})["config.openshift.io/inject-trusted-cabundle"] // "false") != "true"
+    ) | "  - \(.metadata.name)"
+  ' 2>&1 | grep -v "^$" || echo "  (none - all ConfigMaps are protected)"
+fi
+
+echo ""
+echo "7. Recommendations:"
+echo "========================================="
+
+if [[ "$missing" == "true" ]]; then
+  echo "CRITICAL: Update excludedConfigMapNames in your ConfigMap:"
+  echo ""
+  echo "oc patch cm $CM -n $NS --type merge -p '"
+  echo '{"data":{"excludedConfigMapNames":"'
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] && echo "$pattern"
+  done <<< "$unique_patterns"
+  echo '"}}'
+  echo "'"
+  echo ""
+fi
+
+echo "Add these annotations to protection logic:"
+echo "  - service.beta.openshift.io/inject-cabundle=true"
+echo "  - service.alpha.openshift.io/inject-cabundle=true"  
+echo "  - config.openshift.io/inject-trusted-cabundle=true"
+echo ""
+
+echo "8. Safe Testing Steps:"
+echo "========================================="
+echo "1. Run this validation script first"
+echo "2. Review the 'Would be DELETED' section"
+echo "3. Add any missing exclusions to the ConfigMap"
+echo "4. Run pruner with dryRun=true"
+echo "5. Review DRY-RUN logs carefully"
+echo "6. Only then set dryRun=false"
+echo ""
+echo "========================================"
+echo "Validation Complete"
+echo "========================================"
