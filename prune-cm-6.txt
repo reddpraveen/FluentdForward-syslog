@@ -395,7 +395,7 @@ spec:
                   ((namespaces_paginated++))
                   
                   # Get workload references
-                  local ref_result
+                  #local ref_result
                   ref_result=$(get_workload_references "$ns")
                   local referenced_cms=$(echo "$ref_result" | head -1)
                   workload_details=$(echo "$ref_result" | tail -n +2)
@@ -534,7 +534,7 @@ spec:
                   fi
                   
                   # Get workload references
-                  local ref_result
+                  #local ref_result
                   ref_result=$(get_workload_references "$ns")
                   referenced_cms=$(echo "$ref_result" | head -1)
                   workload_details=$(echo "$ref_result" | tail -n +2)
@@ -1020,7 +1020,7 @@ spec:
                 ((namespaces_paginated++))
                 
                 # Get workload references
-                local ref_result
+                #local ref_result
                 ref_result=$(get_workload_references "$ns")
                 local referenced_cms=$(echo "$ref_result" | head -1)
                 workload_details=$(echo "$ref_result" | tail -n +2)
@@ -1159,7 +1159,7 @@ spec:
                 fi
                 
                 # Get workload references
-                local ref_result
+                #local ref_result
                 ref_result=$(get_workload_references "$ns")
                 referenced_cms=$(echo "$ref_result" | head -1)
                 workload_details=$(echo "$ref_result" | tail -n +2)
