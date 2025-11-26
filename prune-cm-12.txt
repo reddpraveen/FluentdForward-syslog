@@ -1,3 +1,50 @@
+---
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: configmap-secret-pruner
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cm-secret-pruner-role
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "configmaps", "secrets", "pods", "serviceaccounts", "replicationcontrollers"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+- apiGroups: ["argoproj.io"]
+  resources: ["rollouts"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps.openshift.io"]
+  resources: ["deploymentconfigs"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cm-secret-pruner-binding
+subjects:
+- kind: ServiceAccount
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+roleRef:
+  kind: ClusterRole
+  name: cm-secret-pruner-role
+  apiGroup: rbac.authorization.k8s.io
+
++++++++++++++++++
 apiVersion: batch/v1
 kind: CronJob
 metadata:
