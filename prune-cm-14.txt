@@ -1,3 +1,196 @@
+#!/bin/bash
+# Validation Script: Verify ConfigMap Reference Status
+# This checks if ConfigMaps marked for deletion are truly unreferenced
+
+NAMESPACE="aap"
+
+echo "========================================================"
+echo "ConfigMap Reference Validation for namespace: $NAMESPACE"
+echo "========================================================"
+echo ""
+
+# List of ConfigMaps from your screenshot that were marked "Would delete"
+declare -a configmaps_to_check=(
+  "aap-gateway-operator"
+  "aap-ldap-cert"
+  "aap-ldapconfig"
+  "aap25-controller-redirect-page"
+  "aap25-envoy-conf"
+  "aap25-gateway-conf"
+  "aap25-nginx-conf"
+  "aap25-supervisord-conf"
+  "aap25-uwsgi-ini"
+  "adp1-ldap-certs"
+  "ansible-lightspeed-operator"
+  "ansible-plugin-files"
+  "ansible-templates-catalog"
+  "app-config-rhdh"
+  "automation-controller-operator"
+  "automation-hub-operator"
+  "backstage-appconfig-developer-hub"
+)
+
+check_configmap_references() {
+  local cm_name="$1"
+  local found_in=""
+  local reference_count=0
+  
+  echo "----------------------------------------"
+  echo "Checking: $cm_name"
+  echo "----------------------------------------"
+  
+  # Check if ConfigMap exists
+  if ! oc get cm "$cm_name" -n "$NAMESPACE" &>/dev/null; then
+    echo "❌ ConfigMap does NOT exist in namespace $NAMESPACE"
+    echo ""
+    return
+  fi
+  
+  # Check Deployments
+  deploy_refs=$(oc get deployments -n "$NAMESPACE" -o json 2>/dev/null | jq -r --arg cm "$cm_name" '
+    .items[] | 
+    select(
+      (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+      (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm) or
+      (.spec.template.spec.initContainers[]?.envFrom[]?.configMapRef?.name == $cm) or
+      (.spec.template.spec.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+    ) | 
+    "deployment:\(.metadata.name)"
+  ' 2>/dev/null)
+  
+  if [[ -n "$deploy_refs" ]]; then
+    found_in="$found_in $deploy_refs"
+    ((reference_count++))
+  fi
+  
+  # Check StatefulSets
+  sts_refs=$(oc get statefulsets -n "$NAMESPACE" -o json 2>/dev/null | jq -r --arg cm "$cm_name" '
+    .items[] | 
+    select(
+      (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+      (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+    ) | 
+    "statefulset:\(.metadata.name)"
+  ' 2>/dev/null)
+  
+  if [[ -n "$sts_refs" ]]; then
+    found_in="$found_in $sts_refs"
+    ((reference_count++))
+  fi
+  
+  # Check DaemonSets
+  ds_refs=$(oc get daemonsets -n "$NAMESPACE" -o json 2>/dev/null | jq -r --arg cm "$cm_name" '
+    .items[] | 
+    select(
+      (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+      (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+      (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+      (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+    ) | 
+    "daemonset:\(.metadata.name)"
+  ' 2>/dev/null)
+  
+  if [[ -n "$ds_refs" ]]; then
+    found_in="$found_in $ds_refs"
+    ((reference_count++))
+  fi
+  
+  # Check Pods (for standalone pods or pods from unknown controllers)
+  pod_refs=$(oc get pods -n "$NAMESPACE" -o json 2>/dev/null | jq -r --arg cm "$cm_name" '
+    .items[] | 
+    select(
+      (.spec.volumes[]?.configMap?.name == $cm) or
+      (.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+      (.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+      (.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+    ) | 
+    "pod:\(.metadata.name)"
+  ' 2>/dev/null)
+  
+  if [[ -n "$pod_refs" ]]; then
+    found_in="$found_in $pod_refs"
+    ((reference_count++))
+  fi
+  
+  # Check for system/injected ConfigMap indicators
+  annotations=$(oc get cm "$cm_name" -n "$NAMESPACE" -o jsonpath='{.metadata.annotations}' 2>/dev/null)
+  labels=$(oc get cm "$cm_name" -n "$NAMESPACE" -o jsonpath='{.metadata.labels}' 2>/dev/null)
+  
+  is_system=false
+  if echo "$annotations" | grep -q "service.beta.openshift.io/inject-cabundle\|service.alpha.openshift.io/inject-cabundle"; then
+    is_system=true
+    echo "🛡️  SYSTEM: CA bundle injection detected"
+  fi
+  
+  if echo "$labels" | grep -q "config.openshift.io/inject-trusted-cabundle"; then
+    is_system=true
+    echo "🛡️  SYSTEM: Trusted CA bundle injection detected"
+  fi
+  
+  if [[ "$cm_name" =~ ^(kube-root-ca\.crt|openshift-service-ca\.crt|istio-ca-root-cert|openshift-ca\.crt)$ ]]; then
+    is_system=true
+    echo "🛡️  SYSTEM: Known system ConfigMap name"
+  fi
+  
+  # Check for protected labels
+  is_protected=false
+  if echo "$labels" | grep -q "app.kubernetes.io/managed-by.*argocd\|app.kubernetes.io/managed-by.*Helm\|meta.helm.sh/release-name\|prune.protected.*true"; then
+    is_protected=true
+    echo "🔒 PROTECTED: Managed by GitOps/Helm or has protection label"
+  fi
+  
+  # Check age
+  created=$(oc get cm "$cm_name" -n "$NAMESPACE" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null)
+  if [[ -n "$created" ]]; then
+    created_epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+    current_epoch=$(date +%s)
+    age_days=$(( (current_epoch - created_epoch) / 86400 ))
+    echo "📅 Age: $age_days days"
+    
+    if [[ $age_days -lt 7 ]]; then
+      echo "⏱️  TOO NEW: Less than 7 days old"
+    fi
+  fi
+  
+  # Final verdict
+  echo ""
+  if [[ "$is_system" == "true" ]]; then
+    echo "✅ VERDICT: Should be SKIPPED (system ConfigMap)"
+  elif [[ "$is_protected" == "true" ]]; then
+    echo "✅ VERDICT: Should be PROTECTED (managed resource)"
+  elif [[ $reference_count -gt 0 ]]; then
+    echo "✅ VERDICT: Should be REFERENCED"
+    echo "   Found in: $found_in"
+  elif [[ $age_days -lt 7 ]]; then
+    echo "✅ VERDICT: Should be SKIPPED (too new)"
+  else
+    echo "⚠️  VERDICT: SAFE TO DELETE (no references found, old enough)"
+  fi
+  echo ""
+}
+
+# Process each ConfigMap
+for cm in "${configmaps_to_check[@]}"; do
+  check_configmap_references "$cm"
+done
+
+echo "========================================================"
+echo "Validation Complete"
+echo "========================================================"
+echo ""
+echo "Legend:"
+echo "  ✅ - Script behavior is correct"
+echo "  ⚠️  - ConfigMap can be deleted (truly unreferenced)"
+echo "  ❌ - ConfigMap doesn't exist"
+echo ""
+echo "If any ConfigMap shows '✅ Should be REFERENCED' but was marked"
+echo "for deletion in the pruner logs, that indicates a bug."
+
+------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
