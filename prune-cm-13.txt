@@ -1,3 +1,80 @@
+#!/bin/bash
+# Diagnostic script to check ConfigMap references
+
+NAMESPACE="aap"
+CM_NAME="app-config-rhdh"
+
+echo "================================================"
+echo "Checking how ConfigMap '$CM_NAME' is referenced"
+echo "in namespace: $NAMESPACE"
+echo "================================================"
+echo ""
+
+echo "1. Checking Deployments..."
+echo "----------------------------"
+oc get deploy -n "$NAMESPACE" -o json | jq -r --arg cm "$CM_NAME" '
+  .items[] | 
+  select(
+    (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+    (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+    (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+    (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm) or
+    (.spec.template.spec.initContainers[]?.envFrom[]?.configMapRef?.name == $cm) or
+    (.spec.template.spec.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+  ) | 
+  "FOUND in Deployment: \(.metadata.name)"
+' || echo "  No deployments found using this ConfigMap"
+
+echo ""
+echo "2. Checking StatefulSets..."
+echo "----------------------------"
+oc get sts -n "$NAMESPACE" -o json | jq -r --arg cm "$CM_NAME" '
+  .items[] | 
+  select(
+    (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+    (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+    (.spec.template.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+    (.spec.template.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+  ) | 
+  "FOUND in StatefulSet: \(.metadata.name)"
+' || echo "  No statefulsets found using this ConfigMap"
+
+echo ""
+echo "3. Checking Pods..."
+echo "----------------------------"
+oc get pods -n "$NAMESPACE" -o json | jq -r --arg cm "$CM_NAME" '
+  .items[] | 
+  select(
+    (.spec.volumes[]?.configMap?.name == $cm) or
+    (.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+    (.spec.containers[]?.envFrom[]?.configMapRef?.name == $cm) or
+    (.spec.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name == $cm)
+  ) | 
+  "FOUND in Pod: \(.metadata.name)"
+' || echo "  No pods found using this ConfigMap"
+
+echo ""
+echo "4. Detailed Volume Check (Projected Volumes)..."
+echo "------------------------------------------------"
+oc get deploy,sts,ds,pod -n "$NAMESPACE" -o json | jq -r --arg cm "$CM_NAME" '
+  .items[] | 
+  select(.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm or .spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) |
+  "PROJECTED VOLUME FOUND in \(.kind): \(.metadata.name)"
+' || echo "  No projected volumes found"
+
+echo ""
+echo "5. Raw YAML Grep Search..."
+echo "----------------------------"
+echo "All references to '$CM_NAME' in workloads:"
+oc get deploy,sts,ds,pod -n "$NAMESPACE" -o yaml | grep -B10 -A2 "$CM_NAME" | head -50
+
+echo ""
+echo "================================================"
+echo "Check complete!"
+echo "================================================"
+
+
+--------
 oc -n aap get deploy backstage-developer-hub -o jsonpath='{.spec.template.spec.volumes[*].configMap.name}'
 
 oc -n aap get deploy backstage-developer-hub -o json | jq -r '
