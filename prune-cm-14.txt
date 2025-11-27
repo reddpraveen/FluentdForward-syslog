@@ -1,4 +1,38 @@
 #!/bin/bash
+# Quick check for the 2 missing ConfigMaps
+
+echo "Checking the 2 ConfigMaps not in validation script..."
+echo ""
+
+for cm in aap25-controller-automationcontroller-configmap dynamic-plugins-config-cm; do
+  echo "=== $cm ==="
+  
+  refs=$(oc get deploy,sts,ds,pod -n aap -o json 2>/dev/null | \
+    jq -r --arg cm "$cm" '
+      .items[] | 
+      select(
+        (.spec.template.spec.volumes[]?.configMap?.name == $cm) or
+        (.spec.volumes[]?.configMap?.name == $cm) or
+        (.spec.template.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm) or
+        (.spec.volumes[]?.projected?.sources[]?.configMap?.name == $cm)
+      ) | 
+      "\(.kind):\(.metadata.name)"
+    ')
+  
+  if [[ -z "$refs" ]]; then
+    echo "  ⚠️  NOT REFERENCED"
+  else
+    echo "  ✅ REFERENCED by:"
+    echo "$refs" | while read line; do
+      echo "     - $line"
+    done
+  fi
+  echo ""
+done
+
+
+==============
+#!/bin/bash
 # Validation Script: Verify ConfigMap Reference Status
 # This checks if ConfigMaps marked for deletion are truly unreferenced
 
