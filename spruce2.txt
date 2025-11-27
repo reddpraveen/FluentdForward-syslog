@@ -1,0 +1,25 @@
+# Find Opaque secrets in openshift-* namespaces older than 90 days
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.metadata.namespace | startswith("openshift-")) |
+    select(.type == "Opaque") |
+    (.metadata.creationTimestamp | fromdateiso8601) as $created |
+    (now - $created) / 86400 as $age_days |
+    select($age_days > 90) |
+    "\(.metadata.namespace)/\(.metadata.name) (\($age_days | floor) days old)"
+  ' | head -10
+
+
+  # Are there ANY user-created secrets of excluded types?
+# (There shouldn't be, but let's check)
+
+# ServiceAccount tokens - ALL should be system-generated
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[] | select(.type == "kubernetes.io/service-account-token") | "\(.metadata.namespace)/\(.metadata.name)"' | \
+  grep -v "openshift\|kube" | head -5
+
+# Docker config - Should all be system or builder-related
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[] | select(.type == "kubernetes.io/dockerconfigjson") | "\(.metadata.namespace)/\(.metadata.name)"' | \
+  grep -v "openshift\|kube\|builder" | head -5
