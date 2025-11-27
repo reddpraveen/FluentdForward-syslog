@@ -1,0 +1,191 @@
+#!/bin/bash
+# analyze-cluster-secrets.sh - Comprehensive Secret Analysis for Pruner Development
+# Run this script to understand your cluster's secret landscape before building a pruner
+
+set -euo pipefail
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+log "🔍 Starting Secret Analysis..."
+log "This script will gather context about secrets in your cluster."
+log "It requires 'oc' CLI configured with cluster-admin or equivalent privileges."
+log ""
+
+# Check if oc is available and authenticated
+if ! command -v oc &> /dev/null; then
+  echo "ERROR: 'oc' CLI not found. Please install OpenShift CLI." >&2
+  exit 1
+fi
+
+if ! oc whoami &> /dev/null; then
+  echo "ERROR: Not authenticated to OpenShift cluster. Please run 'oc login' first." >&2
+  exit 1
+fi
+
+# Create output directory
+OUTPUT_DIR="secret-analysis-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$OUTPUT_DIR"
+log "Output will be saved to: $OUTPUT_DIR"
+
+# Get cluster info
+log "Gathering cluster information..."
+oc version --short > "$OUTPUT_DIR/cluster-version.txt" 2>&1 || echo "Unable to get cluster version" > "$OUTPUT_DIR/cluster-version.txt"
+
+# 1. Secret Type Distribution
+log "1. Analyzing secret types across all namespaces..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[].type // "Opaque"' 2>/dev/null | \
+  sort | uniq -c | sort -nr > "$OUTPUT_DIR/secret-types.txt" || echo "No secrets found or jq not available" > "$OUTPUT_DIR/secret-types.txt"
+
+# 2. Top Secret-Heavy Namespaces
+log "2. Finding namespaces with most secrets..."
+{
+  echo "NAMESPACE                          SECRET_COUNT"
+  oc get namespaces -o name | while read -r ns; do
+    ns_name=$(echo "$ns" | cut -d/ -f2)
+    count=$(oc get secrets -n "$ns_name" --no-headers 2>/dev/null | wc -l || echo "0")
+    printf "%-35s %s\n" "$ns_name" "$count"
+  done | sort -k2 -nr | head -20
+} > "$OUTPUT_DIR/namespace-secret-counts.txt"
+
+# 3. High-Risk Secrets (ServiceAccount Tokens)
+log "3. Identifying ServiceAccount tokens (NEVER delete)..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[] | select(.type == "kubernetes.io/service-account-token") | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null | \
+  head -20 > "$OUTPUT_DIR/sa-tokens.txt" || echo "No ServiceAccount tokens found" > "$OUTPUT_DIR/sa-tokens.txt"
+
+# 4. Docker Pull Secrets
+log "4. Identifying Docker pull secrets (NEVER delete)..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[] | select(.type == "kubernetes.io/dockerconfigjson" or .type == "kubernetes.io/dockercfg") | "\(.metadata.namespace)/\(.metadata.name)"' 2>/dev/null | \
+  head -20 > "$OUTPUT_DIR/docker-pull-secrets.txt" || echo "No Docker pull secrets found" > "$OUTPUT_DIR/docker-pull-secrets.txt"
+
+# 5. Router/Ingress Certs
+log "5. Checking for router/ingress certificates..."
+{
+  echo "Router secrets in openshift-ingress:"
+  oc get secrets -n openshift-ingress --no-headers 2>/dev/null | grep -E "(router|cert|tls)" || echo "None found"
+  echo ""
+  echo "Router secrets in openshift-ingress-operator:"
+  oc get secrets -n openshift-ingress-operator --no-headers 2>/dev/null | grep -E "(router|cert|tls)" || echo "None found"
+} > "$OUTPUT_DIR/router-secrets.txt"
+
+# 6. Opaque Secrets Older Than 30 Days
+log "6. Finding Opaque secrets older than 30 days (potential candidates)..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.type == "Opaque" or .type == null) |
+    select(.metadata.namespace | test("^(openshift|kube|default)$") | not) |
+    (.metadata.creationTimestamp | fromdateiso8601) as $created |
+    (now - $created) / 86400 as $age_days |
+    select($age_days > 30) |
+    "\(.metadata.namespace)/\(.metadata.name) (age: \($age_days | floor) days)"
+  ' 2>/dev/null | head -20 > "$OUTPUT_DIR/old-opaque-secrets.txt" || echo "No old Opaque secrets found" > "$OUTPUT_DIR/old-opaque-secrets.txt"
+
+# 7. ServiceAccount imagePullSecrets
+log "7. Analyzing ServiceAccount imagePullSecrets (CRITICAL references)..."
+oc get sa --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    .metadata.namespace as $ns |
+    (.imagePullSecrets // [])[]?.name | 
+    "\($ns)/\(.)
+  ' 2>/dev/null | sort | uniq | head -30 > "$OUTPUT_DIR/sa-imagepull-secrets.txt" || echo "No imagePullSecrets found" > "$OUTPUT_DIR/sa-imagepull-secrets.txt"
+
+# 8. Secrets Used by Routes (TLS Certs)
+log "8. Finding secrets referenced by Routes..."
+oc get routes --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.spec.tls?.secretName) |
+    "\(.metadata.namespace)/\(.spec.tls.secretName)"
+  ' 2>/dev/null | sort | uniq > "$OUTPUT_DIR/route-tls-secrets.txt" || echo "No Route TLS secrets found" > "$OUTPUT_DIR/route-tls-secrets.txt"
+
+# 9. Secret Age Distribution
+log "9. Analyzing secret age distribution..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.type == "Opaque" or .type == null) |
+    (.metadata.creationTimestamp | fromdateiso8601) as $created |
+    (now - $created) / 86400 as $age_days |
+    if $age_days < 7 then "0-7 days"
+    elif $age_days < 30 then "7-30 days"
+    elif $age_days < 90 then "30-90 days"
+    elif $age_days < 365 then "90-365 days"
+    else ">1 year" end
+  ' 2>/dev/null | sort | uniq -c | sort -nr > "$OUTPUT_DIR/secret-age-distribution.txt" || echo "Unable to calculate age distribution" > "$OUTPUT_DIR/secret-age-distribution.txt"
+
+# 10. Sample of Opaque Secrets with Labels
+log "10. Sampling Opaque secrets with labels (for protection patterns)..."
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.type == "Opaque" or .type == null) |
+    select((.metadata.labels | length) > 0) |
+    "\(.metadata.namespace)/\(.metadata.name): \(.metadata.labels | to_entries | map("\(.key)=\(.value)") | join(", "))"
+  ' 2>/dev/null | head -15 > "$OUTPUT_DIR/opaque-secrets-with-labels.txt" || echo "No labeled Opaque secrets found" > "$OUTPUT_DIR/opaque-secrets-with-labels.txt"
+
+# Summary
+log ""
+log "✅ Analysis complete! Results saved to: $OUTPUT_DIR"
+log ""
+log "Key files to review:"
+log "  - secret-types.txt                # Secret type distribution"
+log "  - sa-tokens.txt                   # ServiceAccount tokens (NEVER delete)"
+log "  - docker-pull-secrets.txt         # Docker pull secrets (NEVER delete)"
+log "  - old-opaque-secrets.txt          # Potential pruning candidates"
+log "  - sa-imagepull-secrets.txt        # Critical references to protect"
+log "  - route-tls-secrets.txt           # TLS certificates to protect"
+log "  - opaque-secrets-with-labels.txt  # Labels for protection patterns"
+log ""
+log "Next steps:"
+log "1. Review these files to understand your secret landscape"
+log "2. Identify additional protection patterns for your environment"
+log "3. Use this data to configure your secret pruner safely"
+log "4. Always start with DRY_RUN=true and validate with real data"
+
+# Create a summary file
+cat > "$OUTPUT_DIR/README.md" << EOF
+# Secret Analysis Summary
+
+Generated on: $(date)
+Cluster: $(oc whoami --show-server 2>/dev/null || echo "unknown")
+
+## Key Findings
+
+- **Total Secret Types**: $(wc -l < "$OUTPUT_DIR/secret-types.txt" || echo "0")
+- **High-Risk Namespaces**: See namespace-secret-counts.txt
+- **Critical Secrets Identified**: 
+  - ServiceAccount tokens: $(wc -l < "$OUTPUT_DIR/sa-tokens.txt" || echo "0")
+  - Docker pull secrets: $(wc -l < "$OUTPUT_DIR/docker-pull-secrets.txt" || echo "0")
+  - Route TLS secrets: $(wc -l < "$OUTPUT_DIR/route-tls-secrets.txt" || echo "0")
+- **Potential Pruning Candidates**: $(wc -l < "$OUTPUT_DIR/old-opaque-secrets.txt" || echo "0")
+
+## Recommendations
+
+1. **NEVER prune** secrets of types:
+   - kubernetes.io/service-account-token
+   - kubernetes.io/dockerconfigjson
+   - kubernetes.io/dockercfg
+
+2. **ALWAYS protect** secrets referenced by:
+   - ServiceAccount imagePullSecrets
+   - Routes (TLS certificates)
+   - Workloads (volumes, envFrom, env)
+
+3. **Use protection labels** like:
+   - prune.protected=true
+   - app.kubernetes.io/managed-by=argocd
+   - app.kubernetes.io/managed-by=Helm
+
+4. **Start with conservative settings**:
+   - minAgeDays: 14-30
+   - DRY_RUN: true initially
+   - Exclude all openshift-* and kube-* namespaces
+EOF
+
+log "Summary saved to: $OUTPUT_DIR/README.md"
