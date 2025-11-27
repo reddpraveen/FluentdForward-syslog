@@ -1,3 +1,57 @@
+#!/bin/bash
+
+# Analyze v2.2 Failure - Multiple Pods Failing
+# Issue: Multiple pods created and all failing
+
+NS="configmap-secret-pruner"
+
+echo "=========================================="
+echo "Analyzing v2.2 Multiple Pod Failures"
+echo "=========================================="
+
+# Get all pods for the job
+echo "--- All Pods in Namespace ---"
+oc get pods -n "$NS" --sort-by=.metadata.creationTimestamp
+echo ""
+
+# Get the latest failed pod
+LATEST_POD=$(oc get pods -n "$NS" --sort-by=.metadata.creationTimestamp --no-headers | tail -1 | awk '{print $1}')
+
+echo "Latest Pod: $LATEST_POD"
+echo ""
+
+# Get the FULL logs from latest pod
+echo "--- FULL LOGS FROM LATEST POD ---"
+oc logs -n "$NS" "$LATEST_POD" 2>&1
+echo ""
+
+# Check if it's a bash syntax error
+echo "--- Checking for Syntax Errors ---"
+oc logs -n "$NS" "$LATEST_POD" 2>&1 | grep -i "syntax error\|line.*unexpected\|command not found"
+echo ""
+
+# Get exit code
+echo "--- Exit Code ---"
+oc get pod "$LATEST_POD" -n "$NS" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}'
+echo ""
+echo ""
+
+# Check the job configuration
+echo "--- Job Details ---"
+JOB=$(oc get jobs -n "$NS" --no-headers | tail -1 | awk '{print $1}')
+echo "Job: $JOB"
+oc get job "$JOB" -n "$NS" -o yaml | grep -A5 "backoffLimit\|restartPolicy"
+echo ""
+
+# Check if there's a specific line number in error
+echo "--- Looking for Error Line Number ---"
+oc logs -n "$NS" "$LATEST_POD" 2>&1 | grep -E "line [0-9]+:"
+echo ""
+
+echo "=========================================="
+
+
+
 apiVersion: batch/v1
 kind: CronJob
 metadata:
