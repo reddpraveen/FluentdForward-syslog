@@ -1,3 +1,156 @@
+#!/bin/bash
+# Super focused test: Why is app-config-rhdh not extracted?
+
+NS="aap"
+CM_NAME="app-config-rhdh"
+
+echo "========================================"
+echo "FOCUSED TEST: app-config-rhdh extraction"
+echo "========================================"
+echo ""
+
+echo "Step 1: Get Deployment backstage-developer-hub"
+echo "------------------------------------------------"
+deploy_json=$(oc get deployment backstage-developer-hub -n "$NS" -o json 2>/dev/null)
+
+if [[ -z "$deploy_json" ]]; then
+  echo "❌ ERROR: Deployment not found"
+  exit 1
+fi
+
+echo "✅ Deployment found"
+echo ""
+
+echo "Step 2: Check .kind field"
+echo "-------------------------"
+kind=$(echo "$deploy_json" | jq -r '.kind')
+echo "Kind: $kind"
+echo ""
+
+echo "Step 3: Extract ConfigMaps using DEPLOYMENT jq path"
+echo "----------------------------------------------------"
+echo "Using path: .spec.template.spec.volumes[]?.configMap?.name"
+echo ""
+
+cms_from_deploy=$(echo "$deploy_json" | jq -r '.spec.template.spec.volumes[]?.configMap?.name // empty' 2>/dev/null)
+echo "Result:"
+echo "$cms_from_deploy"
+echo ""
+
+if echo "$cms_from_deploy" | grep -qx "$CM_NAME"; then
+  echo "✅ FOUND: $CM_NAME in deployment extraction"
+else
+  echo "❌ NOT FOUND: $CM_NAME in deployment extraction"
+fi
+echo ""
+
+echo "Step 4: Wrap in items array (like script does)"
+echo "-----------------------------------------------"
+wrapped=$(echo "$deploy_json" | jq '{items: [.]}' 2>/dev/null)
+echo "✅ Wrapped"
+echo ""
+
+echo "Step 5: Extract using SCRIPT'S exact jq query"
+echo "----------------------------------------------"
+refs_script=$(echo "$wrapped" | jq -r '
+  [
+    .items[]? | 
+    (
+      (select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "ReplicaSet" or .kind == "ReplicationController") |
+        .spec.template.spec | (
+          (.volumes[]?.configMap?.name // empty),
+          (.volumes[]?.projected?.sources[]?.configMap?.name // empty),
+          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+        )
+      )
+    )
+  ] | unique | .[]
+' 2>/dev/null)
+
+echo "Result from script query:"
+echo "$refs_script"
+echo ""
+
+if echo "$refs_script" | grep -qx "$CM_NAME"; then
+  echo "✅ FOUND: $CM_NAME using script's jq query"
+else
+  echo "❌ NOT FOUND: $CM_NAME using script's jq query"
+  echo ""
+  echo "DEBUGGING: Let's see what the select() returns..."
+  
+  echo "$wrapped" | jq '
+    .items[]? | 
+    select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "ReplicaSet" or .kind == "ReplicationController") |
+    {
+      kind: .kind,
+      name: .metadata.name,
+      hasSpec: (has("spec")),
+      hasTemplate: (.spec | has("template")),
+      hasTemplateSpec: (.spec.template | has("spec")),
+      volumeCount: (.spec.template.spec.volumes | length)
+    }
+  ' 2>/dev/null
+fi
+echo ""
+
+echo "Step 6: Test with ALL workloads merged"
+echo "---------------------------------------"
+echo "Getting all workload types..."
+
+deploy_all=$(oc get deployments -n "$NS" -o json 2>/dev/null)
+sts_all=$(oc get statefulsets -n "$NS" -o json 2>/dev/null)
+pods_all=$(oc get pods -n "$NS" -o json 2>/dev/null)
+
+echo "Merging..."
+all_merged=$(jq -s '{items: ([.[] | .items // []] | add)}' \
+  <(echo "$deploy_all") \
+  <(echo "$sts_all") \
+  <(echo "$pods_all") 2>/dev/null)
+
+merged_count=$(echo "$all_merged" | jq '.items | length' 2>/dev/null)
+echo "Merged total: $merged_count items"
+echo ""
+
+refs_all=$(echo "$all_merged" | jq -r '
+  [
+    .items[]? | 
+    (
+      (select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "ReplicaSet" or .kind == "ReplicationController") |
+        .spec.template.spec | (
+          (.volumes[]?.configMap?.name // empty),
+          (.volumes[]?.projected?.sources[]?.configMap?.name // empty)
+        )
+      ),
+      (select(.kind == "Pod") |
+        .spec | (
+          (.volumes[]?.configMap?.name // empty),
+          (.volumes[]?.projected?.sources[]?.configMap?.name // empty)
+        )
+      )
+    )
+  ] | unique | .[]
+' 2>/dev/null)
+
+echo "ConfigMaps extracted from ALL workloads:"
+echo "$refs_all"
+echo ""
+
+if echo "$refs_all" | grep -qx "$CM_NAME"; then
+  echo "✅ FOUND: $CM_NAME in full merge"
+else
+  echo "❌ NOT FOUND: $CM_NAME in full merge"
+fi
+
+echo ""
+echo "========================================"
+echo "Test Complete"
+echo "========================================"
+
+
+--------------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
