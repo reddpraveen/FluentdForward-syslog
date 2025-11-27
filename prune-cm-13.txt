@@ -1,4 +1,103 @@
 #!/bin/bash
+# Debug script to trace ConfigMap reference extraction
+
+NAMESPACE="aap"
+CM_NAME="app-config-rhdh"
+
+echo "========================================"
+echo "DEBUG: ConfigMap Reference Extraction"
+echo "========================================"
+echo ""
+
+echo "Step 1: Get Deployment JSON"
+echo "----------------------------"
+deploy_json=$(oc get deployment backstage-developer-hub -n "$NAMESPACE" -o json 2>/dev/null)
+
+if [[ -z "$deploy_json" ]]; then
+  echo "ERROR: Could not fetch deployment"
+  exit 1
+fi
+
+echo "✅ Deployment JSON fetched ($(echo "$deploy_json" | wc -c) bytes)"
+echo ""
+
+echo "Step 2: Extract ConfigMap references (Method 1 - Direct)"
+echo "---------------------------------------------------------"
+refs_direct=$(echo "$deploy_json" | jq -r '.spec.template.spec.volumes[]?.configMap?.name // empty' 2>/dev/null)
+echo "Result: '$refs_direct'"
+echo ""
+
+echo "Step 3: Wrap in items array (as script does)"
+echo "----------------------------------------------"
+wrapped_json=$(echo "$deploy_json" | jq '{items: [.]}' 2>/dev/null)
+echo "✅ Wrapped JSON created"
+echo ""
+
+echo "Step 4: Extract from wrapped (Method 2 - Script style)"
+echo "-------------------------------------------------------"
+refs_wrapped=$(echo "$wrapped_json" | jq -r '
+  [
+    .items[]? | 
+    (
+      (select(.kind == "Deployment") |
+        .spec.template.spec | (
+          (.volumes[]?.configMap?.name // empty)
+        )
+      )
+    )
+  ] | unique | .[]
+' 2>/dev/null)
+echo "Result: '$refs_wrapped'"
+echo ""
+
+echo "Step 5: Check if app-config-rhdh is in the list"
+echo "------------------------------------------------"
+if echo "$refs_wrapped" | grep -qx "$CM_NAME"; then
+  echo "✅ FOUND: $CM_NAME is in the extracted references"
+else
+  echo "❌ NOT FOUND: $CM_NAME is missing from extracted references"
+fi
+echo ""
+
+echo "Step 6: All extracted ConfigMap names:"
+echo "---------------------------------------"
+echo "$refs_wrapped"
+echo ""
+
+echo "Step 7: Check with Projected Volumes too"
+echo "-----------------------------------------"
+refs_with_projected=$(echo "$wrapped_json" | jq -r '
+  [
+    .items[]? | 
+    (
+      (select(.kind == "Deployment") |
+        .spec.template.spec | (
+          (.volumes[]?.configMap?.name // empty),
+          (.volumes[]?.projected?.sources[]?.configMap?.name // empty)
+        )
+      )
+    )
+  ] | unique | .[]
+' 2>/dev/null)
+echo "Result: '$refs_with_projected'"
+echo ""
+
+if echo "$refs_with_projected" | grep -qx "$CM_NAME"; then
+  echo "✅ FOUND with projected volume check"
+else
+  echo "❌ STILL NOT FOUND with projected volume check"
+fi
+
+echo ""
+echo "========================================"
+echo "Debug Complete"
+echo "========================================"
+
+
+
+
+-------------------------
+#!/bin/bash
 # Diagnostic script to check ConfigMap references
 
 NAMESPACE="aap"
