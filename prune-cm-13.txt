@@ -1,3 +1,17 @@
+oc -n aap get deploy backstage-developer-hub -o jsonpath='{.spec.template.spec.volumes[*].configMap.name}'
+
+oc -n aap get deploy backstage-developer-hub -o json | jq -r '
+  .spec.template.spec |
+  [
+    (.volumes[]?.configMap?.name // empty),
+    (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+    (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+    (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+    (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+  ] | .[] | select(length > 0)
+'
+
+========
 apiVersion: batch/v1
 kind: CronJob
 metadata:
