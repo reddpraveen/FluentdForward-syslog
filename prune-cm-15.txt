@@ -1,3 +1,66 @@
+#!/bin/bash
+
+# Extract Error from Failed Pod
+# The pod shows "Error" status - need to get the actual failure reason
+
+NS="configmap-secret-pruner"
+
+echo "=========================================="
+echo "Extracting Error from Failed Pod"
+echo "=========================================="
+
+# Get the failed pod
+POD=$(oc get pods -n "$NS" --no-headers | grep "Error" | head -1 | awk '{print $1}')
+
+if [[ -z "$POD" ]]; then
+  echo "No Error pod found. Checking for other states..."
+  oc get pods -n "$NS"
+  exit 1
+fi
+
+echo "Failed Pod: $POD"
+echo ""
+
+# Get the exit code
+echo "--- Exit Code ---"
+EXIT_CODE=$(oc get pod "$POD" -n "$NS" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}' 2>/dev/null)
+echo "Exit Code: $EXIT_CODE"
+echo ""
+
+# Get the reason
+echo "--- Termination Reason ---"
+REASON=$(oc get pod "$POD" -n "$NS" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
+echo "Reason: $REASON"
+echo ""
+
+# Get the full logs (this will show the actual error)
+echo "--- Full Pod Logs ---"
+oc logs -n "$NS" "$POD" 2>&1
+echo ""
+
+# Get last 20 lines specifically
+echo "--- Last 20 Lines ---"
+oc logs -n "$NS" "$POD" --tail=20 2>&1
+echo ""
+
+# Check for common bash errors
+echo "--- Checking for Common Errors ---"
+oc logs -n "$NS" "$POD" 2>&1 | grep -i "line.*command not found\|syntax error\|unexpected\|No such file\|permission denied" | head -10
+echo ""
+
+# Describe pod for events
+echo "--- Pod Events ---"
+oc describe pod "$POD" -n "$NS" | grep -A20 "Events:"
+echo ""
+
+echo "=========================================="
+echo "Error Analysis Complete"
+echo "=========================================="
+
+
+
+
+
 apiVersion: batch/v1
 kind: CronJob
 metadata:
