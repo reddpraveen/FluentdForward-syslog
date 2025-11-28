@@ -1,0 +1,49 @@
+#!/bin/bash
+# run-feature.sh - Generic Behave runner with optional Redis support
+
+set -e
+
+if [ $# -eq 0 ]; then
+  echo "Usage: $0 <feature_file> [behave_args...]"
+  exit 1
+fi
+
+FEATURE_FILE="$1"
+shift
+
+# Extract just the filename (e.g., "redis.feature" from "./features/redis.feature")
+FEATURE_NAME=$(basename "$FEATURE_FILE")
+
+# Only require Redis credentials for redis.feature
+if [[ "$FEATURE_NAME" == "redis.feature" ]]; then
+  if [ -z "$REDIS_USER" ] || [ -z "$REDIS_PASSWORD" ]; then
+    echo "Error: redis.feature requires REDIS_USER and REDIS_PASSWORD environment variables"
+    echo "Example: REDIS_USER=myuser REDIS_PASSWORD=mypass $0 $FEATURE_FILE"
+    exit 1
+  fi
+  echo "✅ Redis credentials provided for $FEATURE_NAME"
+else
+  # Optional: Clear Redis vars to prevent accidental use in other features
+  unset REDIS_USER REDIS_PASSWORD 2>/dev/null || true
+fi
+
+# Run behave with the feature file and any extra args
+behave "$FEATURE_FILE" "$@"
+
+
+import os
+from behave import given, when, then
+
+@given('Redis credentials are configured')
+def step_impl(context):
+    # Only check if we're actually running redis.feature
+    if "redis.feature" in context.feature.filename:
+        context.redis_user = os.getenv('REDIS_USER')
+        context.redis_password = os.getenv('REDIS_PASSWORD')
+        
+        assert context.redis_user, "REDIS_USER not set"
+        assert context.redis_password, "REDIS_PASSWORD not set"
+    else:
+        # Set dummy values or skip
+        context.redis_user = None
+        context.redis_password = None
