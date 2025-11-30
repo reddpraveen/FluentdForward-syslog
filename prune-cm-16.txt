@@ -1,3 +1,33 @@
+echo "=== Namespace Check ==="
+oc get ns test-tower-project-131
+
+echo -e "\n=== ConfigMap Count ==="
+oc get cm -n test-tower-project-131 --no-headers | wc -l
+
+echo -e "\n=== Permissions Check ==="
+oc auth can-i list configmaps -n test-tower-project-131 \
+  --as=system:serviceaccount:configmap-secret-pruner:cm-secret-pruner
+
+echo -e "\n=== First Page Fetch Test ==="
+time oc get cm -n test-tower-project-131 --limit=500 -o json > /tmp/test-page.json 2>&1
+echo "Exit code: $?"
+echo "File size: $(ls -lh /tmp/test-page.json 2>/dev/null | awk '{print $5}')"
+
+echo -e "\n=== JSON Validation ==="
+if [ -f /tmp/test-page.json ]; then
+  jq '.items | length' /tmp/test-page.json 2>&1
+  jq -r '.metadata.continue // "NO_CONTINUE_TOKEN"' /tmp/test-page.json 2>&1
+else
+  echo "File not created - fetch failed"
+fi
+
+echo -e "\n=== Check for Errors in Response ==="
+if [ -f /tmp/test-page.json ]; then
+  jq -r '.message // .error // empty' /tmp/test-page.json 2>&1
+fi
+
+
+------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
