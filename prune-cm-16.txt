@@ -1,3 +1,52 @@
+# Check if Opaque secrets in test-project-tower-131 are referenced
+oc get secrets -n test-project-tower-131 -o json | \
+  jq -r '.items[] | select(.type == "Opaque") | .metadata.name' | \
+  while read secret; do
+    refs=$(oc get deploy,sts,ds,pod -n test-project-tower-131 -o json | \
+      jq -r --arg secret "$secret" '
+        .items[] | 
+        (
+          select(.spec.template.spec.volumes[]?.secret?.secretName == $secret),
+          select(.spec.volumes[]?.secret?.secretName == $secret),
+          select(.spec.template.spec.containers[]?.envFrom[]?.secretRef?.name == $secret),
+          select(.spec.template.spec.containers[]?.env[]?.valueFrom?.secretKeyRef?.name == $secret)
+        ) | "\(.kind)/\(.metadata.name)"
+      ' 2>/dev/null)
+    if [[ -z "$refs" ]]; then
+      echo "UNREFERENCED: $secret"
+    else
+      echo "REFERENCED: $secret (by: $(echo "$refs" | head -1))"
+    fi
+  done | head -10
+------
+# Age histogram for Opaque secrets in user namespaces
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] |
+    select(.metadata.namespace | test("^(openshift\\|kube\\|default)$") | not) |
+    select(.type == "Opaque" or .type == null) |
+    select(.metadata.creationTimestamp and (.metadata.creationTimestamp | type == "string")) |
+    (.metadata.creationTimestamp | fromdateiso8601?) as $created |
+    select($created and ($created | type == "number")) |
+    (now - $created) / 86400 as $age_days |
+    if $age_days < 7 then "0-7 days"
+    elif $age_days < 14 then "7-14 days"
+    elif $age_days < 30 then "14-30 days"
+    else ">30 days" end
+  ' 2>/dev/null | sort | uniq -c | sort -nr
+
+--------
+# Show ALL Opaque secrets in user namespaces (no age filter)
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] |
+    select(.metadata.namespace | test("^(openshift\\|kube\\|default)$") | not) |
+    select(.type == "Opaque" or .type == null) |
+    "\(.metadata.namespace)/\(.metadata.name)"
+  ' | head -20
+
+
+-------
 # Find old Opaque secrets in USER namespaces (not openshift/kube)
 oc get secrets --all-namespaces -o json | \
   jq -r '
