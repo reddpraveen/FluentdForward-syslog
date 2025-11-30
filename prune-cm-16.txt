@@ -1,3 +1,25 @@
+# Find unreferenced Opaque secrets in test-project-tower-131
+oc get secrets -n test-project-tower-131 -o json | \
+  jq -r '.items[] | select(.type == "Opaque") | .metadata.name' | \
+  while read secret; do
+    # Check workload references
+    refs=$(oc get deploy,sts,ds,rc,dc,job,cronjob,pod -n test-project-tower-131 -o json | \
+      jq -r --arg secret "$secret" '
+        .items[] | 
+        (
+          select(.spec.template.spec.volumes[]?.secret?.secretName == $secret) // 
+          select(.spec.volumes[]?.secret?.secretName == $secret) // 
+          select(.spec.template.spec.containers[]?.envFrom[]?.secretRef?.name == $secret) // 
+          select(.spec.template.spec.containers[]?.env[]?.valueFrom?.secretKeyRef?.name == $secret)
+        ) | "1"
+      ' 2>/dev/null | head -1)
+    
+    if [[ -z "$refs" ]]; then
+      echo "UNREFERENCED: $secret"
+    fi
+  done
+
+------
 # Check if Opaque secrets in test-project-tower-131 are referenced
 oc get secrets -n test-project-tower-131 -o json | \
   jq -r '.items[] | select(.type == "Opaque") | .metadata.name' | \
