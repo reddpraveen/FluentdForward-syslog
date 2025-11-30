@@ -1,3 +1,16 @@
+# Fixed command:
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] |
+    select(.metadata.namespace | startswith("openshift-")) |
+    select(.type == "Opaque") |
+    select(.metadata.creationTimestamp) |  # ← ADD THIS
+    (.metadata.creationTimestamp | fromdateiso8601) as $created |
+    (now - $created) / 86400 as $age_days |
+    select($age_days > 90) |
+    "\(.metadata.namespace)/\(.metadata.name) (\($age_days | floor) days old)"
+  ' | head -10
+--------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
