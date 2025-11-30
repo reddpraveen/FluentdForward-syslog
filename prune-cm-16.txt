@@ -1,3 +1,742 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: cm-secret-pruner
+    app.kubernetes.io/component: cleanup
+spec:
+  schedule: "0 2 * * 0"
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 28800
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: cm-secret-pruner
+          restartPolicy: Never
+          tolerations:
+          - key: "node-role.kubernetes.io/infra"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "10m"
+              limits:
+                memory: "256Mi"
+                cpu: "100m"
+            env:
+            - name: DELAY_BETWEEN_NAMESPACES
+              value: "0.1"
+            - name: DELAY_BETWEEN_DELETIONS
+              value: "0.05"
+            - name: BATCH_SIZE
+              value: "10"
+            - name: BATCH_PAUSE
+              value: "0.5"
+            command:
+            - /bin/bash
+            - -c
+            - |
+                set -uo pipefail
+                
+                DELAY_NS="${DELAY_BETWEEN_NAMESPACES:-0.5}"
+                DELAY_DEL="${DELAY_BETWEEN_DELETIONS:-0.1}"
+                BATCH_SIZE="${BATCH_SIZE:-10}"
+                BATCH_PAUSE="${BATCH_PAUSE:-1}"
+                
+                total_deleted=0
+                total_skipped=0
+                total_protected=0
+                total_too_new=0
+                total_referenced=0
+                total_system_cm=0
+                total_errors=0
+                namespaces_processed=0
+                namespaces_excluded=0
+                namespaces_high_volume=0
+                namespaces_paginated=0
+                namespaces_skipped_by_mode=0
+                
+                ns_deleted=0
+                ns_skipped=0
+                
+                declare -a high_volume_ns_list
+                declare -a error_list
+                
+                log() {
+                  printf '%s [%s] %s\n' "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$1" "${*:2}" >&2
+                }
+                
+                error_exit() {
+                  log ERROR "$1"
+                  exit 1
+                }
+                
+                log INFO "ConfigMap Pruner - Starting"
+                log INFO "Rate Limiting: ns_delay=${DELAY_NS}s del_delay=${DELAY_DEL}s batch=${BATCH_SIZE} pause=${BATCH_PAUSE}s"
+                
+                NS="configmap-secret-pruner"
+                CM="cm-secret-pruner-config"
+                
+                if ! oc whoami &>/dev/null; then
+                  error_exit "Unable to authenticate"
+                fi
+                
+                if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+                  error_exit "ConfigMap $CM not found in namespace $NS"
+                fi
+                
+                DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "true")
+                [[ -z "$DRY_RUN" ]] && DRY_RUN="true"
+                
+                MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "7")
+                [[ -z "$MIN_AGE_DAYS" ]] && MIN_AGE_DAYS="7"
+                
+                HIGH_VOLUME_THRESHOLD=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.highVolumeThreshold}' 2>/dev/null || echo "1000")
+                [[ -z "$HIGH_VOLUME_THRESHOLD" ]] && HIGH_VOLUME_THRESHOLD="1000"
+                
+                PROCESS_HIGH_VOLUME=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.processHighVolumeNamespaces}' 2>/dev/null || echo "false")
+                [[ -z "$PROCESS_HIGH_VOLUME" ]] && PROCESS_HIGH_VOLUME="false"
+                
+                PAGINATION_LIMIT=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.paginationLimit}' 2>/dev/null || echo "500")
+                [[ -z "$PAGINATION_LIMIT" ]] && PAGINATION_LIMIT="500"
+                
+                PROCESS_ONLY_HIGH_VOLUME=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.processOnlyHighVolume}' 2>/dev/null || echo "false")
+                [[ -z "$PROCESS_ONLY_HIGH_VOLUME" ]] && PROCESS_ONLY_HIGH_VOLUME="false"
+                
+                EXCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedNamespaces}' 2>/dev/null || echo "")
+                if [[ -z "$EXCLUDED_NS" ]]; then
+                  EXCLUDED_NS=$(printf '%s\n' '^openshift-.*' '^kube-.*' '^default$' '^openshift$' '^configmap-secret-pruner$')
+                fi
+                
+                PROTECTED_LABELS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+                if [[ -z "$PROTECTED_LABELS" ]]; then
+                  PROTECTED_LABELS=$(printf '%s\n' 'app.kubernetes.io/managed-by=argocd' 'app.kubernetes.io/managed-by=Helm' 'meta.helm.sh/release-name' 'prune.protected=true')
+                fi
+                
+                EXCLUDED_CM_NAMES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedConfigMapNames}' 2>/dev/null || echo "")
+                if [[ -z "$EXCLUDED_CM_NAMES" ]]; then
+                  EXCLUDED_CM_NAMES=$(printf '%s\n' \
+                    'openshift-service-ca.crt' \
+                    'kube-root-ca.crt' \
+                    'istio-ca-root-cert' \
+                    'openshift-ca.crt')
+                fi
+                
+                EXCLUDED_NS=$(echo "$EXCLUDED_NS" | sed '/^[[:space:]]*$/d')
+                PROTECTED_LABELS=$(echo "$PROTECTED_LABELS" | sed '/^[[:space:]]*$/d')
+                EXCLUDED_CM_NAMES=$(echo "$EXCLUDED_CM_NAMES" | sed '/^[[:space:]]*$/d')
+                
+                log INFO "Config: DRY_RUN=$DRY_RUN MIN_AGE=$MIN_AGE_DAYS days THRESHOLD=$HIGH_VOLUME_THRESHOLD"
+                log INFO "Config: PROCESS_HIGH_VOLUME=$PROCESS_HIGH_VOLUME PROCESS_ONLY_HIGH_VOLUME=$PROCESS_ONLY_HIGH_VOLUME"
+                
+                if [[ "$PROCESS_HIGH_VOLUME" == "true" ]]; then
+                  log INFO "Config: PAGINATION_LIMIT=$PAGINATION_LIMIT per page"
+                fi
+                
+                log INFO "Detecting available API resources..."
+                
+                HAS_DEPLOYMENTS=0
+                HAS_STATEFULSETS=0
+                HAS_DAEMONSETS=0
+                HAS_REPLICASETS=0
+                HAS_REPLICATIONCONTROLLERS=0
+                HAS_DEPLOYMENTCONFIGS=0
+                HAS_CRONJOBS=0
+                HAS_JOBS=0
+                
+                while IFS= read -r line; do
+                  [[ -z "$line" ]] && continue
+                  resource=$(echo "$line" | awk '{print $1}')
+                  case "$resource" in
+                    deployments) HAS_DEPLOYMENTS=1 ;;
+                    statefulsets) HAS_STATEFULSETS=1 ;;
+                    daemonsets) HAS_DAEMONSETS=1 ;;
+                    replicasets) HAS_REPLICASETS=1 ;;
+                    replicationcontrollers) HAS_REPLICATIONCONTROLLERS=1 ;;
+                    deploymentconfigs) HAS_DEPLOYMENTCONFIGS=1 ;;
+                    cronjobs) HAS_CRONJOBS=1 ;;
+                    jobs) HAS_JOBS=1 ;;
+                  esac
+                done < <(oc api-resources --no-headers 2>/dev/null)
+                
+                log INFO "Available workload types: deploy=$HAS_DEPLOYMENTS sts=$HAS_STATEFULSETS ds=$HAS_DAEMONSETS rs=$HAS_REPLICASETS rc=$HAS_REPLICATIONCONTROLLERS dc=$HAS_DEPLOYMENTCONFIGS cronjob=$HAS_CRONJOBS job=$HAS_JOBS"
+                
+                fetch_workload_safe() {
+                  local full_name="$1"
+                  local ns="$2"
+                  local temp_file
+                  temp_file=$(mktemp)
+                  
+                  if ! oc get "$full_name" -n "$ns" -o json >"$temp_file" 2>/dev/null; then
+                    echo '{"items":[]}'
+                    rm -f "$temp_file"
+                    return
+                  fi
+                  
+                  if jq -e '(. | type == "object") and (has("items") or has("apiVersion"))' "$temp_file" >/dev/null 2>&1; then
+                    cat "$temp_file"
+                  else
+                    echo '{"items":[]}'
+                  fi
+                  
+                  rm -f "$temp_file"
+                }
+                
+                get_workload_references() {
+                  local ns="$1"
+                  
+                  local f_deploy=$(mktemp)
+                  local f_sts=$(mktemp)
+                  local f_ds=$(mktemp)
+                  local f_rs=$(mktemp)
+                  local f_cronjob=$(mktemp)
+                  local f_job=$(mktemp)
+                  local f_pod=$(mktemp)
+                  local f_rc=$(mktemp)
+                  local f_dc=$(mktemp)
+                  local f_merged=$(mktemp)
+                  
+                  echo '{"items":[]}' > "$f_deploy"
+                  echo '{"items":[]}' > "$f_sts"
+                  echo '{"items":[]}' > "$f_ds"
+                  echo '{"items":[]}' > "$f_rs"
+                  echo '{"items":[]}' > "$f_cronjob"
+                  echo '{"items":[]}' > "$f_job"
+                  echo '{"items":[]}' > "$f_pod"
+                  echo '{"items":[]}' > "$f_rc"
+                  echo '{"items":[]}' > "$f_dc"
+                  
+                  [[ "$HAS_DEPLOYMENTS" == "1" ]] && fetch_workload_safe "deployments.apps" "$ns" > "$f_deploy"
+                  [[ "$HAS_STATEFULSETS" == "1" ]] && fetch_workload_safe "statefulsets.apps" "$ns" > "$f_sts"
+                  [[ "$HAS_DAEMONSETS" == "1" ]] && fetch_workload_safe "daemonsets.apps" "$ns" > "$f_ds"
+                  [[ "$HAS_REPLICASETS" == "1" ]] && fetch_workload_safe "replicasets.apps" "$ns" > "$f_rs"
+                  [[ "$HAS_CRONJOBS" == "1" ]] && fetch_workload_safe "cronjobs.batch" "$ns" > "$f_cronjob"
+                  [[ "$HAS_JOBS" == "1" ]] && fetch_workload_safe "jobs.batch" "$ns" > "$f_job"
+                  fetch_workload_safe "pods" "$ns" > "$f_pod"
+                  [[ "$HAS_REPLICATIONCONTROLLERS" == "1" ]] && fetch_workload_safe "replicationcontrollers" "$ns" > "$f_rc"
+                  [[ "$HAS_DEPLOYMENTCONFIGS" == "1" ]] && fetch_workload_safe "deploymentconfigs.apps.openshift.io" "$ns" > "$f_dc"
+                  
+                  if ! jq -s '{items: ([.[] | .items // []] | add)}' \
+                    "$f_deploy" "$f_sts" "$f_ds" "$f_rs" "$f_cronjob" "$f_job" "$f_pod" "$f_rc" "$f_dc" \
+                    > "$f_merged" 2>/dev/null; then
+                    log WARN "Failed to merge workloads in $ns"
+                    rm -f "$f_deploy" "$f_sts" "$f_ds" "$f_rs" "$f_cronjob" "$f_job" "$f_pod" "$f_rc" "$f_dc" "$f_merged"
+                    echo ""
+                    echo ""
+                    return
+                  fi
+                  
+                  # IMPROVEMENT 1: Fixed projected volume extraction with select(.configMap)
+                  refs=$(jq -r '
+                    [
+                      .items[]? | 
+                      (
+                        (select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "ReplicaSet" or .kind == "ReplicationController") |
+                          .spec.template.spec | (
+                            (.volumes[]?.configMap?.name // empty),
+                            (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                            (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                            (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                          )
+                        ),
+                        (select(.kind == "DeploymentConfig") |
+                          .spec.template.spec | (
+                            (.volumes[]?.configMap?.name // empty),
+                            (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                            (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                            (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                          )
+                        ),
+                        (select(.kind == "CronJob") |
+                          .spec.jobTemplate.spec.template.spec | (
+                            (.volumes[]?.configMap?.name // empty),
+                            (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                            (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                          )
+                        ),
+                        (select(.kind == "Job") |
+                          .spec.template.spec | (
+                            (.volumes[]?.configMap?.name // empty),
+                            (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                            (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                          )
+                        ),
+                        (select(.kind == "Pod") |
+                          .spec | (
+                            (.volumes[]?.configMap?.name // empty),
+                            (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                            (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                            (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                            (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                          )
+                        )
+                      )
+                    ] | unique | .[]
+                  ' "$f_merged" 2>/dev/null || echo "")
+                  
+                  details=$(jq -r '
+                    .items[]? | 
+                    . as $item |
+                    (
+                      (select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "DaemonSet" or .kind == "ReplicaSet" or .kind == "ReplicationController") |
+                        .spec.template.spec | 
+                        [
+                          (.volumes[]?.configMap?.name // empty),
+                          (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        ] | .[] | select(length > 0) | "\(.):\($item.kind | ascii_downcase):\($item.metadata.name)"
+                      ),
+                      (select(.kind == "DeploymentConfig") |
+                        .spec.template.spec | 
+                        [
+                          (.volumes[]?.configMap?.name // empty),
+                          (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        ] | .[] | select(length > 0) | "\(.):deploymentconfig:\($item.metadata.name)"
+                      ),
+                      (select(.kind == "CronJob") |
+                        .spec.jobTemplate.spec.template.spec | 
+                        [
+                          (.volumes[]?.configMap?.name // empty),
+                          (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        ] | .[] | select(length > 0) | "\(.):cronjob:\($item.metadata.name)"
+                      ),
+                      (select(.kind == "Job") |
+                        .spec.template.spec | 
+                        [
+                          (.volumes[]?.configMap?.name // empty),
+                          (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        ] | .[] | select(length > 0) | "\(.):job:\($item.metadata.name)"
+                      ),
+                      (select(.kind == "Pod") |
+                        .spec | 
+                        [
+                          (.volumes[]?.configMap?.name // empty),
+                          (.volumes[]?.projected?.sources[]? | select(.configMap).configMap.name // empty),
+                          (.containers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.containers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty),
+                          (.initContainers[]?.envFrom[]?.configMapRef?.name // empty),
+                          (.initContainers[]?.env[]?.valueFrom?.configMapKeyRef?.name // empty)
+                        ] | .[] | select(length > 0) | "\(.):pod:\($item.metadata.name)"
+                      )
+                    )
+                  ' "$f_merged" 2>/dev/null || echo "")
+                  
+                  rm -f "$f_deploy" "$f_sts" "$f_ds" "$f_rs" "$f_cronjob" "$f_job" "$f_pod" "$f_rc" "$f_dc" "$f_merged"
+                  
+                  echo "---REFS-START---"
+                  echo "$refs"
+                  echo "---REFS-END---"
+                  echo "$details"
+                }
+                
+                process_configmaps() {
+                  local target_ns="$1"
+                  local cm_json="$2"
+                  local referenced_cms="$3"
+                  local workload_details="$4"
+                  local deleted_count=0
+                  local skipped_count=0
+                  local batch_counter=0
+                  
+                  while IFS= read -r cm_data; do
+                    [[ -z "$cm_data" ]] && continue
+                    
+                    name=$(echo "$cm_data" | jq -r '.name' 2>/dev/null)
+                    [[ -z "$name" || "$name" == "null" ]] && continue
+                    
+                    annotations=$(echo "$cm_data" | jq -r '.annotations // {}' 2>/dev/null)
+                    
+                    inject_cabundle=$(echo "$annotations" | jq -r '."service.beta.openshift.io/inject-cabundle" // ."service.alpha.openshift.io/inject-cabundle" // empty' 2>/dev/null)
+                    if [[ "$inject_cabundle" == "true" ]]; then
+                      ((skipped_count++))
+                      ((total_system_cm++))
+                      log INFO "SKIPPED: $name (inject-cabundle)"
+                      continue
+                    fi
+                    
+                    excluded_by_name=false
+                    while IFS= read -r excluded_name; do
+                      [[ -z "$excluded_name" ]] && continue
+                      if [[ "$name" == "$excluded_name" ]]; then
+                        excluded_by_name=true
+                        ((skipped_count++))
+                        ((total_system_cm++))
+                        log INFO "SKIPPED: $name (system)"
+                        break
+                      fi
+                    done <<< "$EXCLUDED_CM_NAMES"
+                    [[ "$excluded_by_name" == "true" ]] && continue
+                    
+                    labels=$(echo "$cm_data" | jq -r '.labels // {}' 2>/dev/null)
+                    
+                    inject_trusted_ca=$(echo "$labels" | jq -r '."config.openshift.io/inject-trusted-cabundle" // empty' 2>/dev/null)
+                    if [[ "$inject_trusted_ca" == "true" ]]; then
+                      ((skipped_count++))
+                      ((total_system_cm++))
+                      log INFO "SKIPPED: $name (inject-trusted-ca)"
+                      continue
+                    fi
+                    
+                    created=$(echo "$cm_data" | jq -r '.created' 2>/dev/null)
+                    
+                    skip=false
+                    matched_label=""
+                    while IFS= read -r label_rule; do
+                      [[ -z "$label_rule" ]] && continue
+                      
+                      if [[ "$label_rule" == *"="* ]]; then
+                        key="${label_rule%=*}"
+                        expected="${label_rule#*=}"
+                        actual=$(echo "$labels" | jq -r ".\\"$key\\" // empty" 2>/dev/null)
+                        if [[ "$actual" == "$expected" ]]; then
+                          skip=true
+                          matched_label="$label_rule"
+                          ((total_protected++))
+                          break
+                        fi
+                      else
+                        if echo "$labels" | jq -e ".\\"$label_rule\\"" &>/dev/null; then
+                          skip=true
+                          matched_label="$label_rule"
+                          ((total_protected++))
+                          break
+                        fi
+                      fi
+                    done <<< "$PROTECTED_LABELS"
+                    
+                    if [[ "$skip" == "true" ]]; then
+                      ((skipped_count++))
+                      log INFO "PROTECTED: $name (label: $matched_label)"
+                      continue
+                    fi
+                    
+                    age_days="unknown"
+                    if [[ -n "$created" && "$created" != "null" ]]; then
+                      created_epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+                      if [[ "$created_epoch" -gt 0 ]]; then
+                        age_seconds=$((current_epoch - created_epoch))
+                        age_days=$((age_seconds / 86400))
+                        
+                        if [[ "$age_seconds" -lt "$min_age_seconds" ]]; then
+                          ((skipped_count++))
+                          ((total_too_new++))
+                          log INFO "TOO-NEW: $name (age: ${age_days} days)"
+                          continue
+                        fi
+                      fi
+                    fi
+                    
+                    # IMPROVEMENT 2: Use printf and grep -Fxq for safer string matching
+                    if printf '%s\n' "$referenced_cms" | grep -Fxq "$name" 2>/dev/null; then
+                      ((skipped_count++))
+                      ((total_referenced++))
+                      
+                      workload_ref=$(echo "$workload_details" | grep "^$name:" | head -1 | cut -d: -f2- || echo "unknown")
+                      log INFO "REFERENCED: $name (by: $workload_ref)"
+                      continue
+                    fi
+                    
+                    if [[ "$DRY_RUN" == "false" ]]; then
+                      sleep "$DELAY_DEL"
+                      
+                      if oc delete cm "$name" -n "$target_ns" --wait=false &>/dev/null; then
+                        ((deleted_count++))
+                        ((total_deleted++))
+                        ((batch_counter++))
+                        log INFO "DELETED: $name (age: ${age_days} days)"
+                        
+                        if [[ $((batch_counter % BATCH_SIZE)) -eq 0 ]]; then
+                          sleep "$BATCH_PAUSE"
+                        fi
+                      else
+                        ((total_errors++))
+                        error_list+=("Failed to delete ConfigMap $name in namespace $target_ns")
+                        log ERROR "DELETE-FAILED: $name"
+                      fi
+                    else
+                      ((deleted_count++))
+                      ((total_deleted++))
+                      log INFO "DRY-RUN: Would delete $name (age: ${age_days} days, unreferenced)"
+                    fi
+                    
+                  done < <(echo "$cm_json" | jq -c '.items[] | {name: .metadata.name, labels: .metadata.labels, annotations: .metadata.annotations, created: .metadata.creationTimestamp}' 2>/dev/null)
+                  
+                  ns_deleted=$deleted_count
+                  ns_skipped=$skipped_count
+                }
+                
+                process_high_volume_namespace() {
+                  local ns="$1"
+                  local total_cm_count="$2"
+                  
+                  log INFO "HIGH-VOLUME: $ns ($total_cm_count ConfigMaps) - using pagination"
+                  
+                  ((namespaces_paginated++))
+                  
+                  ref_result=$(get_workload_references "$ns")
+                  referenced_cms=$(echo "$ref_result" | sed -n '/---REFS-START---/,/---REFS-END---/p' | grep -v "^---REFS-" || echo "")
+                  workload_details=$(echo "$ref_result" | sed -n '/---REFS-END---/,$p' | tail -n +2 || echo "")
+                  
+                  local deleted_in_ns=0
+                  local skipped_in_ns=0
+                  local continue_token=""
+                  local page_num=0
+                  local total_pages=$(( (total_cm_count + PAGINATION_LIMIT - 1) / PAGINATION_LIMIT ))
+                  
+                  log INFO "PAGINATION: Processing $total_pages pages ($PAGINATION_LIMIT per page)"
+                  
+                  while true; do
+                    ((page_num++))
+                    log INFO "PAGE $page_num/$total_pages: Processing..."
+                    
+                    page_result=""
+                    local retry_count=0
+                    local max_retries=3
+                    
+                    while [[ $retry_count -lt $max_retries ]]; do
+                      if [[ -z "$continue_token" ]]; then
+                        page_result=$(oc get --raw "/api/v1/namespaces/$ns/configmaps?limit=$PAGINATION_LIMIT" 2>/dev/null)
+                      else
+                        page_result=$(oc get --raw "/api/v1/namespaces/$ns/configmaps?limit=$PAGINATION_LIMIT&continue=$continue_token" 2>/dev/null)
+                      fi
+                      
+                      if [[ -n "$page_result" ]] && echo "$page_result" | jq -e '.items' >/dev/null 2>&1; then
+                        break
+                      else
+                        ((retry_count++))
+                        if [[ $retry_count -lt $max_retries ]]; then
+                          log WARN "PAGE $page_num: Fetch failed, retrying ($retry_count/$max_retries)..."
+                          sleep 2
+                        fi
+                      fi
+                    done
+                    
+                    if [[ -z "$page_result" ]] || ! echo "$page_result" | jq -e '.items' >/dev/null 2>&1; then
+                      log ERROR "PAGE $page_num: Fetch failed after $max_retries retries"
+                      error_list+=("Failed to fetch page $page_num in namespace $ns")
+                      ((total_errors++))
+                      break
+                    fi
+                    
+                    process_configmaps "$ns" "$page_result" "$referenced_cms" "$workload_details"
+                    
+                    ((deleted_in_ns += ns_deleted))
+                    ((skipped_in_ns += ns_skipped))
+                    
+                    log INFO "PAGE $page_num: Complete (deleted=$ns_deleted skipped=$ns_skipped)"
+                    
+                    continue_token=$(echo "$page_result" | jq -r '.metadata.continue // empty' 2>/dev/null)
+                    
+                    if [[ -z "$continue_token" ]]; then
+                      log INFO "PAGINATION: Completed all pages"
+                      break
+                    fi
+                    
+                    sleep 1
+                  done
+                  
+                  log INFO "Namespace summary: deleted=$deleted_in_ns skipped=$skipped_in_ns"
+                  ((total_skipped += skipped_in_ns))
+                }
+                
+                namespace_list=$(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | sort)
+                if [[ -z "$namespace_list" ]]; then
+                  error_exit "No namespaces found"
+                fi
+                namespace_count=$(echo "$namespace_list" | wc -l)
+                log INFO "Found $namespace_count namespaces in cluster"
+                
+                current_epoch=$(date +%s)
+                min_age_seconds=$((MIN_AGE_DAYS * 86400))
+                
+                start_time=$(date +%s)
+                
+                while IFS= read -r ns; do
+                  [[ -z "$ns" ]] && continue
+                  
+                  excluded=false
+                  while IFS= read -r pattern; do
+                    [[ -z "$pattern" ]] && continue
+                    if echo "$ns" | grep -Eq "$pattern" 2>/dev/null; then
+                      excluded=true
+                      break
+                    fi
+                  done <<< "$EXCLUDED_NS"
+                  
+                  if [[ "$excluded" == "true" ]]; then
+                    ((namespaces_excluded++))
+                    continue
+                  fi
+                  
+                  ((namespaces_processed++))
+                  
+                  if [[ $((namespaces_processed % 50)) -eq 0 ]]; then
+                    elapsed=$(($(date +%s) - start_time))
+                    log INFO "Progress: $namespaces_processed namespaces, ${elapsed}s elapsed"
+                  fi
+                  
+                  log INFO "-----------------------------------------------"
+                  log INFO "Processing Namespace [$namespaces_processed/$((namespace_count - namespaces_excluded))]: $ns"
+                  log INFO "-----------------------------------------------"
+                  
+                  cm_count=0
+                  if ! cm_count=$(oc get cm -n "$ns" --no-headers 2>/dev/null | wc -l); then
+                    log ERROR "Unable to count ConfigMaps in $ns"
+                    error_list+=("Unable to count ConfigMaps in namespace: $ns")
+                    ((total_errors++))
+                    sleep "$DELAY_NS"
+                    continue
+                  fi
+                  
+                  if [[ "$cm_count" -eq 0 ]]; then
+                    log INFO "No ConfigMaps found"
+                    sleep "$DELAY_NS"
+                    continue
+                  fi
+                  
+                  log INFO "Found $cm_count ConfigMap(s)"
+                  
+                  if [[ "$PROCESS_ONLY_HIGH_VOLUME" == "true" ]]; then
+                    if [[ "$cm_count" -le "$HIGH_VOLUME_THRESHOLD" ]]; then
+                      log INFO "SKIPPED: High-volume-only mode (threshold: $HIGH_VOLUME_THRESHOLD)"
+                      ((namespaces_skipped_by_mode++))
+                      sleep 0.01
+                      continue
+                    fi
+                  fi
+                  
+                  if [[ "$cm_count" -gt "$HIGH_VOLUME_THRESHOLD" ]]; then
+                    if [[ "$PROCESS_HIGH_VOLUME" == "true" ]]; then
+                      process_high_volume_namespace "$ns" "$cm_count"
+                    else
+                      log WARN "HIGH-VOLUME: Skipped (threshold: $HIGH_VOLUME_THRESHOLD)"
+                      log WARN "Set processHighVolumeNamespaces=true to enable"
+                      high_volume_ns_list+=("$ns:$cm_count")
+                      ((namespaces_high_volume++))
+                    fi
+                    sleep "$DELAY_NS"
+                    continue
+                  fi
+                  
+                  ref_result=$(get_workload_references "$ns")
+                  referenced_cms=$(echo "$ref_result" | sed -n '/---REFS-START---/,/---REFS-END---/p' | grep -v "^---REFS-" || echo "")
+                  workload_details=$(echo "$ref_result" | sed -n '/---REFS-END---/,$p' | tail -n +2 || echo "")
+                  
+                  cm_json=""
+                  if ! cm_json=$(oc get cm -n "$ns" -o json 2>/dev/null); then
+                    log ERROR "Unable to list ConfigMaps in $ns"
+                    error_list+=("Unable to list ConfigMaps in namespace: $ns")
+                    ((total_errors++))
+                    sleep "$DELAY_NS"
+                    continue
+                  fi
+                  
+                  process_configmaps "$ns" "$cm_json" "$referenced_cms" "$workload_details"
+                  
+                  log INFO "Namespace summary: deleted=$ns_deleted skipped=$ns_skipped"
+                  ((total_skipped += ns_skipped))
+                  
+                  sleep "$DELAY_NS"
+                  
+                done <<< "$namespace_list"
+                
+                end_time=$(date +%s)
+                duration=$((end_time - start_time))
+                duration_min=$((duration / 60))
+                duration_sec=$((duration % 60))
+                
+                log INFO ""
+                log INFO "================================================"
+                log INFO "Job Completed Successfully"
+                log INFO "================================================"
+                log INFO "Duration: ${duration_min}m ${duration_sec}s"
+                log INFO ""
+                log INFO "Namespace Statistics:"
+                log INFO "  Total in cluster: $namespace_count"
+                log INFO "  Excluded by pattern: $namespaces_excluded"
+                if [[ "$PROCESS_ONLY_HIGH_VOLUME" == "true" ]]; then
+                  log INFO "  Skipped (high-volume-only mode): $namespaces_skipped_by_mode"
+                fi
+                log INFO "  High-volume (paginated): $namespaces_paginated"
+                log INFO "  High-volume (skipped): $namespaces_high_volume"
+                log INFO "  Processed normally: $((namespaces_processed - namespaces_paginated - namespaces_skipped_by_mode))"
+                log INFO ""
+                
+                if [[ "$namespaces_high_volume" -gt 0 ]]; then
+                  log WARN "High-Volume Namespaces Skipped:"
+                  for entry in "${high_volume_ns_list[@]}"; do
+                    ns_name="${entry%:*}"
+                    ns_count="${entry#*:}"
+                    log WARN "  - $ns_name: $ns_count ConfigMaps"
+                  done
+                  log WARN "Set processHighVolumeNamespaces=true to process these"
+                  log WARN ""
+                fi
+                
+                log INFO "ConfigMap Statistics:"
+                log INFO "  Deleted (or would delete): $total_deleted"
+                log INFO "  Skipped total: $total_skipped"
+                log INFO "    - System (injected): $total_system_cm"
+                log INFO "    - Protected (labels): $total_protected"
+                log INFO "    - Too new (< $MIN_AGE_DAYS days): $total_too_new"
+                log INFO "    - Referenced (workloads): $total_referenced"
+                log INFO ""
+                
+                if [[ "$total_errors" -gt 0 ]]; then
+                  log ERROR "Errors Encountered: $total_errors"
+                  for error_msg in "${error_list[@]}"; do
+                    log ERROR "  $error_msg"
+                  done
+                  log ERROR ""
+                else
+                  log INFO "Errors: 0"
+                fi
+                
+                log INFO "Mode: $(if [[ "$DRY_RUN" == "true" ]]; then echo "DRY-RUN"; else echo "LIVE"; fi)"
+                if [[ "$PROCESS_HIGH_VOLUME" == "true" ]]; then
+                  log INFO "Pagination: ENABLED (limit=$PAGINATION_LIMIT)"
+                fi
+                if [[ "$PROCESS_ONLY_HIGH_VOLUME" == "true" ]]; then
+                  log INFO "High-Volume Only: ENABLED"
+                fi
+                log INFO "================================================"
+                
+                exit 0
+
+
+
+
+---------
 # Find unreferenced Opaque secrets in test-project-tower-131
 oc get secrets -n test-project-tower-131 -o json | \
   jq -r '.items[] | select(.type == "Opaque") | .metadata.name' | \
