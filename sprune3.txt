@@ -1,3 +1,38 @@
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  inputs:
+    - name: prometheus-alerts
+      type: http
+      http:
+        port: 8786
+        path: /alerts
+        format: json
+
+  outputs:
+    # Ensure this matches your existing LokiStack output
+    - name: loki
+      type: lokistack
+      lokistack:
+        name: lokistack  # ← must match your LokiStack CR name in openshift-logging
+
+  pipelines:
+    - name: alerts-to-loki
+      inputRefs:
+        - prometheus-alerts
+      outputRefs:
+        - loki
+      # Optional: parse as JSON (implied by input format, but safe to include)
+      parse: json
+      labels:
+        # Static labels applied to all logs in this pipeline
+        job: "prometheus-alerts"
+        cluster: "your-cluster-name"  # ← Replace per cluster (e.g., via GitOps)
+
+---------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
