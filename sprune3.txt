@@ -1,4 +1,123 @@
+# 1. Create namespace
+oc new-project mimir
 
+# 2. Get ODF S3 credentials
+SECRET=$(oc get secret -n openshift-storage -l app=rook-ceph-rgw -o name | head -1 | cut -d/ -f2)
+ACCESS_KEY=$(oc get secret -n openshift-storage $SECRET -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+SECRET_KEY=$(oc get secret -n openshift-storage $SECRET -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+
+# 3. Install Mimir via Helm (replace <ODF_S3_ROUTE> below!)
+helm repo add grafana https://grafana.github.io/helm-charts
+helm upgrade --install mimir grafana/mimir \
+  --namespace mimir \
+  --set rbac.pspEnabled=false \
+  --set image.tag="3.0.0" \
+  --set storage.backend=s3 \
+  --set storage.s3.bucketNames.chunks="mimir-chunks" \
+  --set storage.s3.bucketNames.ruler="mimir-ruler" \
+  --set storage.s3.bucketNames.admin="mimir-admin" \
+  --set storage.s3.endpoint="<ODF_S3_ROUTE>" \
+  --set storage.s3.region="us-east-1" \
+  --set storage.s3.accessKeyId="$ACCESS_KEY" \
+  --set storage.s3.secretAccessKey="$SECRET_KEY" \
+  --set storage.s3.pathStyle=true \
+  --set storage.s3.signatureVersion=v4 \
+  --set limits.retention=8760h \
+  --wait
+
+# 4. Expose via Route
+cat <<EOF | oc apply -f -
+apiVersion: route.openshift.io/v1
+kind: Route
+meta
+  name: mimir-remote-write
+  namespace: mimir
+spec:
+  to: { kind: Service, name: mimir-gateway }
+  port: { targetPort: http }
+  tls: { termination: edge, insecurePolicy: Redirect }
+EOF
+
+# 5. Get Mimir URL (save this!)
+MIMIR_URL=$(oc get route mimir-remote-write -n mimir -o jsonpath='{.spec.host}')
+echo "✅ Central Mimir ready! Remote write URL: https://$MIMIR_URL/api/v1/push"
+
+
+-----
+
+# 1. Create namespace
+oc new-project observability
+
+# 2. Deploy alert-exporter
+cat <<EOF | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+meta
+  name: alert-exporter
+  namespace: observability
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alert-exporter } }
+  template:
+    meta
+      labels: { app: alert-exporter }
+    spec:
+      containers:
+      - name: exporter
+        image: quay.io/prometheuscommunity/alertmanager-webhook-exporter:latest
+        ports: [{ containerPort: 9099 }]
+        env:
+        - name: CLUSTER_NAME
+          valueFrom:
+            fieldRef: { fieldPath: metadata.labels['cluster.openshift.io/cluster-name'] }
+---
+apiVersion: v1
+kind: Service
+meta
+  name: alert-exporter
+  namespace: observability
+spec:
+  selector: { app: alert-exporter }
+  ports: [{ port: 9099, targetPort: 9099 }]
+EOF
+
+----\
+# 1. Add Alertmanager receiver
+cat <<EOF | oc apply -f -
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+meta
+  name: alert-exporter-receiver
+  namespace: openshift-user-workload-monitoring
+spec:
+  route:
+    receiver: "alert-exporter"
+    routes:
+    - matchers: [{ name: severity, value: info }]; receiver: "alert-exporter"
+    - matchers: [{ name: severity, value: warning }]; receiver: "alert-exporter"
+  receivers:
+  - name: "alert-exporter"
+    webhookConfigs:
+    - url: "http://alert-exporter.observability.svc:9099/alerts"
+      sendResolved: true
+EOF
+
+# 2. Configure Prometheus remote_write (replace <MIMIR_URL> and <SPOKE_CLUSTER_NAME>)
+oc patch configmap prometheus-user-workload -n openshift-user-workload-monitoring --type=merge -p="
+data:
+  prometheus.yaml: |
+    remoteWrite:
+    - url: https://<MIMIR_URL>/api/v1/push
+      headers:
+        X-Scope-OrgID: \"<SPOKE_CLUSTER_NAME>\"
+      remoteTimeout: 30s
+      queueConfig:
+        capacity: 10000
+"
+
+
+
+-------
 curl -X POST \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR-GRAFANA-API-KEY" \
