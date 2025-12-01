@@ -1,3 +1,23 @@
+
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR-GRAFANA-API-KEY" \
+  -d '{
+    "name": "Splunk HEC",
+    "type": "webhook",
+    "isDefault": false,
+    "sendReminder": false,
+    "settings": {
+      "url": "https://your-splunk-server:8088/services/collector/event",
+      "httpMethod": "POST",
+      "httpHeaderName1": "Authorization",
+      "httpHeaderValue1": "Splunk YOUR-HEC-TOKEN-HERE",
+      "httpHeaderName2": "Content-Type",
+      "httpHeaderValue2": "application/json"
+    }
+  }' \
+  https://your-grafana-instance/api/alert-notifications
+-----
 apiVersion: logging.openshift.io/v1
 kind: ClusterLogForwarder
 metadata:
