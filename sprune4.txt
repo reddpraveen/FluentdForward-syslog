@@ -1,0 +1,91 @@
+# alert_exporter.py
+from flask import Flask, request, jsonify
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+import os
+
+app = Flask(__name__)
+CLUSTER = os.getenv("CLUSTER_NAME", "unknown")
+
+ALERT_COUNT = Counter(
+    "alert_events_total",
+    "Total number of alert events",
+    ["alertname", "severity", "cluster"]
+)
+
+@app.route("/alerts", methods=["POST"])
+def alerts():
+    data = request.json
+    if not data or "alerts" not in 
+        return jsonify({"status": "invalid"}), 400
+    for alert in data["alerts"]:
+        labels = alert.get("labels", {})
+        alertname = labels.get("alertname", "unknown")
+        severity = labels.get("severity", "info")
+        ALERT_COUNT.labels(alertname=alertname, severity=severity, cluster=CLUSTER).inc()
+    return jsonify({"status": "received"}), 200
+
+@app.route("/metrics")
+def metrics():
+    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=9099)
+
+----
+# Use Red Hat UBI Python image with pip
+FROM registry.redhat.io/rhel9/python-39:1
+
+# Install dependencies as root
+RUN pip3 install --no-cache-dir prometheus_client flask
+
+# Copy your app code
+WORKDIR /app
+COPY alert_exporter.py .
+
+# Switch to non-root user (Red Hat best practice)
+USER 1001
+
+EXPOSE 9099
+CMD ["python3", "alert_exporter.py"]
+
+--1
+# Build
+podman build -t alert-exporter-ubi .
+
+# Test locally
+podman run --rm -p 9099:9099 -e CLUSTER_NAME=test alert-exporter-ubi
+
+curl http://localhost:9099/metrics
+# Should show Prometheus metrics
+
+--11
+apiVersion: apps/v1
+kind: Deployment
+meta
+  name: alert-exporter
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-exporter
+  template:
+    meta
+      labels:
+        app: alert-exporter
+    spec:
+      containers:
+        - name: exporter
+          # Use your image
+          image: quay.io/your-org/alert-exporter:ubi
+          ports:
+            - containerPort: 9099
+          env:
+            - name: CLUSTER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['cluster.openshift.io/cluster-name']
+      serviceAccountName: alert-exporter
+
+
+      
