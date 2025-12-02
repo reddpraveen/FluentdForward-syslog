@@ -1,3 +1,9 @@
+RUN curl -fsSL https://github.com/grafana/mimir/releases/download/v${MIMIR_VERSION}/mimir-linux-amd64.zip -o mimir.zip && \
+    unzip mimir.zip && \
+    mv mimir-linux-amd64/mimir /usr/local/bin/mimir && \
+    chmod +x /usr/local/bin/mimir && \
+    rm -rf mimir.zip mimir-linux-amd64
+-----
 # STAGE 1: Extract in Alpine (has curl + unzip)
 FROM alpine:latest AS builder
 
