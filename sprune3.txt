@@ -1,3 +1,26 @@
+# STAGE 1: Extract in Alpine (has curl + unzip)
+FROM alpine:latest AS builder
+
+RUN apk add --no-cache ca-certificates curl unzip
+
+ARG MIMIR_VERSION=3.0.0
+RUN curl -fsSL https://github.com/grafana/mimir/releases/download/v${MIMIR_VERSION}/mimir-linux-amd64.zip -o mimir.zip && \
+    unzip mimir.zip
+
+# STAGE 2: Final UBI image
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+COPY --from=builder /mimir-linux-amd64/mimir /usr/local/bin/mimir
+
+# Add CA bundle for ODF TLS
+COPY --from=registry.redhat.io/ubi9/ubi:9.4 /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+EXPOSE 8080
+USER 1001
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+
+-------
 # STAGE 1: Use Alpine to extract (no subscription, no repos)
 FROM alpine:latest AS builder
 
