@@ -1,3 +1,28 @@
+# Dockerfile.mimir-ubi
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+# Mimir is a static binary — no deps!
+# Just ensure CA certs are available for TLS (e.g., ODF)
+# Copy CA bundle from a trusted source (UBI base has it)
+COPY --from=registry.redhat.io/ubi9/ubi:9.4 /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+# Download Mimir binary
+ARG MIMIR_VERSION=3.0.0
+ADD https://github.com/grafana/mimir/releases/download/v${MIMIR_VERSION}/mimir-linux-amd64.zip /tmp/mimir.zip
+
+# Unpack and install
+RUN unzip /tmp/mimir.zip && \
+    mv mimir-linux-amd64/mimir /usr/local/bin/mimir && \
+    chmod +x /usr/local/bin/mimir && \
+    rm -rf /tmp/mimir.zip mimir-linux-amd64
+
+EXPOSE 8080
+USER 1001
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+
+
+++++++++++++++++++++++++++++
 # ============================================================
 # PART 1: DOCKERFILE FOR GRAFANA MIMIR ON UBI (Save as Dockerfile.mimir)
 # Build with: podman build -t quay.io/YOUR-ORG/mimir:3.0.0-ubi -f Dockerfile.mimir .
