@@ -1,3 +1,25 @@
+# STAGE 1: Use Alpine to extract (no subscription, no repos)
+FROM alpine:latest AS builder
+
+# Alpine has wget and tar by default
+ARG MIMIR_VERSION=3.0.0
+    tar -xzf mimir.tar.gz
+
+# STAGE 2: Final image — pure UBI minimal (no tools)
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+# Copy only the binary
+COPY --from=builder /mimir-linux-amd64/mimir /usr/local/bin/mimir
+
+# Optional: Add CA bundle if you need TLS (e.g., for ODF)
+# If you skip this, Mimir may fail to connect to ODF over HTTPS
+COPY --from=registry.redhat.io/ubi9/ubi:9.4 /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+EXPOSE 8080
+USER 1001
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+-------
 # Dockerfile.mimir-ubi
 FROM registry.redhat.io/ubi9/ubi-minimal:9.4
 
