@@ -1,3 +1,96 @@
+# alert-exporter-fixed.yaml
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: alert-exporter-script
+  namespace: observability  # or mimir, if you prefer
+
+  alert_exporter.py: |
+    from flask import Flask, request, jsonify
+    from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+    import os
+
+    app = Flask(__name__)
+    CLUSTER = os.getenv("CLUSTER_NAME", "unknown")
+
+    ALERT_COUNT = Counter(
+        "alert_events_total",
+        "Total number of alert events",
+        ["alertname", "severity", "cluster"]
+    )
+
+    @app.route("/alerts", methods=["POST"])
+    def alerts():
+        data = request.get_json(force=True)
+        if not data or not isinstance(data, dict) or "alerts" not in 
+            return jsonify({"error": "invalid payload"}), 400
+        for alert in data["alerts"]:
+            labels = alert.get("labels", {})
+            alertname = labels.get("alertname", "unknown")
+            severity = labels.get("severity", "info")
+            ALERT_COUNT.labels(alertname=alertname, severity=severity, cluster=CLUSTER).inc()
+        return jsonify({"status": "received"}), 200
+
+    @app.route("/metrics")
+    def metrics():
+        return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=9099)
+---
+apiVersion: apps/v1
+kind: Deployment
+meta
+  name: alert-exporter
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-exporter
+  template:
+    meta
+      labels:
+        app: alert-exporter
+    spec:
+      containers:
+        - name: exporter
+          # 🔁 USE YOUR EXISTING IMAGE (with deps already installed)
+          image: quay.io/your-org/alert-exporter:ubi  # ← your working image
+          command: ["python3", "/app/alert_exporter.py"]
+          env:
+            - name: CLUSTER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['cluster.openshift.io/cluster-name']
+          volumeMounts:
+            - name: script
+              mountPath: /app/alert_exporter.py
+              subPath: alert_exporter.py  # ⚠️ critical for file overwrite
+          ports:
+            - containerPort: 9099
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1001
+      volumes:
+        - name: script
+          configMap:
+            name: alert-exporter-script
+---
+apiVersion: v1
+kind: Service
+meta
+  name: alert-exporter
+  namespace: observability
+spec:
+  selector:
+    app: alert-exporter
+  ports:
+    - port: 9099
+      targetPort: 9099
+
+
 # alert_exporter.py
 from flask import Flask, request, jsonify
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
