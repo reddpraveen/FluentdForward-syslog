@@ -1,3 +1,199 @@
+# ============================================================
+# PART 1: DOCKERFILE FOR GRAFANA MIMIR ON UBI (Save as Dockerfile.mimir)
+# Build with: podman build -t quay.io/YOUR-ORG/mimir:3.0.0-ubi -f Dockerfile.mimir .
+# ============================================================
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+# Install deps
+RUN microdnf install -y ca-certificates curl gzip tar && microdnf clean all
+
+# Download Mimir binary (official release)
+ARG MIMIR_VERSION=3.0.0
+RUN curl -fsSL https://github.com/grafana/mimir/releases/download/v${MIMIR_VERSION}/mimir-linux-amd64.zip -o mimir.zip && \
+    unzip mimir.zip && \
+    mv mimir-linux-amd64/mimir /usr/local/bin/mimir && \
+    chmod +x /usr/local/bin/mimir && \
+    rm -rf mimir.zip mimir-linux-amd64
+
+EXPOSE 8080
+USER 1001
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+
+===
+# ============================================================
+# PART 2: DOCKERFILE FOR ALERT-EXPORTER ON UBI (Save as Dockerfile.exporter)
+# Build with: podman build -t quay.io/YOUR-ORG/alert-exporter:ubi -f Dockerfile.exporter .
+# ============================================================
+FROM registry.redhat.io/rhel9/python-39:1-16
+
+WORKDIR /app
+RUN pip3 install --no-cache-dir prometheus_client flask
+
+# Simple exporter (you can replace with your own file)
+RUN echo 'from flask import Flask, request, jsonify; from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST; import os; app = Flask(__name__); CLUSTER = os.getenv("CLUSTER_NAME", "unknown"); ALERT_COUNT = Counter("alert_events_total", "Alert count", ["alertname", "severity", "cluster"]); @app.route("/alerts", methods=["POST"]); def alerts():;   for a in request.json.get("alerts", []):;     labels = a.get("labels", {});     ALERT_COUNT.labels(labels.get("alertname",""), labels.get("severity",""), CLUSTER).inc();   return jsonify({}); @app.route("/metrics"); def metrics():;   return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}; if __name__ == "__main__":;   app.run(host="0.0.0.0", port=9099)' > alert_exporter.py
+
+EXPOSE 9099
+USER 1001
+CMD ["python3", "alert_exporter.py"]
+====
+# ============================================================
+# PART 3: OPENSHIFT DEPLOYMENT YAML FOR MIMIR + ODF
+# Replace ONLY these 3 values:
+#   1. <YOUR_MIMIR_IMAGE>     → e.g., quay.io/your-org/mimir:3.0.0-ubi
+#   2. <ODF_S3_ROUTE>         → e.g., s3-openshift-storage.apps.cluster.example.com
+#   3. <BASE64_ACCESS_KEY>    → echo -n "KEY" | base64
+#   4. <BASE64_SECRET_KEY>    → echo -n "SECRET" | base64
+# ============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+meta
+  name: mimir
+---
+apiVersion: v1
+kind: Secret
+meta
+  name: mimir-s3
+  namespace: mimir
+type: Opaque
+
+  access_key_id: <BASE64_ACCESS_KEY>
+  access_secret_key: <BASE64_SECRET_KEY>
+---
+apiVersion: v1
+kind: ConfigMap
+meta
+  name: mimir-config
+  namespace: mimir
+
+  config.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 8080
+    distributor:
+      ring:
+        kvstore:
+          store: memberlist
+    ingester:
+      lifecycler:
+        ring:
+          kvstore:
+            store: memberlist
+        final_sleep: 0s
+      chunk_idle_period: 30m
+      max_chunk_age: 1h
+    memberlist:
+      join_members: ["mimir-gateway.mimir.svc:8080"]
+    schema:
+      configs:
+        - from: "2020-10-24"
+          store: tsdb
+          object_store: s3
+          schema: v13
+          index:
+            prefix: mimir_
+            period: 24h
+    storage:
+      backend: s3
+      s3:
+        endpoint: <ODF_S3_ROUTE>
+        bucketnames: mimir-chunks
+        access_key_id: ${STORAGE_S3_ACCESS_KEY_ID}
+        secret_access_key: ${STORAGE_S3_SECRET_ACCESS_KEY}
+        insecure: false
+        path_style: true
+        signature_version: v4
+      tsdb:
+        dir: /tmp/tsdb
+      bucket_store:
+        sync_dir: /tmp/bucket-sync
+    limits:
+      retention: 8760h
+    compactor:
+      data_dir: /tmp/compactor
+      compaction_interval: 1h
+      retention_enabled: true
+    frontend:
+      zipkin:
+        enabled: false
+---
+apiVersion: apps/v1
+kind: Deployment
+meta
+  name: mimir
+  namespace: mimir
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mimir
+  template:
+    meta
+      labels:
+        app: mimir
+    spec:
+      containers:
+        - name: mimir
+          # 🔁 REPLACE WITH YOUR UBI IMAGE
+          image: <YOUR_MIMIR_IMAGE>
+          args:
+            - "-config.expand-env=true"
+            - "-config.file=/etc/mimir/config.yaml"
+          env:
+            - name: STORAGE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mimir-s3
+                  key: access_key_id
+            - name: STORAGE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mimir-s3
+                  key: access_secret_key
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mimir
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1001
+      volumes:
+        - name: config
+          configMap:
+            name: mimir-config
+---
+apiVersion: v1
+kind: Service
+meta
+  name: mimir-gateway
+  namespace: mimir
+spec:
+  selector:
+    app: mimir
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+meta
+  name: mimir-remote-write
+  namespace: mimir
+spec:
+  to:
+    kind: Service
+    name: mimir-gateway
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecurePolicy: Redirect
+
+-------------------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
