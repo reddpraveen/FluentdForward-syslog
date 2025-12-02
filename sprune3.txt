@@ -1,6 +1,53 @@
 # STAGE 1: Builder (Alpine)
 FROM alpine:latest AS builder
 
+RUN apk add --no-cache ca-certificates curl
+
+# Use v3.2.1 (confirmed working)
+ARG MIMIR_VERSION=3.2.1
+
+# Download directly from GitHub releases
+RUN curl -fsSL https://github.com/grafana/mimir/releases/download/mimir-${MIMIR_VERSION}/mimir-linux-amd64 -o /tmp/mimir && \
+    chmod +x /tmp/mimir
+
+# STAGE 2: CA Bundle provider (full UBI for ca-certificates)
+FROM registry.redhat.io/ubi9/ubi:9.4 AS ca-provider
+
+# STAGE 3: Runtime (UBI minimal)
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+# Copy CA certificates from full UBI image (avoids microdnf pthread issues)
+COPY --from=ca-provider /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+COPY --from=ca-provider /etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt /etc/pki/ca-trust/extracted/openssl/ca-bundle.trust.crt
+
+# Copy binary from builder
+COPY --from=builder /tmp/mimir /usr/local/bin/mimir
+
+# Create necessary directories with proper permissions for OpenShift
+RUN mkdir -p /etc/mimir /data && \
+    chown -R 1001:0 /etc/mimir /data && \
+    chmod -R g=u /etc/mimir /data
+
+# Labels for OpenShift
+LABEL name="grafana-mimir" \
+      version="3.2.1" \
+      summary="Grafana Mimir - Scalable time series database" \
+      description="Horizontally scalable, highly available, multi-tenant, long-term storage for Prometheus"
+
+EXPOSE 8080
+
+USER 1001
+
+WORKDIR /data
+
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+
+
++++++++++++
+# STAGE 1: Builder (Alpine)
+FROM alpine:latest AS builder
+
 RUN apk add --no-cache ca-certificates curl unzip
 
 # Use v3.2.1 (confirmed working)
