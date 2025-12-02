@@ -1,3 +1,45 @@
+# STAGE 1: Builder (Alpine)
+FROM alpine:latest AS builder
+
+RUN apk add --no-cache ca-certificates curl unzip
+
+# Use v3.2.1 (confirmed working)
+ARG MIMIR_VERSION=3.2.1
+
+RUN curl -fsSL https://github.com/grafana/mimir/releases/download/mimir-${MIMIR_VERSION}/mimir-linux-amd64 -o /tmp/mimir && \
+    chmod +x /tmp/mimir
+
+# STAGE 2: Runtime (UBI)
+FROM registry.redhat.io/ubi9/ubi-minimal:9.4
+
+# Install CA certificates in runtime image
+RUN microdnf install -y ca-certificates && \
+    microdnf clean all
+
+# Copy binary from builder
+COPY --from=builder /tmp/mimir /usr/local/bin/mimir
+
+# Create necessary directories
+RUN mkdir -p /etc/mimir /data && \
+    chown -R 1001:0 /etc/mimir /data && \
+    chmod -R g=u /etc/mimir /data
+
+# Labels for OpenShift
+LABEL name="mimir" \
+      version="${MIMIR_VERSION}" \
+      summary="Grafana Mimir - Scalable time series database" \
+      description="Horizontally scalable, highly available, multi-tenant, long-term storage for Prometheus"
+
+EXPOSE 8080
+
+USER 1001
+
+WORKDIR /data
+
+ENTRYPOINT ["/usr/local/bin/mimir"]
+CMD ["-config.file=/etc/mimir/config.yaml"]
+
+----
 RUN curl -fsSL https://github.com/grafana/mimir/releases/download/v${MIMIR_VERSION}/mimir-linux-amd64.zip -o mimir.zip && \
     unzip mimir.zip && \
     mv mimir-linux-amd64/mimir /usr/local/bin/mimir && \
