@@ -1,0 +1,533 @@
+h1. GitHub Repository Management Workflow
+
+h2. Overview
+
+This workflow provides automated repository management capabilities for GitHub Enterprise, enabling teams to standardize repository creation, access control, and branch protection policies across the organization.
+
+*Current Version:* 1.5
+*Status:* Production
+*Platform:* GitHub Enterprise
+
+h3. Capabilities
+
+- Automated repository provisioning from standardized templates
+- Multi-branch initialization with configurable protection policies
+- Centralized access control management for users and teams
+- Idempotent operations supporting both new and existing repositories
+- Preview mode for validation before execution
+
+-----
+
+h2. Getting Started
+
+h3. Requirements
+
+Before using this workflow, ensure you have:
+
+- Access to your GitHub Enterprise instance
+- A personal access token with the following scopes:
+  ** {{repo}} - Repository administration
+  ** {{admin:org}} - Organization and team management
+- Self-hosted runner configured with {{enterprise}} label
+
+h3. Execution Steps
+
+# Navigate to *Actions* in your repository
+
+# Select *GitHub Repository Management* workflow
+
+# Click *Run workflow* button
+
+# Complete the required input fields
+
+# Click *Run workflow* to execute
+
+Results are available in the workflow summary upon completion.
+
+-----
+
+h2. Configuration Parameters
+
+h3. Required Parameters
+
+|| Parameter || Description || Example Value ||
+| operation | Workflow operation to execute | create-repo-full |
+| target_repo | Destination repository path | myorg/new-repository |
+
+h3. Optional Parameters
+
+|| Parameter || Type || Default || Description ||
+| template_repo | string | none | Source repository for content synchronization |
+| repo_description | string | auto-generated | Repository description text |
+| private_repo | boolean | false | Repository visibility setting |
+| collaborators | JSON array | [] | Individual user access definitions |
+| teams | JSON array | [] | Team access definitions |
+| dry_run | boolean | false | Enable preview mode without changes |
+| force_recreate | boolean | false | Delete and recreate existing repository |
+
+-----
+
+h2. Available Operations
+
+h3. create-repo-full
+
+*Purpose:* Complete repository provisioning including content, access control, and branch protection.
+
+*Process Flow:*
+
+# Creates or updates target repository
+
+# Initializes default branch structure
+
+# Synchronizes content from template (if specified)
+
+# Applies access control policies
+
+# Configures branch protection rules
+
+*Use Case:* Initial repository setup or comprehensive updates to existing repositories.
+
+{code:yaml}
+operation: create-repo-full
+template_repo: myorg/standard-template
+target_repo: myorg/new-service
+teams: [{“team”:“platform-engineering”,“permission”:“write”}]
+{code}
+
+h3. copy-collaborators-only
+
+*Purpose:* Update access control without modifying repository content or protection rules.
+
+*Process Flow:*
+
+# Adds or updates individual collaborators
+
+# Adds or updates team permissions
+
+*Use Case:* Access control modifications on existing repositories.
+
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: myorg/existing-repository
+teams: [{“team”:“security-team”,“permission”:“read”}]
+{code}
+
+h3. copy-protection-only
+
+*Purpose:* Synchronize branch protection policies from template repository.
+
+*Process Flow:*
+
+# Retrieves protection rules from template
+
+# Applies matching rules to target repository branches
+
+*Use Case:* Standardizing branch protection across multiple repositories.
+
+{code:yaml}
+operation: copy-protection-only
+template_repo: myorg/policy-template
+target_repo: myorg/production-service
+{code}
+
+h3. sync-all-settings
+
+*Purpose:* Update both access control and branch protection policies.
+
+*Process Flow:*
+
+# Updates collaborator and team permissions
+
+# Synchronizes branch protection rules
+
+*Use Case:* Policy enforcement on existing repositories without content changes.
+
+{code:yaml}
+operation: sync-all-settings
+template_repo: myorg/policy-template
+target_repo: myorg/service-repository
+{code}
+
+-----
+
+h2. Access Control Configuration
+
+h3. Individual Collaborators
+
+Collaborators are defined as JSON array with username and permission level:
+
+{code:json}
+[
+{“username”:“alice.smith”,“permission”:“admin”},
+{“username”:“bob.jones”,“permission”:“write”},
+{“username”:“charlie.brown”,“permission”:“read”}
+]
+{code}
+
+*Permission Levels:*
+
+- {{admin}} - Full repository access including settings and deletion
+- {{write}} - Push access with ability to modify content
+- {{read}} - Read-only access for cloning and pulling
+
+h3. Team Access
+
+Teams are defined as JSON array with team identifier and permission level:
+
+{code:json}
+[
+{“team”:“platform-engineering”,“permission”:“write”},
+{“team”:“security-operations”,“permission”:“read”}
+]
+{code}
+
+*Team Identifier:* Use the URL slug from your team’s GitHub page. Navigate to the team in GitHub Enterprise and extract the identifier from the URL path {{/orgs/[org]/teams/[identifier]}}.
+
+*Supported Configurations:* This workflow handles both visible and secret team configurations automatically, using appropriate API endpoints based on team visibility settings.
+
+-----
+
+h2. Branch Structure
+
+The workflow establishes a three-branch model for repository organization:
+
+|| Branch Name || Purpose || Default Protection ||
+| master | Primary development branch for ongoing work | None |
+| stable | Production-ready code for releases | Pull request approval required |
+| dev/initial | Base branch for feature development | None |
+
+Branch protection policies on stable branch enforce code review requirements before merging. Additional protection rules are inherited from template repository when applicable.
+
+-----
+
+h2. Common Implementation Patterns
+
+h3. Pattern 1: Microservice Initialization
+
+Standard setup for a new microservice with team access and private visibility:
+
+{code:yaml}
+operation: create-repo-full
+template_repo: myorg/microservice-template
+target_repo: myorg/authentication-service
+repo_description: OAuth2 authentication service
+private_repo: true
+collaborators: [{“username”:“service.owner”,“permission”:“admin”}]
+teams: [{“team”:“backend-engineering”,“permission”:“write”}]
+{code}
+
+h3. Pattern 2: Access Control Update
+
+Adding new team to existing repository:
+
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: myorg/payment-processing
+teams: [{“team”:“compliance-team”,“permission”:“read”}]
+{code}
+
+h3. Pattern 3: Policy Enforcement
+
+Applying standardized branch protection across repositories:
+
+{code:yaml}
+operation: copy-protection-only
+template_repo: myorg/security-policy-template
+target_repo: myorg/customer-data-service
+{code}
+
+h3. Pattern 4: Validation Mode
+
+Testing configuration before applying changes:
+
+{code:yaml}
+operation: create-repo-full
+template_repo: myorg/application-template
+target_repo: myorg/test-application
+dry_run: true
+{code}
+
+-----
+
+h2. Interpreting Results
+
+h3. Successful Execution
+
+Upon successful completion, the workflow summary displays:
+
+- Repository details including URL
+- Branch synchronization status for all created branches
+- Access control operations with success indicators
+- Branch protection application results
+
+Example output structure:
+
+{noformat}
+Repository Created
+
+- Repository: myorg/new-service
+- URL: https://github.enterprise.com/myorg/new-service
+
+Branch Synchronization Status
+
+|Branch     |Status            |
+|-----------|------------------|
+|master     |Created and synced|
+|stable     |Created and synced|
+|dev/initial|Created and synced|
+
+Access Control Summary
+
+|Identity  |Type|Permission|Status |
+|----------|----|----------|-------|
+|user123   |User|admin     |SUCCESS|
+|team-a    |Team|write     |SUCCESS|
+|{noformat}|    |          |       |
+
+h3. Warnings and Errors
+
+Operations that cannot be completed are marked with status indicators:
+
+- SKIP - Operation bypassed due to validation failure
+- WARN - Non-critical issue that did not prevent execution
+- ERROR - Critical failure requiring attention
+
+Common warning scenarios include team identifier mismatches, suspended user accounts, or insufficient token permissions.
+
+-----
+
+h2. Troubleshooting Guide
+
+h3. Team Identifier Issues
+
+*Symptom:* Warning message indicating team not found in organization.
+
+*Resolution:*
+
+# Navigate to team page in GitHub Enterprise
+
+# Extract identifier from URL: {{github.enterprise.com/orgs/[org]/teams/[identifier]}}
+
+# Verify identifier matches exactly (case-sensitive)
+
+# Ensure team exists in target organization
+
+*Example:*
+If URL shows {{/teams/backend-platform-team}}, use {{backend-platform-team}} in configuration.
+
+h3. Repository Already Exists
+
+*Symptom:* Error indicating target repository already exists.
+
+*Resolution Options:*
+
+Option 1 - Update existing repository:
+{code:yaml}
+force_recreate: false
+{code}
+
+Option 2 - Delete and recreate (requires appropriate permissions):
+{code:yaml}
+force_recreate: true
+{code}
+
+Option 3 - Use alternative operation:
+{code:yaml}
+operation: sync-all-settings
+{code}
+
+h3. Permission Denied Errors
+
+*Symptom:* 403 Forbidden or permission denied messages.
+
+*Resolution:*
+Verify personal access token includes required scopes:
+
+- {{repo}} - Full repository control
+- {{admin:org}} - Organization administration
+
+Token scope verification:
+
+# Navigate to Settings > Developer settings > Personal access tokens
+
+# Select your token
+
+# Confirm both required scopes are enabled
+
+h3. Branch Protection Failures
+
+*Symptom:* Failed branch protection application.
+
+*Resolution:*
+Ensure workflow version 1.5 or higher is deployed. Earlier versions contain API payload formatting issues that have been resolved in current release.
+
+-----
+
+h2. Security Considerations
+
+h3. Token Management
+
+Personal access tokens must be managed according to security best practices:
+
+- Store tokens exclusively in GitHub Secrets ({{GH_FUNC_TOKEN}})
+- Use service accounts rather than personal accounts for automation
+- Implement 90-day rotation schedule
+- Never commit tokens to repository code
+
+h3. Access Control
+
+- Secret team configurations are automatically detected and handled
+- Visible teams are recommended for improved organizational transparency
+- Both configurations are supported by the workflow
+
+h3. Repository Visibility
+
+- {{private_repo: true}} - Restricts access to organization members
+- {{private_repo: false}} - Public visibility (evaluate security implications)
+
+-----
+
+h2. Operational Constraints
+
+h3. Organization Policy Limitations
+
+Certain operations may be restricted by organizational policies:
+
+- Repository deletion may be prevented by retention policies
+- Team membership requirements may apply
+- Branch protection modifications require appropriate administrative access
+
+The workflow continues execution when policy restrictions are encountered, logging warnings in the summary output.
+
+h3. API Rate Limits
+
+GitHub Enterprise API enforces rate limiting:
+
+- Standard limit: 5,000 requests per hour for authenticated requests
+- Workflow consumption: 10-20 API calls per repository operation
+- Recommended maximum: 100 repository operations per hour
+
+-----
+
+h2. Support and Assistance
+
+h3. Diagnostic Process
+
+When encountering issues:
+
+# Review workflow summary for error and warning messages
+
+# Examine workflow logs for detailed execution information
+
+# Consult troubleshooting guide above
+
+# Verify configuration parameters match documented formats
+
+h3. Escalation
+
+For issues requiring additional support, provide:
+
+- Complete workflow input configuration
+- Workflow summary output
+- Relevant error messages from execution logs
+- Contact information for follow-up
+
+Reach out to your Platform or DevOps team for assistance.
+
+-----
+
+h2. Quick Reference Matrix
+
+|| Objective || Operation || Required Parameters ||
+| New repository from template | create-repo-full | template_repo, target_repo |
+| New empty repository | create-repo-full | target_repo |
+| Modify access control | copy-collaborators-only | target_repo, teams or collaborators |
+| Update branch protection | copy-protection-only | template_repo, target_repo |
+| Validate before execution | any | dry_run: true |
+| Update existing repository | create-repo-full | target_repo, force_recreate: false |
+
+-----
+
+h2. Version History
+
+h3. Version 1.5 (Current)
+
+*Release Date:* December 2024
+
+*Enhancements:*
+
+- Resolved branch protection API payload structure issues
+- Added support for secret and closed team configurations
+- Implemented automatic permission value translation
+- Enhanced diagnostic messaging and error handling
+- Improved idempotent behavior for existing repositories
+
+h3. Version 1.4 (Superseded)
+
+*Known Issues:*
+
+- Branch protection operations returned validation errors
+- Secret team configurations not supported
+
+These issues are resolved in version 1.5.
+
+-----
+
+h2. Additional Information
+
+*Workflow Location:* {{.github/workflows/repo-management.yml}}
+*Maintained By:* Platform Engineering Team
+*Documentation Version:* 1.5
+*Last Updated:* December 2024
+
+For questions, suggestions, or feedback regarding this workflow, contact the Platform Engineering team through standard support channels.
+
+-----
+
+h2. Appendix: Configuration Examples
+
+h3. Example A: Standard Microservice
+
+{code:yaml}
+operation: create-repo-full
+template_repo: myorg/microservice-base
+target_repo: myorg/order-management-service
+repo_description: Order processing and management service
+private_repo: true
+collaborators: [{“username”:“tech.lead”,“permission”:“admin”}]
+teams: [
+{“team”:“backend-engineers”,“permission”:“write”},
+{“team”:“qa-engineers”,“permission”:“read”}
+]
+{code}
+
+h3. Example B: Multi-Team Access
+
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: myorg/shared-library
+teams: [
+{“team”:“platform-team”,“permission”:“admin”},
+{“team”:“backend-team”,“permission”:“write”},
+{“team”:“frontend-team”,“permission”:“write”},
+{“team”:“security-reviewers”,“permission”:“read”}
+]
+{code}
+
+h3. Example C: Policy Template Application
+
+{code:yaml}
+operation: copy-protection-only
+template_repo: myorg/enterprise-policy-template
+target_repo: myorg/production-api
+{code}
+
+h3. Example D: Validation Run
+
+{code:yaml}
+operation: create-repo-full
+template_repo: myorg/webapp-template
+target_repo: myorg/customer-portal
+private_repo: true
+dry_run: true
+{code}
