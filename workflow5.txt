@@ -1,0 +1,682 @@
+# ConfigMap and Secret Pruner
+
+## Overview
+
+The ConfigMap and Secret Pruner is an automated cleanup solution for OpenShift 4.16 clusters that removes unreferenced ConfigMaps and Secrets older than a specified age. It runs as a weekly CronJob and includes comprehensive safety mechanisms to prevent deletion of system-critical resources and actively-used configurations.
+
+**Key Features:**
+
+- Automated cleanup of unreferenced ConfigMaps and Secrets (>7 days old)
+- Protection for system-injected resources (CA bundles, root certificates)
+- Respects GitOps and Helm management labels
+- Supports high-volume namespaces (1000+ resources) with pagination
+- Dry-run mode for safe validation
+- Detailed logging and reporting
+
+-----
+
+## Architecture
+
+### Components
+
+|Component         |Description                                                 |
+|------------------|------------------------------------------------------------|
+|**CronJob**       |Scheduled execution (weekly on Sundays at 2 AM EST)         |
+|**ServiceAccount**|`cm-secret-pruner` with cluster-wide read/delete permissions|
+|**ConfigMap**     |`cm-secret-pruner-config` for configuration management      |
+|**ClusterRole**   |Grants necessary permissions across all namespaces          |
+
+### Resource Requirements
+
+```yaml
+Resources:
+  Requests: 256Mi memory, 10m CPU
+  Limits: 2Gi memory, 200m CPU
+```
+
+Memory limit supports namespaces with up to 16,000+ ConfigMaps.
+
+-----
+
+## Installation
+
+### 1. Create Namespace
+
+```bash
+oc new-project configmap-secret-pruner
+```
+
+### 2. Deploy ServiceAccount and Permissions
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cm-secret-pruner
+rules:
+- apiGroups: [""]
+  resources: ["configmaps", "secrets", "pods", "namespaces"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps.openshift.io"]
+  resources: ["deploymentconfigs"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cm-secret-pruner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cm-secret-pruner
+subjects:
+- kind: ServiceAccount
+  name: cm-secret-pruner
+  namespace: configmap-secret-pruner
+EOF
+```
+
+### 3. Create Configuration ConfigMap
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-secret-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # Dry-run mode (set to "false" for live deletions)
+  dryRun: "true"
+  
+  # Minimum age before deletion (in days)
+  minAgeDays: "7"
+  
+  # High-volume namespace threshold
+  highVolumeThreshold: "1000"
+  
+  # Process high-volume namespaces with pagination
+  processHighVolumeNamespaces: "true"
+  
+  # Process only high-volume namespaces (for testing)
+  processOnlyHighVolume: "false"
+  
+  # Pagination limit per page
+  paginationLimit: "200"
+  
+  # Excluded namespaces (regex patterns)
+  excludedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^default$
+    ^openshift$
+    ^configmap-secret-pruner$
+  
+  # Protected management labels
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+  
+  # Excluded ConfigMap names (system resources)
+  excludedConfigMapNames: |
+    openshift-service-ca.crt
+    kube-root-ca.crt
+    istio-ca-root-cert
+    openshift-ca.crt
+EOF
+```
+
+### 4. Deploy CronJob
+
+Apply the CronJob YAML (see deployment package).
+
+```bash
+oc apply -f configmap-secret-pruner-cronjob.yaml
+```
+
+-----
+
+## Configuration
+
+### Key Parameters
+
+#### dryRun
+
+**Values:** `"true"` | `"false"`  
+**Default:** `"true"`
+
+When enabled, the pruner logs what it would delete without actually removing resources. Always test with dry-run enabled first.
+
+**Example:**
+
+```bash
+# Enable dry-run mode
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{"dryRun":"true"}}'
+
+# Enable live deletion
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{"dryRun":"false"}}'
+```
+
+#### minAgeDays
+
+**Values:** Positive integer  
+**Default:** `"7"`
+
+Resources must be older than this many days before being considered for deletion.
+
+#### highVolumeThreshold
+
+**Values:** Positive integer  
+**Default:** `"1000"`
+
+Namespaces with more resources than this threshold are processed using pagination.
+
+#### processHighVolumeNamespaces
+
+**Values:** `"true"` | `"false"`  
+**Default:** `"false"`
+
+Enable pagination for high-volume namespaces. Set to `"true"` to process all namespaces.
+
+#### paginationLimit
+
+**Values:** `100-500`  
+**Default:** `"200"`
+
+Number of resources fetched per page during pagination. Lower values are more reliable but slower.
+
+-----
+
+## Protection Mechanisms
+
+### 1. System-Injected Resources
+
+Automatically skipped based on:
+
+- **Name matching:** `openshift-service-ca.crt`, `kube-root-ca.crt`, `istio-ca-root-cert`
+- **Annotations:** `service.beta.openshift.io/inject-cabundle=true`
+- **Labels:** `config.openshift.io/inject-trusted-cabundle=true`
+
+### 2. Management Labels
+
+Resources with these labels are protected:
+
+- `app.kubernetes.io/managed-by=argocd`
+- `app.kubernetes.io/managed-by=Helm`
+- `meta.helm.sh/release-name`
+- `prune.protected=true`
+
+**Usage Example:**
+
+```bash
+# Protect a ConfigMap from deletion
+oc label configmap my-config prune.protected=true -n my-namespace
+```
+
+### 3. Workload References
+
+Resources referenced by any workload are automatically protected:
+
+- Deployments, StatefulSets, DaemonSets
+- Jobs, CronJobs
+- Pods
+- DeploymentConfigs (OpenShift)
+- ReplicaSets, ReplicationControllers
+
+The pruner checks:
+
+- Volume mounts
+- Environment variable references (envFrom, valueFrom)
+- Projected volumes
+
+### 4. Age Requirement
+
+Only resources older than `minAgeDays` (default: 7) are considered for deletion.
+
+-----
+
+## Usage
+
+### Testing with Dry-Run
+
+**Always test first with dry-run enabled:**
+
+```bash
+# Ensure dry-run is enabled
+oc get cm cm-secret-pruner-config -n configmap-secret-pruner -o jsonpath='{.data.dryRun}'
+
+# Create a test job
+oc create job --from=cronjob/cm-secret-pruner test-dryrun \
+  -n configmap-secret-pruner
+
+# Watch the logs
+oc logs -n configmap-secret-pruner -f job/test-dryrun
+
+# Check the summary
+oc logs -n configmap-secret-pruner job/test-dryrun | grep -A 20 "Job Completed"
+```
+
+### Running Production Cleanup
+
+**Once validated, enable live deletion:**
+
+```bash
+# Enable live deletion
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{"dryRun":"false"}}'
+
+# Trigger immediate run
+oc create job --from=cronjob/cm-secret-pruner manual-cleanup-$(date +%Y%m%d) \
+  -n configmap-secret-pruner
+
+# Monitor execution
+oc logs -n configmap-secret-pruner -f job/manual-cleanup-<date>
+```
+
+### Processing Specific Namespace Types
+
+**Only high-volume namespaces:**
+
+```bash
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "processHighVolumeNamespaces":"true",
+    "processOnlyHighVolume":"true"
+  }}'
+```
+
+**All namespaces:**
+
+```bash
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "processHighVolumeNamespaces":"true",
+    "processOnlyHighVolume":"false"
+  }}'
+```
+
+-----
+
+## Monitoring and Troubleshooting
+
+### Log Analysis
+
+**View recent job logs:**
+
+```bash
+oc get jobs -n configmap-secret-pruner
+oc logs -n configmap-secret-pruner job/<job-name>
+```
+
+**Key log entries:**
+
+- `SKIPPED:` Resource skipped (reason provided)
+- `PROTECTED:` Resource protected by label
+- `REFERENCED:` Resource in use by workload
+- `TOO-NEW:` Resource younger than minAgeDays
+- `DELETED:` Resource removed (or would be in dry-run)
+- `DRY-RUN:` What would be deleted
+
+**Example log output:**
+
+```
+[INFO] Processing Namespace [45/154]: my-app
+[INFO] Found 26 ConfigMap(s)
+[INFO] SKIPPED: istio-ca-root-cert (system)
+[INFO] SKIPPED: kube-root-ca.crt (system)
+[INFO] PROTECTED: app-config (label: app.kubernetes.io/managed-by=Helm)
+[INFO] REFERENCED: redis-config (by: deployment:redis)
+[INFO] TOO-NEW: new-config (age: 3 days)
+[INFO] DRY-RUN: Would delete old-config (age: 45 days, unreferenced)
+[INFO] Namespace summary: deleted=1 skipped=5
+```
+
+### Job Summary
+
+Each job produces a comprehensive summary:
+
+```
+================================================
+Job Completed Successfully
+================================================
+Duration: 12m 34s
+
+Namespace Statistics:
+  Total in cluster: 246
+  Excluded by pattern: 91
+  High-volume (processed): 1
+  Processed normally: 154
+
+ConfigMap Statistics:
+  Deleted (or would delete): 1557
+  Skipped total: 14446
+    - System (injected): 468
+    - Protected (labels): 234
+    - Too new (< 7 days): 1245
+    - Referenced (workloads): 12499
+
+Errors: 0
+Mode: DRY-RUN
+High-Volume Processing: ENABLED (limit=200, fallback available)
+================================================
+```
+
+### Common Issues
+
+#### Job Fails with OOMKilled
+
+**Symptom:** Pod shows “OOMKilled” status
+
+**Solution:** Increase memory limit or reduce pagination size:
+
+```bash
+# Reduce pagination size
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{"paginationLimit":"100"}}'
+```
+
+#### Pagination Failures
+
+**Symptom:** Logs show “Failed to fetch page X”
+
+**Solution:** Script automatically falls back to single-fetch mode. If consistently failing:
+
+```bash
+# Use smaller page size
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{"paginationLimit":"100"}}'
+
+# Or exclude problematic namespace temporarily
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "excludedNamespaces":"^openshift-.*\n^kube-.*\n^problematic-namespace$"
+  }}'
+```
+
+#### Authentication Errors
+
+**Symptom:** “Unable to authenticate” errors
+
+**Solution:** Verify ServiceAccount and ClusterRoleBinding:
+
+```bash
+# Check ServiceAccount
+oc get sa cm-secret-pruner -n configmap-secret-pruner
+
+# Check permissions
+oc auth can-i list configmaps --as=system:serviceaccount:configmap-secret-pruner:cm-secret-pruner
+
+# Verify ClusterRoleBinding
+oc get clusterrolebinding cm-secret-pruner
+```
+
+-----
+
+## Safety and Best Practices
+
+### Pre-Deployment Checklist
+
+- [ ] Deploy with `dryRun: "true"` initially
+- [ ] Run test job and review logs thoroughly
+- [ ] Verify protected resources are not flagged for deletion
+- [ ] Check that system ConfigMaps/Secrets are skipped
+- [ ] Review namespace exclusion patterns
+- [ ] Validate workload reference detection
+
+### Operational Guidelines
+
+**DO:**
+
+- ✅ Always test with dry-run first
+- ✅ Review logs before enabling live deletion
+- ✅ Use `prune.protected=true` label for critical resources
+- ✅ Monitor job execution regularly
+- ✅ Keep exclusion patterns up to date
+
+**DON’T:**
+
+- ❌ Enable live deletion without dry-run testing
+- ❌ Reduce minAgeDays below 7 days
+- ❌ Remove system namespace exclusions
+- ❌ Disable protection mechanisms
+
+### Excluding Resources
+
+**Exclude specific namespace:**
+
+```bash
+# Add to excludedNamespaces
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "excludedNamespaces":"^openshift-.*\n^kube-.*\n^my-critical-namespace$"
+  }}'
+```
+
+**Protect specific resource:**
+
+```bash
+# Add protection label
+oc label configmap critical-config prune.protected=true -n my-namespace
+oc label secret critical-secret prune.protected=true -n my-namespace
+```
+
+-----
+
+## Scheduling and Maintenance
+
+### CronJob Schedule
+
+**Default:** Every Sunday at 2:00 AM EST
+
+**Modify schedule:**
+
+```bash
+oc patch cronjob cm-secret-pruner -n configmap-secret-pruner \
+  --type json -p='[
+    {"op": "replace", "path": "/spec/schedule", "value": "0 3 * * 0"}
+  ]'
+```
+
+**Schedule examples:**
+
+- `"0 2 * * 0"` - Sunday at 2 AM
+- `"0 2 * * 6"` - Saturday at 2 AM
+- `"0 2 1 * *"` - First day of month at 2 AM
+- `"0 2 */2 * *"` - Every 2 days at 2 AM
+
+### Pause/Resume
+
+**Suspend CronJob:**
+
+```bash
+oc patch cronjob cm-secret-pruner -n configmap-secret-pruner \
+  -p '{"spec":{"suspend":true}}'
+```
+
+**Resume CronJob:**
+
+```bash
+oc patch cronjob cm-secret-pruner -n configmap-secret-pruner \
+  -p '{"spec":{"suspend":false}}'
+```
+
+### Manual Execution
+
+**Trigger immediate run:**
+
+```bash
+oc create job --from=cronjob/cm-secret-pruner manual-run-$(date +%Y%m%d-%H%M) \
+  -n configmap-secret-pruner
+```
+
+-----
+
+## Advanced Configuration
+
+### Rate Limiting
+
+Control API call frequency to reduce cluster load:
+
+```yaml
+env:
+- name: DELAY_BETWEEN_NAMESPACES
+  value: "0.1"  # Seconds between namespace processing
+- name: DELAY_BETWEEN_DELETIONS
+  value: "0.05"  # Seconds between deletions
+- name: BATCH_SIZE
+  value: "10"  # Delete in batches
+- name: BATCH_PAUSE
+  value: "0.5"  # Pause after each batch
+```
+
+### Custom Exclusions
+
+**Add custom ConfigMap names to exclude:**
+
+```bash
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "excludedConfigMapNames":"openshift-service-ca.crt\nkube-root-ca.crt\nmy-custom-config"
+  }}'
+```
+
+**Add custom protection labels:**
+
+```bash
+oc patch cm cm-secret-pruner-config -n configmap-secret-pruner \
+  --type merge -p '{"data":{
+    "protectedLabels":"app.kubernetes.io/managed-by=argocd\nmy.company/protected=true"
+  }}'
+```
+
+-----
+
+## Metrics and Reporting
+
+### Key Metrics
+
+Monitor these metrics from job summaries:
+
+|Metric                  |Description        |Threshold        |
+|------------------------|-------------------|-----------------|
+|**Deleted**             |Resources removed  |Review if >1000  |
+|**Skipped (System)**    |System resources   |Expected: 200-500|
+|**Skipped (Protected)** |Label-protected    |Expected: varies |
+|**Skipped (Referenced)**|In-use resources   |Expected: 80-90% |
+|**Errors**              |Processing failures|Alert if >0      |
+|**Duration**            |Job runtime        |Alert if >60min  |
+
+### Audit Trail
+
+Job history is automatically retained:
+
+- **Successful jobs:** Last 3 retained
+- **Failed jobs:** Last 3 retained
+- **Pod logs:** Retained for 24 hours after job completion
+
+**View job history:**
+
+```bash
+oc get jobs -n configmap-secret-pruner --sort-by=.metadata.creationTimestamp
+```
+
+-----
+
+## Uninstallation
+
+**Remove all components:**
+
+```bash
+# Delete CronJob
+oc delete cronjob cm-secret-pruner -n configmap-secret-pruner
+
+# Delete ClusterRoleBinding
+oc delete clusterrolebinding cm-secret-pruner
+
+# Delete ClusterRole
+oc delete clusterrole cm-secret-pruner
+
+# Delete namespace (includes ConfigMap and ServiceAccount)
+oc delete project configmap-secret-pruner
+```
+
+-----
+
+## Support and Contact
+
+**Deployment Package:** Available in Git repository  
+**Documentation:** This page  
+**Support Contact:** Platform Team
+
+**Common Support Requests:**
+
+- Excluding additional namespaces
+- Adjusting cleanup frequency
+- Investigating unexpected deletions
+- Performance tuning for large clusters
+
+-----
+
+## Appendix
+
+### Resource Identification Logic
+
+**ConfigMap/Secret is deleted if ALL conditions are met:**
+
+1. ✅ Age > `minAgeDays` (default: 7 days)
+1. ✅ NOT in excluded namespace (regex match)
+1. ✅ NOT a system-injected resource (name or annotation)
+1. ✅ NO protected management labels
+1. ✅ NOT referenced by any workload
+1. ✅ NOT in `excludedConfigMapNames` list
+
+**If ANY condition fails, resource is SKIPPED.**
+
+### Pagination Details
+
+**High-volume namespaces (>1000 resources):**
+
+1. **Primary method:** Pagination via Kubernetes API
+- Fetches resources in pages (default: 200 per page)
+- Uses continue tokens for sequential fetching
+- Includes retry logic and token expiration handling
+1. **Fallback method:** Single fetch
+- If pagination fails, fetches all resources at once
+- Re-fetches workload references to prevent race conditions
+- Requires more memory but guarantees completion
+
+**Why pagination?**
+
+- Prevents API server overload
+- Reduces memory consumption
+- Handles extreme-scale namespaces (10,000+ resources)
+
+### Version History
+
+|Version|Date   |Changes                                                  |
+|-------|-------|---------------------------------------------------------|
+|2.0    |2024-12|Added pagination support, fallback logic, improved safety|
+|1.0    |2024-11|Initial release                                          |
+
+-----
+
+**Document Version:** 2.0  
+**Last Updated:** December 2024  
+**Status:** Production
