@@ -1,0 +1,1426 @@
+h1. GitHub Repository Management Workflow
+
+*Version:* 1.5
+*Status:* {status:colour=Green|title=Production Ready|subtle=false}
+*Platform:* GitHub Enterprise
+
+-----
+
+h2. Overview
+
+This workflow automates the complete setup and management of GitHub repositories, including:
+
+- Repository creation
+- Branch initialization (master, stable, dev/initial)
+- Content synchronization from template repositories
+- Collaborator and team access management
+- Branch protection rules
+
+h3. Features
+
+{tip}
+(/) *Idempotent* - Safe to run multiple times
+(/) *Template Support* - Clone from existing repositories
+(/) *Multi-Branch* - Automatically creates master, stable, and dev/initial branches
+(/) *Access Control* - Manage users and teams in one operation
+(/) *Branch Protection* - Copy protection rules from template
+(/) *Secret Team Support* - Works with both visible and secret teams
+(/) *Dry Run Mode* - Preview changes before applying
+(/) *Enterprise Compatible* - Optimized for GitHub Enterprise
+{tip}
+
+-----
+
+h2. Quick Start
+
+h3. 1. Prerequisites
+
+- GitHub Enterprise access
+- Personal Access Token with scopes:
+  ** {{repo}} (full control of repositories)
+  ** {{admin:org}} (manage organization teams)
+- Self-hosted runner with label: {{enterprise}}
+
+h3. 2. Add Workflow to Your Repository
+
+Save this workflow as: {{.github/workflows/repo-management.yml}}
+
+h3. 3. Run the Workflow
+
+# Go to *Actions* → *GitHub Repository Management*
+
+# Click *Run workflow*
+
+# Fill in the required inputs (see below)
+
+# Click *Run workflow*
+
+-----
+
+h2. Input Parameters
+
+h3. Required Inputs
+
+||Parameter||Description||Example||
+|{{operation}}|What action to perform|{{create-repo-full}}|
+|{{target_repo}}|Target repository in org/repo-name format|{{XXX/my-new-repo}}|
+
+h3. Optional Inputs
+
+||Parameter||Description||Default||Example||
+|{{template_repo}}|Source repository to copy from|*(empty)*|{{XXX/template-repo}}|
+|{{target_org}}|Organization name (if not in target_repo)|*(empty)*|{{XXX}}|
+|{{repo_description}}|Repository description|{{Repository created via GitHub Actions}}|{{My awesome project}}|
+|{{private_repo}}|Repository visibility|{{false}} (public)|{{true}}|
+|{{collaborators}}|Individual users to add (JSON)|{{[]}}|See Collaborators Format|
+|{{teams}}|Teams to add (JSON)|{{[]}}|See Teams Format|
+|{{dry_run}}|Preview mode (no changes made)|{{false}}|{{true}}|
+|{{force_recreate}}|Delete and recreate if exists|{{false}}|{{true}}|
+|{{github_hostname}}|GitHub Enterprise hostname|{{github.com}}|{{github.company.com}}|
+
+-----
+
+h2. Operations
+
+h3. create-repo-full
+
+{panel:title=Complete Repository Setup|borderStyle=solid|borderColor=#ccc|titleBGColor=#E6FCFF|bgColor=#FFFFFF}
+*Description:* Complete repository setup - creates repository, initializes branches, copies content, adds collaborators/teams, and applies protection rules.
+
+*What it does:*
+
+# Creates the target repository (or updates if exists)
+
+# Initializes master branch with README
+
+# Syncs content from template repository (if provided)
+
+# Creates stable and dev/initial branches
+
+# Adds collaborators and teams
+
+# Applies branch protection rules (stable requires PR approval)
+
+*Use when:* Setting up a new repository or updating an existing one.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/template-repo
+target_repo: XXX/new-project
+collaborators: [{“username”:“alice”,“permission”:“admin”}]
+teams: [{“team”:“backend-team”,“permission”:“write”}]
+{code}
+
+h3. copy-collaborators-only
+
+{panel:title=Update Access Only|borderStyle=solid|borderColor=#ccc|titleBGColor=#FFF7D6|bgColor=#FFFFFF}
+*Description:* Only updates collaborators and teams on an existing repository.
+
+*What it does:*
+
+# Adds/updates individual collaborators
+
+# Adds/updates team access
+
+*Use when:* You only need to change who has access to the repository.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: XXX/existing-repo
+teams: [{“team”:“new-team”,“permission”:“read”}]
+{code}
+
+h3. copy-protection-only
+
+{panel:title=Update Protection Rules Only|borderStyle=solid|borderColor=#ccc|titleBGColor=#F4F5F7|bgColor=#FFFFFF}
+*Description:* Only updates branch protection rules on an existing repository.
+
+*What it does:*
+
+# Copies branch protection rules from template repository
+
+# Applies to matching branches in target repository
+
+*Use when:* You need to update protection rules without changing content or access.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: copy-protection-only
+template_repo: XXX/template-repo
+target_repo: XXX/existing-repo
+{code}
+
+h3. sync-all-settings
+
+{panel:title=Sync Access and Protection|borderStyle=solid|borderColor=#ccc|titleBGColor=#E3FCEF|bgColor=#FFFFFF}
+*Description:* Updates both collaborators/teams AND branch protection rules.
+
+*What it does:*
+
+# Updates collaborators and teams
+
+# Updates branch protection rules
+
+*Use when:* You need to sync access and protection but not content.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: sync-all-settings
+template_repo: XXX/template-repo
+target_repo: XXX/existing-repo
+{code}
+
+-----
+
+h2. Input Format Examples
+
+h3. Collaborators Format
+
+Add individual users with specific permissions:
+
+{code:json}
+[
+{“username”:“alice”,“permission”:“admin”},
+{“username”:“bob”,“permission”:“write”},
+{“username”:“charlie”,“permission”:“read”}
+]
+{code}
+
+*Valid permissions:*
+
+- {{admin}} - Full access (includes settings)
+- {{write}} - Push access (can commit)
+- {{read}} - Pull access (read-only)
+
+h3. Teams Format
+
+Add teams with specific permissions:
+
+{code:json}
+[
+{“team”:“backend-team”,“permission”:“write”},
+{“team”:“frontend-team”,“permission”:“write”},
+{“team”:“qa-team”,“permission”:“read”}
+]
+{code}
+
+{info:title=Team Slug}
+*Team slug:* Use the team’s URL slug (e.g., {{backend-team}} not “Backend Team”)
+*Find team slug:* Check team URL: {{github.com/orgs/XXX/teams/backend-team}} → use {{backend-team}}
+{info}
+
+*Valid permissions:*
+
+- {{admin}} - Full access
+- {{write}} - Push access
+- {{read}} - Pull access
+
+{note}
+*Note:* Works with both visible and secret teams automatically.
+{note}
+
+-----
+
+h2. Branch Structure
+
+The workflow creates three branches:
+
+||Branch||Purpose||Protection||
+|{{master}}|Primary development branch|None by default|
+|{{stable}}|Production-ready code|*Requires PR approval*|
+|{{dev/initial}}|Feature branch base|None by default|
+
+{tip:title=Branch Protection}
+Stable branch automatically requires PR approval. Other branches inherit protection from template if configured.
+{tip}
+
+-----
+
+h2. Common Use Cases
+
+h3. Case 1: Create New Repository from Template
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/standard-template
+target_repo: XXX/new-microservice
+repo_description: Authentication microservice
+private_repo: true
+collaborators: [{“username”:“alice”,“permission”:“admin”}]
+teams: [{“team”:“backend-team”,“permission”:“write”}]
+dry_run: false
+{code}
+
+{success}*Result:* New repository with template content, team access, and protection rules.{success}
+
+h3. Case 2: Create Empty Repository
+
+{code:yaml}
+operation: create-repo-full
+target_repo: XXX/blank-project
+repo_description: New blank project
+private_repo: false
+dry_run: false
+{code}
+
+{success}*Result:* Empty repository with master/stable/dev branches and basic README.{success}
+
+h3. Case 3: Add Team to Existing Repository
+
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: XXX/existing-repo
+teams: [{“team”:“new-team”,“permission”:“read”}]
+dry_run: false
+{code}
+
+{success}*Result:* Team added without changing repository content.{success}
+
+h3. Case 4: Preview Changes (Dry Run)
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/template
+target_repo: XXX/test-repo
+dry_run: true
+{code}
+
+{info}*Result:* Shows what would be done without making changes.{info}
+
+h3. Case 5: Update Existing Repository
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/updated-template
+target_repo: XXX/existing-repo
+force_recreate: false
+dry_run: false
+{code}
+
+{success}*Result:* Updates repository with new template content, preserves existing setup.{success}
+
+-----
+
+h2. Workflow Output
+
+After completion, check the *workflow summary* for detailed results:
+
+h3. Success Indicators
+
+{panel:title=Example Success Output|borderStyle=solid|borderColor=#00875A|titleBGColor=#E3FCEF}
+{noformat}
+
+## Repository Created
+
+- Repository: XXX/my-repo
+- URL: https://github.company.com/XXX/my-repo
+
+## Branch Synchronization Status
+
+|Branch     |Status                 |
+|-----------|-----------------------|
+|master     |[OK] Created and synced|
+|stable     |[OK] Created and synced|
+|dev/initial|[OK] Created and synced|
+
+## Collaborator & Team Management
+
+|User/Team   |Type|Permission|Action    |Status      |
+|------------|----|----------|----------|------------|
+|alice       |User|admin     |ADD/UPDATE|[OK] SUCCESS|
+|backend-team|Team|write     |ADD/UPDATE|[OK] SUCCESS|
+
+## Branch Protection Management
+
+|Branch|Action |Status                    |
+|------|-------|--------------------------|
+|stable|PROTECT|[OK] SUCCESS (PR required)|
+
+Protection Summary: [OK] 1 successful, [ERROR] 0 failed
+{noformat}
+{panel}
+
+h3. Error Indicators
+
+{panel:title=Common Warnings|borderStyle=solid|borderColor=#FF991F|titleBGColor=#FFF7D6}
+{noformat}
+| backend-team | Team | write | SKIP | [WARN] Team not found in org |
+{noformat}
+
+*Common warnings:*
+
+- Team not found - Check team slug spelling
+- User suspended - User account is inactive
+- Permission denied - Token lacks required permissions
+  {panel}
+
+-----
+
+h2. Troubleshooting
+
+h3. Issue: “Team not found in org”
+
+{warning:title=Cause}
+Team slug is incorrect or team doesn’t exist.
+{warning}
+
+{tip:title=Solution}
+
+# Go to: {{https://github.company.com/orgs/XXX/teams}}
+
+# Click on your team
+
+# Check URL: {{github.company.com/orgs/XXX/teams/[THIS-IS-THE-SLUG]}}
+
+# Use the exact slug from the URL
+
+{tip}
+
+*Example:* If URL shows {{backend-developers}}, use:
+{code:json}
+{“team”:“backend-developers”,“permission”:“write”}
+{code}
+
+h3. Issue: “Repository already exists”
+
+{warning:title=Cause}
+Repository was created previously.
+{warning}
+
+{tip:title=Solutions}
+
+*Option 1:* Update existing repository (recommended)
+{code:yaml}
+force_recreate: false  # Will update without deleting
+{code}
+
+*Option 2:* Delete and recreate
+{code:yaml}
+force_recreate: true  # Attempts to delete (may be blocked by policy)
+{code}
+
+*Option 3:* Use different operation
+{code:yaml}
+operation: sync-all-settings  # Only updates settings, not content
+{code}
+{tip}
+
+h3. Issue: Branch protection fails
+
+{warning:title=Cause}
+Missing required fields in API payload.
+{warning}
+
+{tip:title=Solution}
+Already fixed in v1.5 - ensure you’re using the latest workflow version.
+{tip}
+
+h3. Issue: “403 Forbidden” or “Permission denied”
+
+{warning:title=Cause}
+Token lacks required permissions.
+{warning}
+
+{tip:title=Solution}
+Verify token has these scopes:
+
+- (/) {{repo}} (Full control of private repositories)
+- (/) {{admin:org}} (Full control of orgs and teams)
+
+*Check token:*
+
+# Go to: Settings → Developer settings → Personal access tokens
+
+# Click on your token
+
+# Verify scopes are checked
+
+{tip}
+
+-----
+
+h2. Security Notes
+
+h3. Token Security
+
+{warning:title=Important}
+*Never commit tokens to repository*
+
+- Store token in GitHub Secrets as {{GH_FUNC_TOKEN}}
+- Token should be from a service account, not personal account
+- Rotate tokens regularly (every 90 days recommended)
+  {warning}
+
+h3. Team Visibility
+
+- *Secret teams:* Automatically handled by workflow
+- *Visible teams:* Preferred for better visibility
+- Both types work - workflow detects and uses correct API
+
+h3. Repository Visibility
+
+- {{private_repo: true}} - Only org members can see
+- {{private_repo: false}} - Anyone can see (use carefully)
+
+-----
+
+h2. Limitations
+
+h3. GitHub Enterprise Restrictions
+
+Some operations may be blocked by organization policies:
+
+{note}
+
+- (x) Deleting repositories ({{force_recreate: true}} may fail)
+- (!) Adding certain teams (must be org member)
+- (!) Modifying protected branches (requires admin access)
+
+*When blocked:* Workflow continues with warnings in summary.
+{note}
+
+h3. Rate Limits
+
+{info}
+GitHub API has rate limits:
+
+- ~5,000 requests/hour for authenticated requests
+- Workflow uses ~10-20 API calls per repository
+
+*Best practice:* Don’t create more than 100 repositories per hour.
+{info}
+
+-----
+
+h2. Support
+
+h3. Getting Help
+
+# *Check workflow summary* - Look for {{[ERROR]}} or {{[WARN]}} messages
+
+# *Review troubleshooting section* - Common issues listed above
+
+# *Check workflow logs* - Look for lines starting with {{DEBUG:}}
+
+h3. Providing Feedback
+
+If you encounter issues:
+
+# Share workflow summary screenshot
+
+# Provide workflow inputs used
+
+# Include error messages from logs
+
+-----
+
+h2. Changelog
+
+h3. Version 1.5 (Current)
+
+{panel:borderColor=#00875A|titleBGColor=#E3FCEF}
+
+- (/) Fixed branch protection API payload structure
+- (/) Added support for secret/closed teams
+- (/) Added automatic permission value conversion
+- (/) Enhanced error messages and debugging
+- (/) Improved idempotency for existing repositories
+  {panel}
+
+h3. Version 1.4
+
+{panel:borderColor=#DE350B|titleBGColor=#FFEBE6}
+
+- (x) Branch protection had 422 errors (fixed in 1.5)
+- (x) Secret teams not supported (fixed in 1.5)
+  {panel}
+
+-----
+
+h2. Quick Reference Card
+
+||I want to…||Operation||Key Inputs||
+|Create new repo from template|{{create-repo-full}}|{{template_repo}}, {{target_repo}}|
+|Create blank repo|{{create-repo-full}}|{{target_repo}} only|
+|Add team to existing repo|{{copy-collaborators-only}}|{{target_repo}}, {{teams}}|
+|Update branch protection|{{copy-protection-only}}|{{template_repo}}, {{target_repo}}|
+|Preview changes first|Any operation|{{dry_run: true}}|
+|Update existing repo|{{create-repo-full}}|{{force_recreate: false}}|
+
+-----
+
+{info:title=Document Info}
+*Last Updated:* 2024
+*Workflow File:* {{.github/workflows/repo-management.yml}}
+*Questions?* Contact your DevOps team
+{info}
+
+
+
+-----
+
+# GitHub Repository Management Workflow
+
+> Automated repository creation and management for GitHub Enterprise
+
+**Version:** 1.5 | **Status:** <span style="color:green">**Production Ready ✅**</span>
+
+-----
+
+## What This Workflow Does
+
+Automates complete GitHub repository setup in one action:
+
+- ✅ Creates repositories from templates
+- ✅ Initializes branches (master, stable, dev/initial)
+- ✅ Manages user and team access
+- ✅ Applies branch protection rules
+
+-----
+
+## Quick Start
+
+### Prerequisites
+
+1. GitHub Enterprise access
+1. Token with scopes: `repo`, `admin:org`
+1. Self-hosted runner with label: `enterprise`
+
+### Run the Workflow
+
+1. Go to **Actions** → **GitHub Repository Management**
+1. Click **Run workflow**
+1. Enter inputs (see below)
+1. Click **Run workflow**
+
+-----
+
+## Input Parameters
+
+### Required
+
+|Parameter    |Description      |Example            |
+|-------------|-----------------|-------------------|
+|`operation`  |Action to perform|`create-repo-full` |
+|`target_repo`|Target repository|`myorg/my-new-repo`|
+
+### Optional
+
+|Parameter         |Description      |Default       |Example                                      |
+|------------------|-----------------|--------------|---------------------------------------------|
+|`template_repo`   |Source repository|*(none)*      |`myorg/template`                             |
+|`repo_description`|Description      |Auto-generated|`My project`                                 |
+|`private_repo`    |Make private     |`false`       |`true`                                       |
+|`collaborators`   |Users (JSON)     |`[]`          |`[{"username":"alice","permission":"admin"}]`|
+|`teams`           |Teams (JSON)     |`[]`          |`[{"team":"backend","permission":"write"}]`  |
+|`dry_run`         |Preview only     |`false`       |`true`                                       |
+
+-----
+
+## Operations
+
+### create-repo-full
+
+**Complete setup:** Creates repo, syncs content, adds access, applies protection
+
+**Example:**
+
+```yaml
+operation: create-repo-full
+template_repo: myorg/template
+target_repo: myorg/new-service
+teams: [{"team":"backend","permission":"write"}]
+```
+
+### copy-collaborators-only
+
+**Update access only:** Adds/updates users and teams
+
+**Example:**
+
+```yaml
+operation: copy-collaborators-only
+target_repo: myorg/existing-repo
+teams: [{"team":"qa","permission":"read"}]
+```
+
+### copy-protection-only
+
+**Update protection only:** Copies branch protection from template
+
+**Example:**
+
+```yaml
+operation: copy-protection-only
+template_repo: myorg/template
+target_repo: myorg/existing-repo
+```
+
+### sync-all-settings
+
+**Update access + protection:** Both collaborators and protection rules
+
+-----
+
+## Input Formats
+
+### Collaborators
+
+```json
+[
+  {"username":"alice","permission":"admin"},
+  {"username":"bob","permission":"write"}
+]
+```
+
+**Permissions:** `admin`, `write`, `read`
+
+### Teams
+
+```json
+[
+  {"team":"backend-team","permission":"write"},
+  {"team":"qa-team","permission":"read"}
+]
+```
+
+**Team slug:** Use URL slug (e.g., `backend-team` from `/teams/backend-team`)
+
+**Permissions:** `admin`, `write`, `read`
+
+> **Note:** Works with both visible and secret teams
+
+-----
+
+## Common Examples
+
+### Create New Repo from Template
+
+```yaml
+operation: create-repo-full
+template_repo: myorg/api-template
+target_repo: myorg/auth-service
+repo_description: Authentication API
+private_repo: true
+teams: [{"team":"backend","permission":"write"}]
+collaborators: [{"username":"alice","permission":"admin"}]
+```
+
+### Add Team to Existing Repo
+
+```yaml
+operation: copy-collaborators-only
+target_repo: myorg/existing-repo
+teams: [{"team":"new-team","permission":"read"}]
+```
+
+### Preview Changes (Dry Run)
+
+```yaml
+operation: create-repo-full
+template_repo: myorg/template
+target_repo: myorg/test-repo
+dry_run: true
+```
+
+-----
+
+## Branch Structure
+
+The workflow creates three branches:
+
+|Branch       |Purpose            |Protection              |
+|-------------|-------------------|------------------------|
+|`master`     |Main development   |None                    |
+|`stable`     |Production releases|**PR approval required**|
+|`dev/initial`|Feature base       |None                    |
+
+-----
+
+## Understanding the Output
+
+### Success Example
+
+```
+## Repository Created
+- Repository: myorg/my-repo
+- URL: https://github.company.com/myorg/my-repo
+
+## Collaborator & Team Management
+| User/Team  | Type | Permission | Status      |
+|------------|------|------------|-------------|
+| alice      | User | admin      | [OK] SUCCESS|
+| backend    | Team | write      | [OK] SUCCESS|
+
+## Branch Protection Management
+| Branch | Action  | Status                     |
+|--------|---------|----------------------------|
+| stable | PROTECT | [OK] SUCCESS (PR required) |
+```
+
+### Warning Example
+
+```
+| backend | Team | write | SKIP | [WARN] Team not found in org |
+```
+
+-----
+
+## Troubleshooting
+
+### “Team not found in org”
+
+**Cause:** Wrong team slug
+
+**Fix:** Check team URL for exact slug
+
+```
+URL: github.com/orgs/myorg/teams/backend-developers
+Use: "backend-developers" (not "Backend Developers")
+```
+
+### “Repository already exists”
+
+**Fix Option 1:** Update without deleting (recommended)
+
+```yaml
+force_recreate: false
+```
+
+**Fix Option 2:** Delete and recreate (may be blocked)
+
+```yaml
+force_recreate: true
+```
+
+### “403 Forbidden”
+
+**Cause:** Token lacks permissions
+
+**Fix:** Verify token has `repo` and `admin:org` scopes
+
+-----
+
+## Security Best Practices
+
+⚠️ **Token Security**
+
+- Store token in GitHub Secrets as `GH_FUNC_TOKEN`
+- Use service account, not personal token
+- Rotate every 90 days
+
+🔒 **Repository Visibility**
+
+- `private_repo: true` = Org members only
+- `private_repo: false` = Public (use carefully)
+
+-----
+
+## Limitations
+
+- Organization policies may block repository deletion
+- Rate limit: ~5,000 API calls/hour
+- Don’t create >100 repositories/hour
+
+-----
+
+## Quick Reference
+
+|Task                  |Operation                |Key Parameters                |
+|----------------------|-------------------------|------------------------------|
+|New repo from template|`create-repo-full`       |`template_repo`, `target_repo`|
+|Blank repo            |`create-repo-full`       |`target_repo` only            |
+|Add team access       |`copy-collaborators-only`|`teams`                       |
+|Update protection     |`copy-protection-only`   |`template_repo`               |
+|Preview first         |Any                      |`dry_run: true`               |
+
+-----
+
+## Support
+
+**Issues?**
+
+1. Check workflow summary for errors
+1. Review logs for `DEBUG:` messages
+1. See troubleshooting section above
+
+**Contact:** Your DevOps team
+
+-----
+
+**Workflow File:** `.github/workflows/repo-management.yml`  
+**Version:** 1.5  
+**Last Updated:** 2024
+
+
+
+----
+
+h1. GitHub Repository Management Workflow
+
+*Version:* 1.5
+*Status:* {status:colour=Green|title=Production Ready|subtle=false}
+*Platform:* GitHub Enterprise
+
+-----
+
+h2. Overview
+
+This workflow automates the complete setup and management of GitHub repositories, including:
+
+- Repository creation
+- Branch initialization (master, stable, dev/initial)
+- Content synchronization from template repositories
+- Collaborator and team access management
+- Branch protection rules
+
+h3. Features
+
+{tip}
+(/) *Idempotent* - Safe to run multiple times
+(/) *Template Support* - Clone from existing repositories
+(/) *Multi-Branch* - Automatically creates master, stable, and dev/initial branches
+(/) *Access Control* - Manage users and teams in one operation
+(/) *Branch Protection* - Copy protection rules from template
+(/) *Secret Team Support* - Works with both visible and secret teams
+(/) *Dry Run Mode* - Preview changes before applying
+(/) *Enterprise Compatible* - Optimized for GitHub Enterprise
+{tip}
+
+-----
+
+h2. Quick Start
+
+h3. 1. Prerequisites
+
+- GitHub Enterprise access
+- Personal Access Token with scopes:
+  ** {{repo}} (full control of repositories)
+  ** {{admin:org}} (manage organization teams)
+- Self-hosted runner with label: {{enterprise}}
+
+h3. 2. Add Workflow to Your Repository
+
+Save this workflow as: {{.github/workflows/repo-management.yml}}
+
+h3. 3. Run the Workflow
+
+# Go to *Actions* → *GitHub Repository Management*
+
+# Click *Run workflow*
+
+# Fill in the required inputs (see below)
+
+# Click *Run workflow*
+
+-----
+
+h2. Input Parameters
+
+h3. Required Inputs
+
+||Parameter||Description||Example||
+|{{operation}}|What action to perform|{{create-repo-full}}|
+|{{target_repo}}|Target repository in org/repo-name format|{{XXX/my-new-repo}}|
+
+h3. Optional Inputs
+
+||Parameter||Description||Default||Example||
+|{{template_repo}}|Source repository to copy from|*(empty)*|{{XXX/template-repo}}|
+|{{target_org}}|Organization name (if not in target_repo)|*(empty)*|{{XXX}}|
+|{{repo_description}}|Repository description|{{Repository created via GitHub Actions}}|{{My awesome project}}|
+|{{private_repo}}|Repository visibility|{{false}} (public)|{{true}}|
+|{{collaborators}}|Individual users to add (JSON)|{{[]}}|See Collaborators Format|
+|{{teams}}|Teams to add (JSON)|{{[]}}|See Teams Format|
+|{{dry_run}}|Preview mode (no changes made)|{{false}}|{{true}}|
+|{{force_recreate}}|Delete and recreate if exists|{{false}}|{{true}}|
+|{{github_hostname}}|GitHub Enterprise hostname|{{github.com}}|{{github.company.com}}|
+
+-----
+
+h2. Operations
+
+h3. create-repo-full
+
+{panel:title=Complete Repository Setup|borderStyle=solid|borderColor=#ccc|titleBGColor=#E6FCFF|bgColor=#FFFFFF}
+*Description:* Complete repository setup - creates repository, initializes branches, copies content, adds collaborators/teams, and applies protection rules.
+
+*What it does:*
+
+# Creates the target repository (or updates if exists)
+
+# Initializes master branch with README
+
+# Syncs content from template repository (if provided)
+
+# Creates stable and dev/initial branches
+
+# Adds collaborators and teams
+
+# Applies branch protection rules (stable requires PR approval)
+
+*Use when:* Setting up a new repository or updating an existing one.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/template-repo
+target_repo: XXX/new-project
+collaborators: [{“username”:“alice”,“permission”:“admin”}]
+teams: [{“team”:“backend-team”,“permission”:“write”}]
+{code}
+
+h3. copy-collaborators-only
+
+{panel:title=Update Access Only|borderStyle=solid|borderColor=#ccc|titleBGColor=#FFF7D6|bgColor=#FFFFFF}
+*Description:* Only updates collaborators and teams on an existing repository.
+
+*What it does:*
+
+# Adds/updates individual collaborators
+
+# Adds/updates team access
+
+*Use when:* You only need to change who has access to the repository.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: XXX/existing-repo
+teams: [{“team”:“new-team”,“permission”:“read”}]
+{code}
+
+h3. copy-protection-only
+
+{panel:title=Update Protection Rules Only|borderStyle=solid|borderColor=#ccc|titleBGColor=#F4F5F7|bgColor=#FFFFFF}
+*Description:* Only updates branch protection rules on an existing repository.
+
+*What it does:*
+
+# Copies branch protection rules from template repository
+
+# Applies to matching branches in target repository
+
+*Use when:* You need to update protection rules without changing content or access.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: copy-protection-only
+template_repo: XXX/template-repo
+target_repo: XXX/existing-repo
+{code}
+
+h3. sync-all-settings
+
+{panel:title=Sync Access and Protection|borderStyle=solid|borderColor=#ccc|titleBGColor=#E3FCEF|bgColor=#FFFFFF}
+*Description:* Updates both collaborators/teams AND branch protection rules.
+
+*What it does:*
+
+# Updates collaborators and teams
+
+# Updates branch protection rules
+
+*Use when:* You need to sync access and protection but not content.
+{panel}
+
+*Example:*
+{code:yaml}
+operation: sync-all-settings
+template_repo: XXX/template-repo
+target_repo: XXX/existing-repo
+{code}
+
+-----
+
+h2. Input Format Examples
+
+h3. Collaborators Format
+
+Add individual users with specific permissions:
+
+{code:json}
+[
+{“username”:“alice”,“permission”:“admin”},
+{“username”:“bob”,“permission”:“write”},
+{“username”:“charlie”,“permission”:“read”}
+]
+{code}
+
+*Valid permissions:*
+
+- {{admin}} - Full access (includes settings)
+- {{write}} - Push access (can commit)
+- {{read}} - Pull access (read-only)
+
+h3. Teams Format
+
+Add teams with specific permissions:
+
+{code:json}
+[
+{“team”:“backend-team”,“permission”:“write”},
+{“team”:“frontend-team”,“permission”:“write”},
+{“team”:“qa-team”,“permission”:“read”}
+]
+{code}
+
+{info:title=Team Slug}
+*Team slug:* Use the team’s URL slug (e.g., {{backend-team}} not “Backend Team”)
+*Find team slug:* Check team URL: {{github.com/orgs/XXX/teams/backend-team}} → use {{backend-team}}
+{info}
+
+*Valid permissions:*
+
+- {{admin}} - Full access
+- {{write}} - Push access
+- {{read}} - Pull access
+
+{note}
+*Note:* Works with both visible and secret teams automatically.
+{note}
+
+-----
+
+h2. Branch Structure
+
+The workflow creates three branches:
+
+||Branch||Purpose||Protection||
+|{{master}}|Primary development branch|None by default|
+|{{stable}}|Production-ready code|*Requires PR approval*|
+|{{dev/initial}}|Feature branch base|None by default|
+
+{tip:title=Branch Protection}
+Stable branch automatically requires PR approval. Other branches inherit protection from template if configured.
+{tip}
+
+-----
+
+h2. Common Use Cases
+
+h3. Case 1: Create New Repository from Template
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/standard-template
+target_repo: XXX/new-microservice
+repo_description: Authentication microservice
+private_repo: true
+collaborators: [{“username”:“alice”,“permission”:“admin”}]
+teams: [{“team”:“backend-team”,“permission”:“write”}]
+dry_run: false
+{code}
+
+{success}*Result:* New repository with template content, team access, and protection rules.{success}
+
+h3. Case 2: Create Empty Repository
+
+{code:yaml}
+operation: create-repo-full
+target_repo: XXX/blank-project
+repo_description: New blank project
+private_repo: false
+dry_run: false
+{code}
+
+{success}*Result:* Empty repository with master/stable/dev branches and basic README.{success}
+
+h3. Case 3: Add Team to Existing Repository
+
+{code:yaml}
+operation: copy-collaborators-only
+target_repo: XXX/existing-repo
+teams: [{“team”:“new-team”,“permission”:“read”}]
+dry_run: false
+{code}
+
+{success}*Result:* Team added without changing repository content.{success}
+
+h3. Case 4: Preview Changes (Dry Run)
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/template
+target_repo: XXX/test-repo
+dry_run: true
+{code}
+
+{info}*Result:* Shows what would be done without making changes.{info}
+
+h3. Case 5: Update Existing Repository
+
+{code:yaml}
+operation: create-repo-full
+template_repo: XXX/updated-template
+target_repo: XXX/existing-repo
+force_recreate: false
+dry_run: false
+{code}
+
+{success}*Result:* Updates repository with new template content, preserves existing setup.{success}
+
+-----
+
+h2. Workflow Output
+
+After completion, check the *workflow summary* for detailed results:
+
+h3. Success Indicators
+
+{panel:title=Example Success Output|borderStyle=solid|borderColor=#00875A|titleBGColor=#E3FCEF}
+{noformat}
+
+## Repository Created
+
+- Repository: XXX/my-repo
+- URL: https://github.company.com/XXX/my-repo
+
+## Branch Synchronization Status
+
+|Branch     |Status                 |
+|-----------|-----------------------|
+|master     |[OK] Created and synced|
+|stable     |[OK] Created and synced|
+|dev/initial|[OK] Created and synced|
+
+## Collaborator & Team Management
+
+|User/Team   |Type|Permission|Action    |Status      |
+|------------|----|----------|----------|------------|
+|alice       |User|admin     |ADD/UPDATE|[OK] SUCCESS|
+|backend-team|Team|write     |ADD/UPDATE|[OK] SUCCESS|
+
+## Branch Protection Management
+
+|Branch|Action |Status                    |
+|------|-------|--------------------------|
+|stable|PROTECT|[OK] SUCCESS (PR required)|
+
+Protection Summary: [OK] 1 successful, [ERROR] 0 failed
+{noformat}
+{panel}
+
+h3. Error Indicators
+
+{panel:title=Common Warnings|borderStyle=solid|borderColor=#FF991F|titleBGColor=#FFF7D6}
+{noformat}
+| backend-team | Team | write | SKIP | [WARN] Team not found in org |
+{noformat}
+
+*Common warnings:*
+
+- Team not found - Check team slug spelling
+- User suspended - User account is inactive
+- Permission denied - Token lacks required permissions
+  {panel}
+
+-----
+
+h2. Troubleshooting
+
+h3. Issue: “Team not found in org”
+
+{warning:title=Cause}
+Team slug is incorrect or team doesn’t exist.
+{warning}
+
+{tip:title=Solution}
+
+# Go to: {{https://github.company.com/orgs/XXX/teams}}
+
+# Click on your team
+
+# Check URL: {{github.company.com/orgs/XXX/teams/[THIS-IS-THE-SLUG]}}
+
+# Use the exact slug from the URL
+
+{tip}
+
+*Example:* If URL shows {{backend-developers}}, use:
+{code:json}
+{“team”:“backend-developers”,“permission”:“write”}
+{code}
+
+h3. Issue: “Repository already exists”
+
+{warning:title=Cause}
+Repository was created previously.
+{warning}
+
+{tip:title=Solutions}
+
+*Option 1:* Update existing repository (recommended)
+{code:yaml}
+force_recreate: false  # Will update without deleting
+{code}
+
+*Option 2:* Delete and recreate
+{code:yaml}
+force_recreate: true  # Attempts to delete (may be blocked by policy)
+{code}
+
+*Option 3:* Use different operation
+{code:yaml}
+operation: sync-all-settings  # Only updates settings, not content
+{code}
+{tip}
+
+h3. Issue: Branch protection fails
+
+{warning:title=Cause}
+Missing required fields in API payload.
+{warning}
+
+{tip:title=Solution}
+Already fixed in v1.5 - ensure you’re using the latest workflow version.
+{tip}
+
+h3. Issue: “403 Forbidden” or “Permission denied”
+
+{warning:title=Cause}
+Token lacks required permissions.
+{warning}
+
+{tip:title=Solution}
+Verify token has these scopes:
+
+- (/) {{repo}} (Full control of private repositories)
+- (/) {{admin:org}} (Full control of orgs and teams)
+
+*Check token:*
+
+# Go to: Settings → Developer settings → Personal access tokens
+
+# Click on your token
+
+# Verify scopes are checked
+
+{tip}
+
+-----
+
+h2. Security Notes
+
+h3. Token Security
+
+{warning:title=Important}
+*Never commit tokens to repository*
+
+- Store token in GitHub Secrets as {{GH_FUNC_TOKEN}}
+- Token should be from a service account, not personal account
+- Rotate tokens regularly (every 90 days recommended)
+  {warning}
+
+h3. Team Visibility
+
+- *Secret teams:* Automatically handled by workflow
+- *Visible teams:* Preferred for better visibility
+- Both types work - workflow detects and uses correct API
+
+h3. Repository Visibility
+
+- {{private_repo: true}} - Only org members can see
+- {{private_repo: false}} - Anyone can see (use carefully)
+
+-----
+
+h2. Limitations
+
+h3. GitHub Enterprise Restrictions
+
+Some operations may be blocked by organization policies:
+
+{note}
+
+- (x) Deleting repositories ({{force_recreate: true}} may fail)
+- (!) Adding certain teams (must be org member)
+- (!) Modifying protected branches (requires admin access)
+
+*When blocked:* Workflow continues with warnings in summary.
+{note}
+
+h3. Rate Limits
+
+{info}
+GitHub API has rate limits:
+
+- ~5,000 requests/hour for authenticated requests
+- Workflow uses ~10-20 API calls per repository
+
+*Best practice:* Don’t create more than 100 repositories per hour.
+{info}
+
+-----
+
+h2. Support
+
+h3. Getting Help
+
+# *Check workflow summary* - Look for {{[ERROR]}} or {{[WARN]}} messages
+
+# *Review troubleshooting section* - Common issues listed above
+
+# *Check workflow logs* - Look for lines starting with {{DEBUG:}}
+
+h3. Providing Feedback
+
+If you encounter issues:
+
+# Share workflow summary screenshot
+
+# Provide workflow inputs used
+
+# Include error messages from logs
+
+-----
+
+h2. Changelog
+
+h3. Version 1.5 (Current)
+
+{panel:borderColor=#00875A|titleBGColor=#E3FCEF}
+
+- (/) Fixed branch protection API payload structure
+- (/) Added support for secret/closed teams
+- (/) Added automatic permission value conversion
+- (/) Enhanced error messages and debugging
+- (/) Improved idempotency for existing repositories
+  {panel}
+
+h3. Version 1.4
+
+{panel:borderColor=#DE350B|titleBGColor=#FFEBE6}
+
+- (x) Branch protection had 422 errors (fixed in 1.5)
+- (x) Secret teams not supported (fixed in 1.5)
+  {panel}
+
+-----
+
+h2. Quick Reference Card
+
+||I want to…||Operation||Key Inputs||
+|Create new repo from template|{{create-repo-full}}|{{template_repo}}, {{target_repo}}|
+|Create blank repo|{{create-repo-full}}|{{target_repo}} only|
+|Add team to existing repo|{{copy-collaborators-only}}|{{target_repo}}, {{teams}}|
+|Update branch protection|{{copy-protection-only}}|{{template_repo}}, {{target_repo}}|
+|Preview changes first|Any operation|{{dry_run: true}}|
+|Update existing repo|{{create-repo-full}}|{{force_recreate: false}}|
+
+-----
+
+{info:title=Document Info}
+*Last Updated:* 2024
+*Workflow File:* {{.github/workflows/repo-management.yml}}
+*Questions?* Contact your DevOps team
+{info}
