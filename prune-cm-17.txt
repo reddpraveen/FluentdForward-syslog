@@ -1,3 +1,58 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cm-secret-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # Dry-run mode (set to "false" for live deletions)
+  dryRun: "true"
+  
+  # Minimum age before deletion (in days)
+  minAgeDays: "7"
+  
+  # High-volume namespace threshold
+  highVolumeThreshold: "1000"
+  
+  # Process high-volume namespaces with pagination
+  processHighVolumeNamespaces: "true"
+  
+  # Process only high-volume namespaces (for testing)
+  processOnlyHighVolume: "false"
+  
+  # Pagination limit per page
+  paginationLimit: "200"
+  
+  # *** INCLUDED NAMESPACES (WHITELIST) ***
+  # Only these namespaces will be processed
+  # Use regex patterns to match namespace names
+  # Default: Only OpenShift system and infrastructure namespaces
+  includedNamespaces: |
+    ^openshift-.*
+    ^kube-.*
+    ^openshift-monitoring$
+    ^openshift-logging$
+    ^openshift-operators$
+  
+  # Protected management labels
+  # ConfigMaps/Secrets with these labels will NOT be deleted
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+  
+  # Excluded ConfigMap names (system resources)
+  # These specific ConfigMap names will NEVER be deleted
+  excludedConfigMapNames: |
+    openshift-service-ca.crt
+    kube-root-ca.crt
+    istio-ca-root-cert
+    openshift-ca.crt
+
+
+
+---------
 apiVersion: batch/v1
 kind: CronJob
 metadata:
