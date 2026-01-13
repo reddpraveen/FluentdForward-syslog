@@ -1,5 +1,5 @@
 #!/bin/bash
-
+#
 echo "Checking dangerous ClusterRoles (licensing-related with -admin or -edit)..."
 
 oc get clusterroles -o name | grep -E 'licensing|ibm.*license' | while read cr; do
