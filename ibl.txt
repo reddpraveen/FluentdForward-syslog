@@ -1,3 +1,57 @@
+#!/bin/bash
+
+echo "Checking dangerous ClusterRoles (licensing-related with -admin or -edit)..."
+
+oc get clusterroles -o name | grep -E 'licensing|ibm.*license' | while read cr; do
+  name=$(basename "$cr")
+  if [[ "$name" == *"-admin"* || "$name" == *"-edit"* ]]; then
+    echo "DANGEROUS ClusterRole: $name"
+    # Check if bound
+    if oc get clusterrolebinding -o json | jq -r '.items[] | select(.roleRef.name == "'"$name"'") | .metadata.name' | grep -q .; then
+      echo "   BOUND! Run: oc get clusterrolebinding -o wide | grep '$name'"
+    else
+      echo "   Not bound -- safe to delete"
+    fi
+  fi
+done
+
+echo ""
+echo "Checking active risky ClusterRoleBindings..."
+
+oc get clusterrolebindings -o name | while read crb; do
+  name=$(basename "$crb")
+  role=$(oc get "$crb" -o jsonpath='{.roleRef.name}' 2>/dev/null)
+  if [[ "$role" == *"licensing"* ]] && [[ "$role" == *"-admin"* || "$role" == *"-edit"* ]]; then
+    echo "RISKY ClusterRoleBinding: $name -> Role: $role"
+    echo "   Subjects: $(oc get "$crb" -o jsonpath='{range .subjects[*]}{.kind}:{.name} {.namespace}{" | "}{end}')"
+  fi
+done
+
+echo ""
+echo "Checking dangerous namespace Roles..."
+
+oc get roles -A -o custom-columns="NS:.metadata.namespace,NAME:.metadata.name" --no-headers | while read ns name; do
+  if [[ "$name" == *"licensing"* ]] && [[ "$name" == *"-admin"* || "$name" == *"-edit"* ]]; then
+    echo "DANGEROUS Role: $ns/$name"
+    if oc get rolebinding -n "$ns" -o json | jq -r '.items[] | select(.roleRef.name == "'"$name"'") | .metadata.name' | grep -q .; then
+      echo "   Bound in namespace $ns"
+    else
+      echo "   Not bound in $ns"
+    fi
+  fi
+done
+
+echo ""
+echo "Checking active risky RoleBindings..."
+
+oc get rolebindings -A -o custom-columns="NS:.metadata.namespace,NAME:.metadata.name,ROLE:.roleRef.name" --no-headers | while read ns name role; do
+  if [[ "$role" == *"licensing"* ]] && [[ "$role" == *"-admin"* || "$role" == *"-edit"* ]]; then
+    echo "RISKY RoleBinding: $ns/$name -> Role: $role"
+    echo "   Subjects: $(oc get rolebinding -n "$ns" "$name" -o jsonpath='{range .subjects[*]}{.kind}:{.name}{" | "}{end}')"
+  fi
+done
+
+-------
 oc get clusterrole,clusterrolebinding,role,rolebinding -A -o json | \
 jq -r '
   # Define dangerous role name patterns
