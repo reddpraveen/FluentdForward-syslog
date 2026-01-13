@@ -1,5 +1,63 @@
 #!/bin/bash
 #
+PATTERN="ibm-licens"
+
+echo "=== AUDIT: All RBAC resources with '$PATTERN' in name (case-insensitive) ==="
+
+# Helper: check if name contains pattern (case-insensitive)
+matches_pattern() {
+    echo "$1" | grep -iq "$PATTERN"
+}
+
+# ---- 1. ClusterRoles ----
+echo ""
+echo "[1] Matching ClusterRoles:"
+oc get clusterroles -o name | while read cr; do
+    name=$(basename "$cr")
+    if matches_pattern "$name"; then
+        echo "  $name"
+    fi
+done
+
+# ---- 2. ClusterRoleBindings referencing matching roles ----
+echo ""
+echo "[2] Active ClusterRoleBindings to matching roles:"
+oc get clusterrolebindings -o custom-columns="NAME:.metadata.name,ROLE:.roleRef.name" --no-headers | while read binding_name role_name; do
+    if matches_pattern "$role_name"; then
+        subjects=$(oc get clusterrolebinding "$binding_name" -o jsonpath='{range .subjects[*]}{.kind}:{.name}{" "}{end}' 2>/dev/null)
+        echo "  Binding: $binding_name -> Role: $role_name | Subjects: $subjects"
+    fi
+done
+
+# ---- 3. Namespace Roles (all namespaces) ----
+echo ""
+echo "[3] Matching namespace-scoped Roles:"
+oc get roles -A -o custom-columns="NS:.metadata.namespace,NAME:.metadata.name" --no-headers | while read ns role_name; do
+    if matches_pattern "$role_name"; then
+        echo "  $ns/$role_name"
+    fi
+done
+
+# ---- 4. RoleBindings referencing matching roles ----
+echo ""
+echo "[4] Active RoleBindings to matching roles:"
+oc get rolebindings -A -o custom-columns="NS:.metadata.namespace,NAME:.metadata.name,ROLE:.roleRef.name" --no-headers | while read ns binding_name role_name; do
+    if matches_pattern "$role_name"; then
+        subjects=$(oc get rolebinding -n "$ns" "$binding_name" -o jsonpath='{range .subjects[*]}{.kind}:{.name}{" "}{end}' 2>/dev/null)
+        echo "  Binding: $ns/$binding_name -> Role: $role_name | Subjects: $subjects"
+    fi
+done
+
+echo ""
+echo "=== END ==="
+echo "Note: This includes ALL roles/bindings with 'ibm-licens' in the name,"
+echo "whether they end in -admin, -edit, -view, or have no suffix."
+
+
+========
+
+#!/bin/bash
+#
 echo "Checking dangerous ClusterRoles (licensing-related with -admin or -edit)..."
 
 oc get clusterroles -o name | grep -E 'licensing|ibm.*license' | while read cr; do
