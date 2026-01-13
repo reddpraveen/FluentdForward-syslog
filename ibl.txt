@@ -1,0 +1,30 @@
+oc get clusterrole,clusterrolebinding,role,rolebinding -A -o json | \
+jq -r '
+  # Define dangerous role name patterns
+  def is_dangerous_role($name):
+    ($name | endswith("-admin")) or
+    ($name | endswith("-edit")) or
+    ($name | test("ibm.*licensing.*admin"; "i")) or
+    ($name | test("ibm.*licensing.*edit"; "i"));
+
+  # Find all roles (ClusterRole + Role) that match dangerous pattern
+  (.items[] | select(.kind == "ClusterRole" or .kind == "Role")) as $role |
+  select(is_dangerous_role($role.metadata.name)) |
+  "\($role.kind): \($role.metadata.namespace // "cluster")/\($role.metadata.name)" |
+  @text,
+
+  # Now find any bindings (ClusterRoleBinding or RoleBinding) that reference ANY licensing-related role
+  (.items[] | select(.kind == "ClusterRoleBinding" or .kind == "RoleBinding")) as $binding |
+  ($binding.roleRef.name // "") as $rolename |
+  select(
+    ($rolename | contains("licensing")) and
+    (
+      ($rolename | endswith("-admin")) or
+      ($rolename | endswith("-edit")) or
+      ($rolename | startswith("ibm-licensing")) or
+      ($rolename | startswith("ibmlicensing"))
+    )
+  ) |
+  "\($binding.kind): \($binding.metadata.namespace // "cluster")/\($binding.metadata.name) → Role: \($rolename)" |
+  @text
+' | sort -u
