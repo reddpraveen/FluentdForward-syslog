@@ -1,5 +1,660 @@
 #!/bin/bash
 #
+# IBM Licensing RBAC Discovery Script - Ultra-Safe Version
+# Handles ALL possible null values at every level
+#
+
+set -euo pipefail
+
+# Disable colors by default for maximum compatibility
+RED=''
+GREEN=''
+YELLOW=''
+BLUE=''
+CYAN=''
+MAGENTA=''
+NC=''
+BOLD=''
+
+# Pattern to match (case-insensitive)
+PATTERN="${1:-licens}"
+
+# Output file
+OUTPUT_FILE="ibm-licensing-rbac-inventory-$(date +%Y%m%d-%H%M%S).txt"
+
+print_header() {
+    local title="$1"
+    printf "\n======================================================================\n"
+    printf "%s\n" "$title"
+    printf "======================================================================\n\n"
+}
+
+print_subheader() {
+    local title="$1"
+    printf "\n>>> %s\n\n" "$title"
+}
+
+check_oc() {
+    if ! command -v oc &> /dev/null; then
+        printf "Error: oc command not found. Please install OpenShift CLI.\n"
+        exit 1
+    fi
+}
+
+check_cluster() {
+    if ! oc whoami &> /dev/null; then
+        printf "Error: Not connected to OpenShift cluster. Please login first.\n"
+        exit 1
+    fi
+}
+
+get_timestamp() {
+    date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
+format_subject() {
+    local kind="$1"
+    local name="$2"
+    local namespace="${3:-}"
+    
+    if [[ -n "$namespace" ]]; then
+        printf "    - %s: %s (namespace: %s)\n" "$kind" "$name" "$namespace"
+    else
+        printf "    - %s: %s\n" "$kind" "$name"
+    fi
+}
+
+# Ultra-safe jq wrapper that handles all nulls
+safe_jq_length() {
+    local json="$1"
+    local field="$2"
+    echo "$json" | jq -r "if .$field and (.$field | type) == \"array\" then (.$field | length) else 0 end" 2>/dev/null || echo "0"
+}
+
+safe_jq_string() {
+    local json="$1"
+    local field="$2"
+    local default="${3:-}"
+    echo "$json" | jq -r "if .$field and (.$field | type) == \"string\" then .$field else \"$default\" end" 2>/dev/null || echo "$default"
+}
+
+safe_jq_object() {
+    local json="$1"
+    local field="$2"
+    local result
+    result=$(echo "$json" | jq -r "if .$field and (.$field | type) == \"object\" and (.$field | length) > 0 then .$field else empty end" 2>/dev/null || echo "")
+    if [[ -n "$result" && "$result" != "null" ]]; then
+        echo "$result"
+    fi
+}
+
+# Initialize
+check_oc
+check_cluster
+
+CURRENT_USER=$(oc whoami)
+CURRENT_CONTEXT=$(oc config current-context 2>/dev/null || echo "unknown")
+
+{
+    print_header "IBM LICENSING RBAC INVENTORY REPORT"
+    
+    printf "Generated: %s\n" "$(get_timestamp)"
+    printf "User: %s\n" "$CURRENT_USER"
+    printf "Context: %s\n" "$CURRENT_CONTEXT"
+    printf "Search Pattern: '%s' (case-insensitive)\n" "$PATTERN"
+    
+    # =========================================================================
+    # DISCOVER CLUSTERROLES
+    # =========================================================================
+    
+    print_header "CLUSTER-SCOPED ROLES (ClusterRole)"
+    
+    mapfile -t CLUSTERROLES < <(oc get clusterrole -o json 2>/dev/null | \
+        jq -r --arg pattern "$PATTERN" \
+        '.items[]? | select(.metadata.name | ascii_downcase | contains($pattern | ascii_downcase)) | .metadata.name' 2>/dev/null | \
+        sort || true)
+    
+    if [[ ${#CLUSTERROLES[@]} -eq 0 ]]; then
+        printf "No ClusterRoles found matching pattern '%s'\n" "$PATTERN"
+    else
+        printf "Found %d ClusterRole(s) matching pattern:\n\n" "${#CLUSTERROLES[@]}"
+        
+        printf "Operator ClusterRoles (with version hashes):\n"
+        for cr in "${CLUSTERROLES[@]}"; do
+            if [[ "$cr" =~ ^ibm-licensing-operator\.v- ]]; then
+                printf "  - %s\n" "$cr"
+            fi
+        done
+        
+        printf "\nCRD-related ClusterRoles (admin/edit/view):\n"
+        for cr in "${CLUSTERROLES[@]}"; do
+            if [[ "$cr" =~ ibmlicensing.*(admin|edit|view|crdview) ]]; then
+                printf "  - %s\n" "$cr"
+            fi
+        done
+        
+        printf "\nOLM-generated ClusterRoles:\n"
+        for cr in "${CLUSTERROLES[@]}"; do
+            if [[ "$cr" =~ ^olm\.og\.ibm-licensing ]]; then
+                printf "  - %s\n" "$cr"
+            fi
+        done
+        
+        printf "\nOther/Base ClusterRoles:\n"
+        for cr in "${CLUSTERROLES[@]}"; do
+            if [[ ! "$cr" =~ ^ibm-licensing-operator\.v- ]] && \
+               [[ ! "$cr" =~ ibmlicensing.*(admin|edit|view|crdview) ]] && \
+               [[ ! "$cr" =~ ^olm\.og\.ibm-licensing ]]; then
+                printf "  - %s\n" "$cr"
+            fi
+        done
+        
+        printf "\nDetailed Information for Each ClusterRole:\n"
+        printf "=====================================================================\n\n"
+        
+        for cr in "${CLUSTERROLES[@]}"; do
+            printf "ClusterRole: %s\n" "$cr"
+            
+            # Get full JSON once
+            cr_json=$(oc get clusterrole "$cr" -o json 2>/dev/null || echo "{}")
+            
+            # Get creation timestamp safely
+            creation=$(echo "$cr_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+            printf "  Created: %s\n" "$creation"
+            
+            # Get labels safely
+            labels=$(safe_jq_object "$cr_json" "metadata.labels")
+            if [[ -n "$labels" ]]; then
+                printf "  Labels: %s\n" "$labels"
+            fi
+            
+            # Get annotations safely
+            annotations=$(safe_jq_object "$cr_json" "metadata.annotations")
+            if [[ -n "$annotations" ]]; then
+                printf "  Annotations: %s\n" "$annotations"
+            fi
+            
+            # Get rule count safely
+            rule_count=$(safe_jq_length "$cr_json" "rules")
+            printf "  Rules: %s permission rule(s)\n" "$rule_count"
+            
+            # Show permissions with ultra-safe null handling
+            if [[ "$rule_count" -gt 0 ]]; then
+                printf "  Key Permissions:\n"
+                
+                # Process rules with maximum safety
+                echo "$cr_json" | jq -r '
+                    if .rules and (.rules | type) == "array" then
+                        .rules[] | 
+                        if . then
+                            "    * " + 
+                            (if .apiGroups and (.apiGroups | type) == "array" then (.apiGroups | join(",")) else "" end) + 
+                            " -> " + 
+                            (if .resources and (.resources | type) == "array" then (.resources | join(", ")) else "none" end) + 
+                            " [" + 
+                            (if .verbs and (.verbs | type) == "array" then (.verbs | join(", ")) else "none" end) + 
+                            "]"
+                        else
+                            empty
+                        end
+                    else
+                        empty
+                    end
+                ' 2>/dev/null | head -10 || printf "    (Unable to display permissions)\n"
+                
+                if [[ $rule_count -gt 10 ]]; then
+                    printf "    ... and %d more rule(s)\n" $((rule_count - 10))
+                fi
+            else
+                printf "  No rules defined (aggregated or empty ClusterRole)\n"
+            fi
+            
+            printf "\n"
+        done
+    fi
+    
+    # =========================================================================
+    # DISCOVER NAMESPACE-SCOPED ROLES
+    # =========================================================================
+    
+    print_header "NAMESPACE-SCOPED ROLES (Role)"
+    
+    mapfile -t ROLES_RAW < <(oc get role -A -o json 2>/dev/null | \
+        jq -r --arg pattern "$PATTERN" \
+        '.items[]? | select(.metadata.name | ascii_downcase | contains($pattern | ascii_downcase)) | .metadata.namespace + "/" + .metadata.name' 2>/dev/null | \
+        sort || true)
+    
+    if [[ ${#ROLES_RAW[@]} -eq 0 ]]; then
+        printf "No namespace-scoped Roles found matching pattern '%s'\n" "$PATTERN"
+    else
+        printf "Found %d namespace-scoped Role(s) matching pattern:\n\n" "${#ROLES_RAW[@]}"
+        
+        for role_entry in "${ROLES_RAW[@]}"; do
+            namespace="${role_entry%%/*}"
+            role="${role_entry#*/}"
+            
+            printf "Role: %s (namespace: %s)\n" "$role" "$namespace"
+            
+            # Get full JSON once
+            role_json=$(oc get role "$role" -n "$namespace" -o json 2>/dev/null || echo "{}")
+            
+            # Get creation timestamp safely
+            creation=$(echo "$role_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+            printf "  Created: %s\n" "$creation"
+            
+            # Get labels safely
+            labels=$(safe_jq_object "$role_json" "metadata.labels")
+            if [[ -n "$labels" ]]; then
+                printf "  Labels: %s\n" "$labels"
+            fi
+            
+            # Get annotations safely
+            annotations=$(safe_jq_object "$role_json" "metadata.annotations")
+            if [[ -n "$annotations" ]]; then
+                printf "  Annotations: %s\n" "$annotations"
+            fi
+            
+            # Get rule count safely
+            rule_count=$(safe_jq_length "$role_json" "rules")
+            printf "  Rules: %s permission rule(s)\n" "$rule_count"
+            
+            # Show permissions with ultra-safe null handling
+            if [[ "$rule_count" -gt 0 ]]; then
+                printf "  Key Permissions:\n"
+                
+                echo "$role_json" | jq -r '
+                    if .rules and (.rules | type) == "array" then
+                        .rules[] | 
+                        if . then
+                            "    * " + 
+                            (if .apiGroups and (.apiGroups | type) == "array" then (.apiGroups | join(",")) else "" end) + 
+                            " -> " + 
+                            (if .resources and (.resources | type) == "array" then (.resources | join(", ")) else "none" end) + 
+                            " [" + 
+                            (if .verbs and (.verbs | type) == "array" then (.verbs | join(", ")) else "none" end) + 
+                            "]"
+                        else
+                            empty
+                        end
+                    else
+                        empty
+                    end
+                ' 2>/dev/null | head -10 || printf "    (Unable to display permissions)\n"
+                
+                if [[ $rule_count -gt 10 ]]; then
+                    printf "    ... and %d more rule(s)\n" $((rule_count - 10))
+                fi
+            else
+                printf "  No rules defined (empty Role)\n"
+            fi
+            
+            printf "\n"
+        done
+    fi
+    
+    # =========================================================================
+    # DISCOVER CLUSTERROLEBINDINGS
+    # =========================================================================
+    
+    print_header "CLUSTER-SCOPED ROLE BINDINGS (ClusterRoleBinding)"
+    
+    if [[ ${#CLUSTERROLES[@]} -eq 0 ]]; then
+        printf "No ClusterRoles found, skipping ClusterRoleBinding search\n"
+    else
+        printf "Searching for ClusterRoleBindings that reference the discovered ClusterRoles...\n\n"
+        
+        binding_found=0
+        
+        for cr in "${CLUSTERROLES[@]}"; do
+            mapfile -t bindings < <(oc get clusterrolebinding -o json 2>/dev/null | \
+                jq -r --arg rolename "$cr" \
+                '.items[]? | select(.roleRef.name == $rolename and .roleRef.kind == "ClusterRole") | .metadata.name' 2>/dev/null | \
+                sort || true)
+            
+            if [[ ${#bindings[@]} -gt 0 ]]; then
+                print_subheader "ClusterRole: $cr"
+                printf "Found %d ClusterRoleBinding(s):\n\n" "${#bindings[@]}"
+                
+                for binding in "${bindings[@]}"; do
+                    printf "ClusterRoleBinding: %s\n" "$binding"
+                    
+                    binding_json=$(oc get clusterrolebinding "$binding" -o json 2>/dev/null || echo "{}")
+                    
+                    creation=$(echo "$binding_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+                    printf "  Created: %s\n" "$creation"
+                    
+                    labels=$(safe_jq_object "$binding_json" "metadata.labels")
+                    if [[ -n "$labels" ]]; then
+                        printf "  Labels: %s\n" "$labels"
+                    fi
+                    
+                    printf "  Grants ClusterRole: %s\n" "$cr"
+                    
+                    printf "  Subjects (who gets these permissions):\n"
+                    
+                    subject_count=$(safe_jq_length "$binding_json" "subjects")
+                    
+                    if [[ "$subject_count" -eq 0 ]]; then
+                        printf "    No subjects (binding is not active)\n"
+                    else
+                        echo "$binding_json" | jq -r '
+                            if .subjects and (.subjects | type) == "array" then
+                                .subjects[] | 
+                                if . then
+                                    (if .kind then .kind else "Unknown" end) + "|" +
+                                    (if .name then .name else "unknown" end) + "|" +
+                                    (if .namespace then .namespace else "" end)
+                                else
+                                    empty
+                                end
+                            else
+                                empty
+                            end
+                        ' 2>/dev/null | while IFS='|' read -r kind name ns; do
+                            format_subject "$kind" "$name" "$ns"
+                        done || printf "    (Unable to display subjects)\n"
+                    fi
+                    
+                    printf "\n"
+                    ((binding_found++))
+                done
+            fi
+        done
+        
+        if [[ $binding_found -eq 0 ]]; then
+            printf "No ClusterRoleBindings found for any of the discovered ClusterRoles\n"
+        fi
+    fi
+    
+    # =========================================================================
+    # DISCOVER ROLEBINDINGS
+    # =========================================================================
+    
+    print_header "NAMESPACE-SCOPED ROLE BINDINGS (RoleBinding)"
+    
+    if [[ ${#ROLES_RAW[@]} -eq 0 && ${#CLUSTERROLES[@]} -eq 0 ]]; then
+        printf "No Roles or ClusterRoles found, skipping RoleBinding search\n"
+    else
+        printf "Searching for RoleBindings that reference the discovered Roles or ClusterRoles...\n\n"
+        
+        binding_found=0
+        
+        # Check for RoleBindings that reference namespace-scoped Roles
+        if [[ ${#ROLES_RAW[@]} -gt 0 ]]; then
+            for role_entry in "${ROLES_RAW[@]}"; do
+                namespace="${role_entry%%/*}"
+                role="${role_entry#*/}"
+                
+                mapfile -t bindings < <(oc get rolebinding -n "$namespace" -o json 2>/dev/null | \
+                    jq -r --arg rolename "$role" \
+                    '.items[]? | select(.roleRef.name == $rolename and .roleRef.kind == "Role") | .metadata.name' 2>/dev/null | \
+                    sort || true)
+                
+                if [[ ${#bindings[@]} -gt 0 ]]; then
+                    print_subheader "Role: $role (namespace: $namespace)"
+                    printf "Found %d RoleBinding(s) in namespace %s:\n\n" "${#bindings[@]}" "$namespace"
+                    
+                    for binding in "${bindings[@]}"; do
+                        printf "RoleBinding: %s (namespace: %s)\n" "$binding" "$namespace"
+                        
+                        binding_json=$(oc get rolebinding "$binding" -n "$namespace" -o json 2>/dev/null || echo "{}")
+                        
+                        creation=$(echo "$binding_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+                        printf "  Created: %s\n" "$creation"
+                        
+                        labels=$(safe_jq_object "$binding_json" "metadata.labels")
+                        if [[ -n "$labels" ]]; then
+                            printf "  Labels: %s\n" "$labels"
+                        fi
+                        
+                        printf "  Grants Role: %s\n" "$role"
+                        
+                        printf "  Subjects (who gets these permissions):\n"
+                        
+                        subject_count=$(safe_jq_length "$binding_json" "subjects")
+                        
+                        if [[ "$subject_count" -eq 0 ]]; then
+                            printf "    No subjects (binding is not active)\n"
+                        else
+                            echo "$binding_json" | jq -r '
+                                if .subjects and (.subjects | type) == "array" then
+                                    .subjects[] | 
+                                    if . then
+                                        (if .kind then .kind else "Unknown" end) + "|" +
+                                        (if .name then .name else "unknown" end) + "|" +
+                                        (if .namespace then .namespace else "" end)
+                                    else
+                                        empty
+                                    end
+                                else
+                                    empty
+                                end
+                            ' 2>/dev/null | while IFS='|' read -r kind name ns; do
+                                format_subject "$kind" "$name" "$ns"
+                            done || printf "    (Unable to display subjects)\n"
+                        fi
+                        
+                        printf "\n"
+                        ((binding_found++))
+                    done
+                fi
+            done
+        fi
+        
+        # Check for RoleBindings that reference ClusterRoles
+        if [[ ${#CLUSTERROLES[@]} -gt 0 ]]; then
+            print_subheader "RoleBindings that reference ClusterRoles (cross-namespace grants)"
+            
+            for cr in "${CLUSTERROLES[@]}"; do
+                mapfile -t bindings_raw < <(oc get rolebinding -A -o json 2>/dev/null | \
+                    jq -r --arg rolename "$cr" \
+                    '.items[]? | select(.roleRef.name == $rolename and .roleRef.kind == "ClusterRole") | .metadata.namespace + "/" + .metadata.name' 2>/dev/null | \
+                    sort || true)
+                
+                if [[ ${#bindings_raw[@]} -gt 0 ]]; then
+                    printf "\nClusterRole: %s\n" "$cr"
+                    printf "Found %d RoleBinding(s) that reference this ClusterRole:\n\n" "${#bindings_raw[@]}"
+                    
+                    for binding_entry in "${bindings_raw[@]}"; do
+                        namespace="${binding_entry%%/*}"
+                        binding="${binding_entry#*/}"
+                        
+                        printf "RoleBinding: %s (namespace: %s)\n" "$binding" "$namespace"
+                        
+                        binding_json=$(oc get rolebinding "$binding" -n "$namespace" -o json 2>/dev/null || echo "{}")
+                        
+                        creation=$(echo "$binding_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+                        printf "  Created: %s\n" "$creation"
+                        
+                        labels=$(safe_jq_object "$binding_json" "metadata.labels")
+                        if [[ -n "$labels" ]]; then
+                            printf "  Labels: %s\n" "$labels"
+                        fi
+                        
+                        printf "  Grants ClusterRole: %s (namespace-scoped via RoleBinding)\n" "$cr"
+                        
+                        printf "  Subjects (who gets these permissions in namespace %s):\n" "$namespace"
+                        
+                        subject_count=$(safe_jq_length "$binding_json" "subjects")
+                        
+                        if [[ "$subject_count" -eq 0 ]]; then
+                            printf "    No subjects (binding is not active)\n"
+                        else
+                            echo "$binding_json" | jq -r '
+                                if .subjects and (.subjects | type) == "array" then
+                                    .subjects[] | 
+                                    if . then
+                                        (if .kind then .kind else "Unknown" end) + "|" +
+                                        (if .name then .name else "unknown" end) + "|" +
+                                        (if .namespace then .namespace else "" end)
+                                    else
+                                        empty
+                                    end
+                                else
+                                    empty
+                                end
+                            ' 2>/dev/null | while IFS='|' read -r kind name ns; do
+                                format_subject "$kind" "$name" "$ns"
+                            done || printf "    (Unable to display subjects)\n"
+                        fi
+                        
+                        printf "\n"
+                        ((binding_found++))
+                    done
+                fi
+            done
+        fi
+        
+        if [[ $binding_found -eq 0 ]]; then
+            printf "No RoleBindings found for any of the discovered Roles or ClusterRoles\n"
+        fi
+    fi
+    
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    
+    print_header "SUMMARY"
+    
+    printf "Search Pattern: %s (case-insensitive)\n\n" "$PATTERN"
+    
+    printf "Resources Found:\n"
+    printf "  * ClusterRoles: %d\n" "${#CLUSTERROLES[@]}"
+    printf "  * Namespace-scoped Roles: %d\n" "${#ROLES_RAW[@]}"
+    
+    # Count total bindings safely
+    total_crb=0
+    if [[ ${#CLUSTERROLES[@]} -gt 0 ]]; then
+        total_crb=$(oc get clusterrolebinding -o json 2>/dev/null | \
+            jq --argjson roles "$(printf '%s\n' "${CLUSTERROLES[@]}" | jq -R . | jq -s . 2>/dev/null || echo '[]')" \
+            '[.items[]? | select(.roleRef.kind == "ClusterRole" and ([.roleRef.name] | inside($roles)))] | length' 2>/dev/null || echo "0")
+    fi
+    
+    total_rb=0
+    for role_entry in "${ROLES_RAW[@]}"; do
+        namespace="${role_entry%%/*}"
+        role="${role_entry#*/}"
+        count=$(oc get rolebinding -n "$namespace" -o json 2>/dev/null | \
+            jq --arg rolename "$role" \
+            '[.items[]? | select(.roleRef.name == $rolename and .roleRef.kind == "Role")] | length' 2>/dev/null || echo "0")
+        total_rb=$((total_rb + count))
+    done
+    
+    total_rb_to_cr=0
+    if [[ ${#CLUSTERROLES[@]} -gt 0 ]]; then
+        total_rb_to_cr=$(oc get rolebinding -A -o json 2>/dev/null | \
+            jq --argjson roles "$(printf '%s\n' "${CLUSTERROLES[@]}" | jq -R . | jq -s . 2>/dev/null || echo '[]')" \
+            '[.items[]? | select(.roleRef.kind == "ClusterRole" and ([.roleRef.name] | inside($roles)))] | length' 2>/dev/null || echo "0")
+    fi
+    
+    total_rb=$((total_rb + total_rb_to_cr))
+    
+    printf "  * ClusterRoleBindings: %d\n" "$total_crb"
+    printf "  * RoleBindings: %d\n" "$total_rb"
+    
+    printf "\nResource Breakdown:\n"
+    printf "  * Operator roles (with version hashes): %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -c "^ibm-licensing-operator\.v-" 2>/dev/null || echo 0)"
+    printf "  * CRD-related roles (admin/edit/view): %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -cE "ibmlicensing.*(admin|edit|view|crdview)" 2>/dev/null || echo 0)"
+    printf "  * OLM-generated roles: %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -c "^olm\.og\.ibm-licensing" 2>/dev/null || echo 0)"
+    
+    # =========================================================================
+    # TABLE SUMMARY
+    # =========================================================================
+    
+    if [[ ${#CLUSTERROLES[@]} -gt 0 ]]; then
+        print_header "CLUSTERROLE SUMMARY TABLE"
+        
+        printf "%-50s | %-40s | %-50s | %s\n" "ClusterRole" "Labels" "Permissions" "Created"
+        printf "%.50s-+-%.40s-+-%.50s-+-%s\n" "$(printf '%.0s-' {1..50})" "$(printf '%.0s-' {1..40})" "$(printf '%.0s-' {1..50})" "$(printf '%.0s-' {1..20})"
+        
+        for cr in "${CLUSTERROLES[@]}"; do
+            # Get role JSON once
+            cr_json=$(oc get clusterrole "$cr" -o json 2>/dev/null || echo "{}")
+            
+            # Get creation timestamp
+            creation=$(echo "$cr_json" | jq -r 'if .metadata.creationTimestamp then .metadata.creationTimestamp else "unknown" end' 2>/dev/null || echo "unknown")
+            
+            # Get labels - format compactly
+            labels_raw=$(echo "$cr_json" | jq -r 'if .metadata.labels and (.metadata.labels | type) == "object" then (.metadata.labels | to_entries | map("\(.key)=\(.value)") | join(", ")) else "" end' 2>/dev/null || echo "")
+            
+            # Truncate labels if too long
+            if [[ ${#labels_raw} -gt 40 ]]; then
+                labels="${labels_raw:0:37}..."
+            else
+                labels="$labels_raw"
+            fi
+            
+            # Get permissions - format as array
+            mapfile -t permissions < <(echo "$cr_json" | jq -r '
+                if .rules and (.rules | type) == "array" then
+                    .rules[] | 
+                    if . then
+                        (if .apiGroups and (.apiGroups | type) == "array" then (.apiGroups | join(",")) else "" end) + 
+                        " -> " + 
+                        (if .resources and (.resources | type) == "array" then (.resources | join(", ")) else "none" end) + 
+                        " [" + 
+                        (if .verbs and (.verbs | type) == "array" then (.verbs | join(", ")) else "none" end) + 
+                        "]"
+                    else
+                        empty
+                    end
+                else
+                    empty
+                end
+            ' 2>/dev/null || echo "")
+            
+            # If no permissions, show placeholder
+            if [[ ${#permissions[@]} -eq 0 ]]; then
+                permissions=("(no rules)")
+            fi
+            
+            # Truncate role name if too long
+            if [[ ${#cr} -gt 50 ]]; then
+                cr_display="${cr:0:47}..."
+            else
+                cr_display="$cr"
+            fi
+            
+            # Print first row with all columns
+            perm_first="${permissions[0]}"
+            if [[ ${#perm_first} -gt 50 ]]; then
+                perm_first="${perm_first:0:47}..."
+            fi
+            
+            printf "%-50s | %-40s | %-50s | %s\n" "$cr_display" "$labels" "$perm_first" "$creation"
+            
+            # Print remaining permission rows (if any) with empty ClusterRole, Labels, and Created columns
+            for ((i=1; i<${#permissions[@]}; i++)); do
+                perm="${permissions[$i]}"
+                if [[ ${#perm} -gt 50 ]]; then
+                    perm="${perm:0:47}..."
+                fi
+                printf "%-50s | %-40s | %-50s | %s\n" "" "" "$perm" ""
+            done
+        done
+        
+        printf "\n"
+    fi
+    
+    printf "Discovery complete!\n"
+    printf "Report generated at: %s\n\n" "$(get_timestamp)"
+    
+} | tee "$OUTPUT_FILE"
+
+printf "\n======================================================================\n"
+printf "Report saved to: %s\n" "$OUTPUT_FILE"
+printf "======================================================================\n\n"
+
+printf "TIP: To search for a more specific pattern, run:\n"
+printf "     %s \"ibm-licensing-operator\"  (for exact operator roles)\n" "$0"
+printf "     %s \"ibmlicensing\"            (for CRD-related roles)\n" "$0"
+printf "     %s \"licens\"                  (default - catches everything)\n\n" "$0"
+
+
+
+===================
+#!/bin/bash
+#
 # IBM Licensing RBAC Discovery Script for OpenShift 4.16 (Flexible Pattern)
 # 
 # Purpose: Discover all RBAC resources (ClusterRole, Role, ClusterRoleBinding, RoleBinding)
