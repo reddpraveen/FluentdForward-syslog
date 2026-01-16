@@ -1,0 +1,108 @@
+#!/bin/bash
+#
+# IBM Licensing RBAC Discovery Script - Table Version
+# This version generates the table right after ClusterRole discovery
+#
+
+set -euo pipefail
+
+PATTERN="${1:-licens}"
+OUTPUT_FILE="ibm-licensing-rbac-inventory-$(date +%Y%m%d-%H%M%S).txt"
+
+echo "Searching for ClusterRoles matching pattern: $PATTERN"
+echo ""
+
+# Get ClusterRoles
+mapfile -t CLUSTERROLES < <(oc get clusterrole -o json 2>/dev/null | \
+    jq -r --arg pattern "$PATTERN" \
+    '.items[]? | select(.metadata.name | ascii_downcase | contains($pattern | ascii_downcase)) | .metadata.name' 2>/dev/null | \
+    sort || true)
+
+echo "Found ${#CLUSTERROLES[@]} ClusterRoles"
+echo ""
+
+if [[ ${#CLUSTERROLES[@]} -eq 0 ]]; then
+    echo "ERROR: No ClusterRoles found matching pattern '$PATTERN'"
+    echo "Try: oc get clusterroles | grep -i $PATTERN"
+    exit 1
+fi
+
+echo "Generating table..."
+echo ""
+
+# Print table header
+printf "%-50s | %-40s | %-50s | %s\n" "ClusterRole" "Labels" "Permissions" "Created"
+printf "%.50s-+-%.40s-+-%.50s-+-%s\n" "$(printf '%.0s-' {1..50})" "$(printf '%.0s-' {1..40})" "$(printf '%.0s-' {1..50})" "$(printf '%.0s-' {1..20})"
+
+# Process each ClusterRole
+for cr in "${CLUSTERROLES[@]}"; do
+    echo "  Processing: $cr" >&2
+    
+    # Get role JSON
+    cr_json=$(oc get clusterrole "$cr" -o json 2>/dev/null || echo "{}")
+    
+    if [[ "$cr_json" == "{}" ]]; then
+        printf "%-50s | %-40s | %-50s | %s\n" "$cr" "ERROR: Unable to fetch" "" ""
+        continue
+    fi
+    
+    # Get creation timestamp
+    creation=$(echo "$cr_json" | jq -r '.metadata.creationTimestamp // "unknown"' 2>/dev/null || echo "unknown")
+    
+    # Get labels - simplified
+    labels_json=$(echo "$cr_json" | jq -r '.metadata.labels // {}' 2>/dev/null || echo "{}")
+    if [[ "$labels_json" != "{}" ]]; then
+        labels=$(echo "$labels_json" | jq -r 'to_entries | map("\(.key)=\(.value)") | join(", ")' 2>/dev/null || echo "")
+        if [[ ${#labels} -gt 40 ]]; then
+            labels="${labels:0:37}..."
+        fi
+    else
+        labels=""
+    fi
+    
+    # Get permissions - one rule at a time
+    rule_count=$(echo "$cr_json" | jq -r 'if .rules then (.rules | length) else 0 end' 2>/dev/null || echo "0")
+    
+    if [[ $rule_count -eq 0 ]]; then
+        # No rules - print single row
+        if [[ ${#cr} -gt 50 ]]; then
+            cr_display="${cr:0:47}..."
+        else
+            cr_display="$cr"
+        fi
+        printf "%-50s | %-40s | %-50s | %s\n" "$cr_display" "$labels" "(no rules)" "$creation"
+    else
+        # Has rules - print multiple rows
+        if [[ ${#cr} -gt 50 ]]; then
+            cr_display="${cr:0:47}..."
+        else
+            cr_display="$cr"
+        fi
+        
+        first_row=1
+        for ((i=0; i<rule_count; i++)); do
+            # Get individual rule components
+            apigroups=$(echo "$cr_json" | jq -r ".rules[$i].apiGroups // [] | join(\",\")" 2>/dev/null || echo "")
+            resources=$(echo "$cr_json" | jq -r ".rules[$i].resources // [] | join(\", \")" 2>/dev/null || echo "none")
+            verbs=$(echo "$cr_json" | jq -r ".rules[$i].verbs // [] | join(\", \")" 2>/dev/null || echo "none")
+            
+            perm="${apigroups} -> ${resources} [${verbs}]"
+            if [[ ${#perm} -gt 50 ]]; then
+                perm="${perm:0:47}..."
+            fi
+            
+            if [[ $first_row -eq 1 ]]; then
+                # First row - show all columns
+                printf "%-50s | %-40s | %-50s | %s\n" "$cr_display" "$labels" "$perm" "$creation"
+                first_row=0
+            else
+                # Subsequent rows - empty first 3 columns
+                printf "%-50s | %-40s | %-50s | %s\n" "" "" "$perm" ""
+            fi
+        done
+    fi
+done
+
+echo ""
+echo "Table generation complete!"
+echo "Total ClusterRoles: ${#CLUSTERROLES[@]}"
