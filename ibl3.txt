@@ -1,5 +1,93 @@
 #!/bin/bash
 #
+# IBM Licensing RBAC Discovery Script - CSV Export (Full Data)
+#
+
+set -euo pipefail
+
+PATTERN="${1:-licens}"
+OUTPUT_FILE="ibm-licensing-rbac-table-$(date +%Y%m%d-%H%M%S).csv"
+
+{
+# CSV Header
+echo "ClusterRole,Created,Labels,Rule_Number,API_Groups,Resources,Verbs"
+
+# Get ClusterRoles
+mapfile -t CLUSTERROLES < <(oc get clusterrole -o json 2>/dev/null | \
+    jq -r --arg pattern "$PATTERN" \
+    '.items[]? | select(.metadata.name | ascii_downcase | contains($pattern | ascii_downcase)) | .metadata.name' 2>/dev/null | \
+    sort || true)
+
+if [[ ${#CLUSTERROLES[@]} -eq 0 ]]; then
+    echo "ERROR: No ClusterRoles found" >&2
+    exit 1
+fi
+
+# Process each ClusterRole
+for cr in "${CLUSTERROLES[@]}"; do
+    # Get role JSON
+    cr_json=$(oc get clusterrole "$cr" -o json 2>/dev/null || echo "{}")
+    
+    if [[ "$cr_json" == "{}" ]]; then
+        echo "\"$cr\",\"ERROR\",\"Unable to fetch\",\"\",\"\",\"\",\"\""
+        continue
+    fi
+    
+    # Get creation timestamp
+    creation=$(echo "$cr_json" | jq -r '.metadata.creationTimestamp // "unknown"' 2>/dev/null || echo "unknown")
+    
+    # Get labels - as comma-separated key=value pairs
+    labels=$(echo "$cr_json" | jq -r 'if .metadata.labels then (.metadata.labels | to_entries | map("\(.key)=\(.value)") | join("; ")) else "" end' 2>/dev/null || echo "")
+    
+    # Get rule count
+    rule_count=$(echo "$cr_json" | jq -r 'if .rules then (.rules | length) else 0 end' 2>/dev/null || echo "0")
+    
+    if [[ $rule_count -eq 0 ]]; then
+        # No rules
+        echo "\"$cr\",\"$creation\",\"$labels\",\"0\",\"(no rules)\",\"\",\"\""
+    else
+        # Process each rule
+        for ((i=0; i<rule_count; i++)); do
+            # Get components
+            apigroups=$(echo "$cr_json" | jq -r ".rules[$i].apiGroups // [] | join(\"; \")" 2>/dev/null || echo "")
+            resources=$(echo "$cr_json" | jq -r ".rules[$i].resources // [] | join(\"; \")" 2>/dev/null || echo "")
+            verbs=$(echo "$cr_json" | jq -r ".rules[$i].verbs // [] | join(\"; \")" 2>/dev/null || echo "")
+            
+            # First rule includes role name, creation, and labels
+            # Subsequent rules have empty first 3 columns
+            if [[ $i -eq 0 ]]; then
+                echo "\"$cr\",\"$creation\",\"$labels\",\"$((i+1))\",\"$apigroups\",\"$resources\",\"$verbs\""
+            else
+                echo "\"\",\"\",\"\",\"$((i+1))\",\"$apigroups\",\"$resources\",\"$verbs\""
+            fi
+        done
+    fi
+done
+
+} > "$OUTPUT_FILE"
+
+echo "CSV export complete!"
+echo "File: $OUTPUT_FILE"
+echo ""
+echo "Found $(grep -cv "^$" "$OUTPUT_FILE") rows"
+echo ""
+echo "To view:"
+echo "  cat $OUTPUT_FILE"
+echo ""
+echo "To import to spreadsheet:"
+echo "  1. Open in Excel/Google Sheets"
+echo "  2. File > Import > Choose '$OUTPUT_FILE'"
+echo "  3. Delimiter: Comma"
+echo ""
+
+
+
+
+
+
+++++++++++++++++++++++++++++++++++++++++
+#!/bin/bash
+#
 # IBM Licensing RBAC Discovery Script - Full Output Table (No Truncation)
 #
 
