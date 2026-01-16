@@ -1,5 +1,155 @@
 #!/bin/bash
 #
+# IBM Licensing RBAC Discovery Script - Full Output Table (No Truncation)
+#
+
+set -euo pipefail
+
+PATTERN="${1:-licens}"
+OUTPUT_FILE="ibm-licensing-rbac-table-full-$(date +%Y%m%d-%H%M%S).txt"
+
+{
+echo "==========================================================================="
+echo "IBM LICENSING CLUSTERROLE TABLE - FULL OUTPUT (NO TRUNCATION)"
+echo "==========================================================================="
+echo ""
+echo "Pattern: $PATTERN"
+echo "Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+echo ""
+
+# Get ClusterRoles
+mapfile -t CLUSTERROLES < <(oc get clusterrole -o json 2>/dev/null | \
+    jq -r --arg pattern "$PATTERN" \
+    '.items[]? | select(.metadata.name | ascii_downcase | contains($pattern | ascii_downcase)) | .metadata.name' 2>/dev/null | \
+    sort || true)
+
+echo "Found ${#CLUSTERROLES[@]} ClusterRoles"
+echo ""
+
+if [[ ${#CLUSTERROLES[@]} -eq 0 ]]; then
+    echo "ERROR: No ClusterRoles found matching pattern '$PATTERN'"
+    exit 1
+fi
+
+echo "==========================================================================="
+echo ""
+
+# Process each ClusterRole
+for cr in "${CLUSTERROLES[@]}"; do
+    echo "ClusterRole: $cr"
+    echo "---------------------------------------------------------------------------"
+    
+    # Get role JSON
+    cr_json=$(oc get clusterrole "$cr" -o json 2>/dev/null || echo "{}")
+    
+    if [[ "$cr_json" == "{}" ]]; then
+        echo "  ERROR: Unable to fetch role"
+        echo ""
+        continue
+    fi
+    
+    # Get creation timestamp
+    creation=$(echo "$cr_json" | jq -r '.metadata.creationTimestamp // "unknown"' 2>/dev/null || echo "unknown")
+    echo "  Created: $creation"
+    
+    # Get labels - FULL output
+    labels_json=$(echo "$cr_json" | jq -r '.metadata.labels // {}' 2>/dev/null || echo "{}")
+    if [[ "$labels_json" != "{}" && "$labels_json" != "null" ]]; then
+        echo "  Labels:"
+        echo "$labels_json" | jq -r 'to_entries[] | "    - \(.key) = \(.value)"' 2>/dev/null || echo "    (unable to parse)"
+    else
+        echo "  Labels: (none)"
+    fi
+    
+    # Get annotations if they exist
+    annotations_json=$(echo "$cr_json" | jq -r '.metadata.annotations // {}' 2>/dev/null || echo "{}")
+    if [[ "$annotations_json" != "{}" && "$annotations_json" != "null" ]]; then
+        annotation_count=$(echo "$annotations_json" | jq 'length' 2>/dev/null || echo "0")
+        if [[ $annotation_count -gt 0 ]]; then
+            echo "  Annotations: ($annotation_count total)"
+            echo "$annotations_json" | jq -r 'to_entries[] | "    - \(.key) = \(.value)"' 2>/dev/null | head -5
+            if [[ $annotation_count -gt 5 ]]; then
+                echo "    ... and $((annotation_count - 5)) more"
+            fi
+        fi
+    fi
+    
+    # Get permissions - FULL output
+    rule_count=$(echo "$cr_json" | jq -r 'if .rules then (.rules | length) else 0 end' 2>/dev/null || echo "0")
+    
+    echo "  Permissions: ($rule_count rules)"
+    
+    if [[ $rule_count -eq 0 ]]; then
+        echo "    (no rules - aggregated or empty ClusterRole)"
+    else
+        for ((i=0; i<rule_count; i++)); do
+            echo "    Rule $((i+1)):"
+            
+            # Get apiGroups - FULL
+            apigroups=$(echo "$cr_json" | jq -r ".rules[$i].apiGroups // []" 2>/dev/null)
+            if [[ "$apigroups" != "[]" && "$apigroups" != "null" ]]; then
+                echo "      API Groups:"
+                echo "$apigroups" | jq -r '.[] | "        - " + .' 2>/dev/null || echo "        (unable to parse)"
+            else
+                echo "      API Groups: (core/empty)"
+            fi
+            
+            # Get resources - FULL
+            resources=$(echo "$cr_json" | jq -r ".rules[$i].resources // []" 2>/dev/null)
+            if [[ "$resources" != "[]" && "$resources" != "null" ]]; then
+                echo "      Resources:"
+                echo "$resources" | jq -r '.[] | "        - " + .' 2>/dev/null || echo "        (unable to parse)"
+            else
+                echo "      Resources: (none)"
+            fi
+            
+            # Get verbs - FULL
+            verbs=$(echo "$cr_json" | jq -r ".rules[$i].verbs // []" 2>/dev/null)
+            if [[ "$verbs" != "[]" && "$verbs" != "null" ]]; then
+                echo "      Verbs:"
+                echo "$verbs" | jq -r '.[] | "        - " + .' 2>/dev/null || echo "        (unable to parse)"
+            else
+                echo "      Verbs: (none)"
+            fi
+            
+            # Get resourceNames if present
+            resourcenames=$(echo "$cr_json" | jq -r ".rules[$i].resourceNames // []" 2>/dev/null)
+            if [[ "$resourcenames" != "[]" && "$resourcenames" != "null" ]]; then
+                echo "      Resource Names (specific):"
+                echo "$resourcenames" | jq -r '.[] | "        - " + .' 2>/dev/null
+            fi
+            
+            echo ""
+        done
+    fi
+    
+    echo ""
+    echo "==========================================================================="
+    echo ""
+done
+
+echo ""
+echo "SUMMARY"
+echo "-------"
+echo "Total ClusterRoles: ${#CLUSTERROLES[@]}"
+echo ""
+echo "Breakdown:"
+printf "  * Operator roles (with version hashes): %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -c "^ibm-licensing-operator\.v-" 2>/dev/null || echo 0)"
+printf "  * CRD-related roles (admin/edit/view): %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -cE "ibmlicensing.*(admin|edit|view|crdview)" 2>/dev/null || echo 0)"
+printf "  * OLM-generated roles: %d\n" "$(printf '%s\n' "${CLUSTERROLES[@]}" | grep -c "^olm\.og\.ibm-licensing" 2>/dev/null || echo 0)"
+echo ""
+echo "Report complete!"
+
+} | tee "$OUTPUT_FILE"
+
+echo ""
+echo "Full report saved to: $OUTPUT_FILE"
+echo ""
+
+
+-----------------------------------
+#!/bin/bash
+#
 # IBM Licensing RBAC Discovery Script - Table Version
 # This version generates the table right after ClusterRole discovery
 #
