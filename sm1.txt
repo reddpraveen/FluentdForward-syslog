@@ -1,0 +1,1093 @@
+# OpenShift Service Mesh 3.0 - Complete Installation & GitOps Guide
+
+**Last Updated:** Based on OSSM 3.0 (Istio 1.24) - January 2025
+
+This guide provides ALL required configurations for installing and managing OpenShift Service Mesh 3.0 using ArgoCD and GitOps principles.
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#architecture-overview)
+2. [Prerequisites](#prerequisites)
+3. [Step 1: Install OSSM3 Operator](#step-1-install-ossm3-operator)
+4. [Step 2: Install IstioCNI (Cluster-Wide)](#step-2-install-istiocni-cluster-wide)
+5. [Step 3: Create Control Planes](#step-3-create-control-planes)
+6. [Step 4: Namespace Enrollment](#step-4-namespace-enrollment)
+7. [Step 5: ArgoCD Integration](#step-5-argocd-integration)
+8. [Complete Git Repository Structure](#complete-git-repository-structure)
+9. [Verification Steps](#verification-steps)
+10. [Troubleshooting](#troubleshooting)
+
+---
+
+## Architecture Overview
+
+### Key Differences from OSSM 2.x
+
+| Feature | OSSM 2.x | OSSM 3.0 |
+|---------|----------|----------|
+| **Operator** | servicemeshoperator (Maistra) | sailoperator (upstream Istio) |
+| **Control Plane CRD** | ServiceMeshControlPlane | Istio |
+| **Member Enrollment** | ServiceMeshMember, ServiceMeshMemberRoll | Namespace labels + discoverySelectors |
+| **Configuration** | Custom Maistra format | Upstream Istio Helm values |
+| **CNI** | Part of control plane | Separate IstioCNI CRD (cluster-wide) |
+| **Scope** | Multi-tenant or cluster-wide | Cluster-wide (limited by discoverySelectors) |
+| **Revisions** | Not natively supported | Native revision support |
+
+### OSSM3 Components
+
+1. **Sail Operator** - Manages Istio lifecycle
+2. **IstioCNI** - Handles pod traffic redirection (cluster-wide)
+3. **Istio** - Control plane resource (one per revision)
+4. **IstioRevision** - Auto-created by operator, represents one revision
+5. **Kiali Operator** - Separate operator for UI/observability
+
+---
+
+## Prerequisites
+
+- OpenShift Container Platform 4.14+
+- Cluster admin access
+- ArgoCD/OpenShift GitOps installed
+- Git repository for configurations
+
+---
+
+## Step 1: Install OSSM3 Operator
+
+### 1.1 Operator Subscription
+
+```yaml
+# File: operators/servicemesh/subscription.yaml
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: servicemeshoperator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: servicemeshoperator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+```
+
+### 1.2 Apply Operator
+
+```bash
+oc apply -f operators/servicemesh/subscription.yaml
+```
+
+### 1.3 Verify Operator Installation
+
+```bash
+# Wait for operator to be ready
+oc get csv -n openshift-operators | grep servicemesh
+
+# Check operator pod
+oc get pods -n openshift-operators | grep sail-operator
+```
+
+**Expected Output:**
+```
+sail-operator-xxxx-yyyy   1/1     Running   0          2m
+```
+
+---
+
+## Step 2: Install IstioCNI (Cluster-Wide)
+
+### 2.1 IstioCNI Namespace
+
+```yaml
+# File: servicemesh-cni/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-cni
+  labels:
+    name: istio-cni
+```
+
+### 2.2 IstioCNI Resource
+
+```yaml
+# File: servicemesh-cni/istiocni.yaml
+apiVersion: sailoperator.io/v1alpha1
+kind: IstioCNI
+metadata:
+  name: default
+spec:
+  version: v1.24.0
+  namespace: istio-cni
+```
+
+### 2.3 Apply IstioCNI
+
+```bash
+oc apply -f servicemesh-cni/namespace.yaml
+oc apply -f servicemesh-cni/istiocni.yaml
+```
+
+### 2.4 Verify IstioCNI
+
+```bash
+# Check IstioCNI status
+oc get istiocni -A
+
+# Verify CNI DaemonSet
+oc get ds -n istio-cni
+```
+
+**Expected Output:**
+```
+NAME      STATUS    VERSION    AGE
+default   Healthy   v1.24.0    5m
+
+NAME        DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE
+istio-cni   3         3         3       3            3
+```
+
+---
+
+## Step 3: Create Control Planes
+
+### 3.1 Production Control Plane (Default Revision)
+
+#### 3.1.1 Create Namespace
+
+```yaml
+# File: controlplanes/prod-default/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system-prod
+  labels:
+    name: istio-system-prod
+    environment: production
+    mesh-tier: prod
+```
+
+#### 3.1.2 Create Istio Control Plane
+
+```yaml
+# File: controlplanes/prod-default/istio.yaml
+apiVersion: sailoperator.io/v1alpha1
+kind: Istio
+metadata:
+  name: default
+  namespace: istio-system-prod
+spec:
+  # Version of Istio to deploy
+  version: v1.24.0
+  
+  # Namespace where control plane will be deployed
+  namespace: istio-system-prod
+  
+  # Istio configuration using Helm values
+  values:
+    # Global mesh configuration
+    meshConfig:
+      # Discovery selectors - CRITICAL for namespace enrollment
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: default
+            mesh-tier: prod
+      
+      # Observability settings
+      accessLogFile: /dev/stdout
+      accessLogEncoding: JSON
+      
+      # Default tracing config
+      defaultConfig:
+        tracing:
+          sampling: 1.0  # 1% sampling for production
+      
+      # Extension providers for observability
+      extensionProviders:
+        - name: otel
+          opentelemetry:
+            port: 4317
+            service: otel-collector.istio-system-prod.svc.cluster.local
+    
+    # Global settings
+    global:
+      istioNamespace: istio-system-prod
+      
+      # Proxy settings
+      proxy:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+    
+    # Pilot (istiod) configuration
+    pilot:
+      autoscaleEnabled: true
+      autoscaleMin: 2
+      autoscaleMax: 5
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 2000m
+          memory: 2Gi
+      
+      # Pod disruption budget
+      podDisruptionBudget:
+        minAvailable: 1
+    
+    # Ingress Gateway configuration
+    gateways:
+      istio-ingressgateway:
+        enabled: true
+        autoscaleEnabled: true
+        autoscaleMin: 2
+        autoscaleMax: 5
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 2000m
+            memory: 2Gi
+        
+        # Service configuration
+        type: LoadBalancer
+        
+        # Pod anti-affinity for HA
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - istio-ingressgateway
+                topologyKey: kubernetes.io/hostname
+      
+      # Egress Gateway
+      istio-egressgateway:
+        enabled: true
+        autoscaleEnabled: false
+        replicas: 2
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+```
+
+#### 3.1.3 Network Policies (Optional but Recommended)
+
+```yaml
+# File: controlplanes/prod-default/networkpolicies.yaml
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-istiod-webhook
+  namespace: istio-system-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: istiod
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 15017  # Webhook port
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingressgateway
+  namespace: istio-system-prod
+spec:
+  podSelector:
+    matchLabels:
+      app: istio-ingressgateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - {}  # Allow all ingress
+```
+
+#### 3.1.4 Apply Production Control Plane
+
+```bash
+oc apply -f controlplanes/prod-default/namespace.yaml
+oc apply -f controlplanes/prod-default/istio.yaml
+oc apply -f controlplanes/prod-default/networkpolicies.yaml
+```
+
+#### 3.1.5 Verify Production Control Plane
+
+```bash
+# Check Istio resource
+oc get istio -n istio-system-prod
+
+# Check IstioRevision (auto-created)
+oc get istiorevision -n istio-system-prod
+
+# Check istiod pods
+oc get pods -n istio-system-prod -l app=istiod
+
+# Check ingress gateway
+oc get pods -n istio-system-prod -l app=istio-ingressgateway
+```
+
+**Expected Output:**
+```
+NAME      STATUS    VERSION    AGE
+default   Healthy   v1.24.0    5m
+
+NAME              TYPE     READY   STATUS    IN USE   VERSION    AGE
+default-v1-24-0   Local    True    Healthy   True     v1.24.0    5m
+
+NAME                      READY   STATUS    RESTARTS   AGE
+istiod-default-v1-24-0-xxxx   1/1     Running   0          5m
+
+NAME                                   READY   STATUS    RESTARTS   AGE
+istio-ingressgateway-xxxx-yyyy         1/1     Running   0          5m
+```
+
+---
+
+### 3.2 Production Canary Control Plane
+
+#### 3.2.1 Istio Canary Resource
+
+```yaml
+# File: controlplanes/prod-canary/istio.yaml
+apiVersion: sailoperator.io/v1alpha1
+kind: Istio
+metadata:
+  name: canary
+  namespace: istio-system-prod  # Same namespace as prod
+spec:
+  version: v1.24.0  # Or newer version for testing
+  namespace: istio-system-prod
+  
+  # Update strategy for canary
+  updateStrategy:
+    type: InPlace
+  
+  values:
+    # CRITICAL: Different revision name
+    revision: canary
+    
+    meshConfig:
+      # Canary control plane watches different label
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: canary
+            mesh-tier: prod
+      
+      accessLogFile: /dev/stdout
+      accessLogEncoding: JSON
+      
+      defaultConfig:
+        tracing:
+          sampling: 50.0  # Higher sampling for canary testing
+    
+    global:
+      istioNamespace: istio-system-prod
+    
+    pilot:
+      autoscaleEnabled: false
+      replicas: 1  # Single replica for canary
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+    
+    # Separate ingress gateway for canary
+    gateways:
+      istio-ingressgateway:
+        enabled: true
+        name: istio-ingressgateway-canary
+        autoscaleEnabled: false
+        replicas: 1
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+```
+
+#### 3.2.2 Apply Canary Control Plane
+
+```bash
+oc apply -f controlplanes/prod-canary/istio.yaml
+```
+
+---
+
+### 3.3 Non-Production Control Plane
+
+#### 3.3.1 Create Namespace
+
+```yaml
+# File: controlplanes/nonprod-default/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system-nonprod
+  labels:
+    name: istio-system-nonprod
+    environment: nonprod
+    mesh-tier: nonprod
+```
+
+#### 3.3.2 Istio NonProd Resource
+
+```yaml
+# File: controlplanes/nonprod-default/istio.yaml
+apiVersion: sailoperator.io/v1alpha1
+kind: Istio
+metadata:
+  name: default
+  namespace: istio-system-nonprod
+spec:
+  version: v1.24.0
+  namespace: istio-system-nonprod
+  
+  values:
+    meshConfig:
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: default
+            mesh-tier: nonprod
+      
+      accessLogFile: /dev/stdout
+      
+      defaultConfig:
+        tracing:
+          sampling: 100.0  # 100% sampling for dev/test
+    
+    global:
+      istioNamespace: istio-system-nonprod
+    
+    pilot:
+      autoscaleEnabled: false
+      replicas: 1  # Single replica for nonprod
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: 1000m
+          memory: 1Gi
+    
+    gateways:
+      istio-ingressgateway:
+        enabled: true
+        autoscaleEnabled: false
+        replicas: 1
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      
+      istio-egressgateway:
+        enabled: false  # Disabled for nonprod
+```
+
+#### 3.3.3 Apply NonProd Control Plane
+
+```bash
+oc apply -f controlplanes/nonprod-default/namespace.yaml
+oc apply -f controlplanes/nonprod-default/istio.yaml
+```
+
+---
+
+## Step 4: Namespace Enrollment
+
+### 4.1 Understanding Discovery Selectors
+
+In OSSM3, namespaces join the mesh by having **labels that match the control plane's discoverySelectors**.
+
+**Example:**
+- Control plane has: `discoverySelectors: [{matchLabels: {istio-discovery: default}}]`
+- Namespace needs: `labels: {istio-discovery: default}`
+
+### 4.2 Enroll Namespace - Production Default
+
+```yaml
+# File: namespaces/payment-app.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payment-app
+  labels:
+    # CRITICAL: Must match discoverySelector
+    istio-discovery: default
+    mesh-tier: prod
+    
+    # Additional labels
+    app-team: payments
+    environment: production
+    compliance: pci-dss
+```
+
+```bash
+oc apply -f namespaces/payment-app.yaml
+```
+
+### 4.3 Enroll Namespace - Production Canary
+
+```yaml
+# File: namespaces/inventory-app-canary.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inventory-app-canary
+  labels:
+    # Points to canary control plane
+    istio-discovery: canary
+    mesh-tier: prod
+    
+    app-team: inventory
+    environment: canary-test
+```
+
+```bash
+oc apply -f namespaces/inventory-app-canary.yaml
+```
+
+### 4.4 Enroll Namespace - NonProd
+
+```yaml
+# File: namespaces/payment-app-dev.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: payment-app-dev
+  labels:
+    istio-discovery: default
+    mesh-tier: nonprod
+    
+    app-team: payments
+    environment: development
+```
+
+```bash
+oc apply -f namespaces/payment-app-dev.yaml
+```
+
+### 4.5 Enable Sidecar Injection
+
+OSSM3 uses **revision-based injection** with namespace labels:
+
+```bash
+# For production default revision
+oc label namespace payment-app istio.io/rev=default
+
+# For canary revision
+oc label namespace inventory-app-canary istio.io/rev=canary
+
+# For nonprod
+oc label namespace payment-app-dev istio.io/rev=default
+```
+
+**OR** use the annotation on pods directly:
+
+```yaml
+# In deployment spec
+template:
+  metadata:
+    labels:
+      sidecar.istio.io/inject: "true"
+    annotations:
+      istio.io/rev: default  # or canary
+```
+
+### 4.6 Verify Namespace Enrollment
+
+```bash
+# Check if namespace is discovered
+oc get namespace payment-app --show-labels
+
+# Deploy test app
+oc create deployment httpbin --image=kennethreitz/httpbin -n payment-app
+
+# Verify sidecar injected
+oc get pods -n payment-app
+```
+
+**Expected Output:**
+```
+NAME                       READY   STATUS    RESTARTS   AGE
+httpbin-xxxx-yyyy          2/2     Running   0          1m
+```
+
+`2/2` means app container + istio-proxy sidecar
+
+---
+
+## Step 5: ArgoCD Integration
+
+### 5.1 ArgoCD Application - IstioCNI
+
+```yaml
+# File: argocd/servicemesh-cni.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: servicemesh-cni
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: platform
+  source:
+    repoURL: https://github.com/your-org/your-repo.git
+    targetRevision: main
+    path: servicemesh-cni
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: istio-cni
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  ignoreDifferences:
+    - group: sailoperator.io
+      kind: IstioCNI
+      jsonPointers:
+        - /status
+```
+
+### 5.2 ArgoCD ApplicationSet - Control Planes
+
+```yaml
+# File: argocd/servicemesh-controlplanes-appset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: servicemesh-controlplanes
+  namespace: openshift-gitops
+spec:
+  generators:
+    - list:
+        elements:
+          - name: prod-default
+            path: controlplanes/prod-default
+            namespace: istio-system-prod
+            wave: "10"
+          
+          - name: prod-canary
+            path: controlplanes/prod-canary
+            namespace: istio-system-prod
+            wave: "11"
+          
+          - name: nonprod-default
+            path: controlplanes/nonprod-default
+            namespace: istio-system-nonprod
+            wave: "10"
+  
+  template:
+    metadata:
+      name: 'servicemesh-cp-{{name}}'
+      annotations:
+        argocd.argoproj.io/sync-wave: '{{wave}}'
+      labels:
+        controlplane: '{{name}}'
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/your-org/your-repo.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+      ignoreDifferences:
+        - group: sailoperator.io
+          kind: Istio
+          jsonPointers:
+            - /status
+```
+
+### 5.3 ArgoCD ApplicationSet - Namespace Enrollment
+
+```yaml
+# File: argocd/servicemesh-namespaces-appset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: servicemesh-namespaces
+  namespace: openshift-gitops
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/your-repo.git
+        revision: main
+        directories:
+          - path: namespaces/*
+  
+  template:
+    metadata:
+      name: 'namespace-{{path.basename}}'
+      annotations:
+        argocd.argoproj.io/sync-wave: "20"
+      labels:
+        type: mesh-namespace
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: platform
+      source:
+        repoURL: https://github.com/your-org/your-repo.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+### 5.4 Apply ArgoCD Applications
+
+```bash
+# Apply in order
+oc apply -f argocd/servicemesh-cni.yaml
+oc apply -f argocd/servicemesh-controlplanes-appset.yaml
+oc apply -f argocd/servicemesh-namespaces-appset.yaml
+```
+
+---
+
+## Complete Git Repository Structure
+
+```
+your-repo/
+├── operators/
+│   └── servicemesh/
+│       └── subscription.yaml
+│
+├── servicemesh-cni/
+│   ├── namespace.yaml
+│   └── istiocni.yaml
+│
+├── controlplanes/
+│   ├── prod-default/
+│   │   ├── namespace.yaml
+│   │   ├── istio.yaml
+│   │   └── networkpolicies.yaml
+│   ├── prod-canary/
+│   │   └── istio.yaml
+│   └── nonprod-default/
+│       ├── namespace.yaml
+│       └── istio.yaml
+│
+├── namespaces/
+│   ├── payment-app/
+│   │   └── namespace.yaml
+│   ├── inventory-app-canary/
+│   │   └── namespace.yaml
+│   └── payment-app-dev/
+│       └── namespace.yaml
+│
+├── argocd/
+│   ├── servicemesh-cni.yaml
+│   ├── servicemesh-controlplanes-appset.yaml
+│   └── servicemesh-namespaces-appset.yaml
+│
+└── docs/
+    └── OSSM3-Complete-Installation-Guide.md
+```
+
+---
+
+## Verification Steps
+
+### 1. Verify Operator
+
+```bash
+oc get csv -n openshift-operators | grep servicemesh
+oc get pods -n openshift-operators | grep sail-operator
+```
+
+### 2. Verify IstioCNI
+
+```bash
+oc get istiocni -A
+oc get ds -n istio-cni
+```
+
+### 3. Verify Control Planes
+
+```bash
+# Production
+oc get istio -n istio-system-prod
+oc get istiorevision -n istio-system-prod
+oc get pods -n istio-system-prod
+
+# NonProd
+oc get istio -n istio-system-nonprod
+oc get pods -n istio-system-nonprod
+```
+
+### 4. Verify Namespace Enrollment
+
+```bash
+# Check namespace labels
+oc get namespace payment-app --show-labels
+
+# Deploy test application
+oc create deployment httpbin --image=kennethreitz/httpbin -n payment-app
+oc get pods -n payment-app
+
+# Should show 2/2 (app + sidecar)
+```
+
+### 5. Test Mesh Connectivity
+
+```bash
+# Deploy sleep pod
+oc create deployment sleep --image=curlimages/curl:7.85.0 \
+  -n payment-app -- sleep 3600
+
+# Test connectivity
+oc exec -it deploy/sleep -n payment-app -- \
+  curl -s http://httpbin.payment-app:8000/headers
+```
+
+### 6. Check Mesh Status with istioctl
+
+```bash
+# Download istioctl from OpenShift Console > CLI Tools
+
+# Analyze mesh
+istioctl analyze -n payment-app
+
+# Check proxy status
+istioctl proxy-status -n istio-system-prod
+```
+
+---
+
+## Troubleshooting
+
+### Issue 1: Sidecar Not Injected
+
+**Symptoms:** Pod shows `1/1` instead of `2/2`
+
+**Solution:**
+```bash
+# Check namespace labels
+oc get namespace <namespace> --show-labels
+
+# Verify revision label
+oc get namespace <namespace> -o yaml | grep istio.io/rev
+
+# If missing, add it
+oc label namespace <namespace> istio.io/rev=default
+```
+
+### Issue 2: Namespace Not Discovered
+
+**Symptoms:** Services not visible in mesh
+
+**Solution:**
+```bash
+# Check discoverySelectors in Istio resource
+oc get istio default -n istio-system-prod -o yaml
+
+# Verify namespace has matching label
+oc get namespace <namespace> --show-labels
+
+# Add missing label
+oc label namespace <namespace> istio-discovery=default
+```
+
+### Issue 3: Control Plane Not Ready
+
+**Symptoms:** `oc get istio` shows `Status: Reconciling`
+
+**Solution:**
+```bash
+# Check operator logs
+oc logs -n openshift-operators deployment/sail-operator
+
+# Check istiod logs
+oc logs -n istio-system-prod deployment/istiod-default-v1-24-0
+
+# Check events
+oc get events -n istio-system-prod --sort-by='.lastTimestamp'
+```
+
+### Issue 4: Multiple Control Planes Conflict
+
+**Symptoms:** Webhooks failing, unexpected behavior
+
+**Solution:**
+```bash
+# Ensure each control plane has unique discoverySelectors
+# Prod default watches: istio-discovery=default, mesh-tier=prod
+# Prod canary watches: istio-discovery=canary, mesh-tier=prod
+# NonProd watches: istio-discovery=default, mesh-tier=nonprod
+
+# Namespaces should have ONLY ONE matching label set
+```
+
+### Issue 5: Ingress Gateway Not Accessible
+
+**Symptoms:** Cannot access services through ingress
+
+**Solution:**
+```bash
+# Check gateway pod
+oc get pods -n istio-system-prod -l app=istio-ingressgateway
+
+# Check service
+oc get svc -n istio-system-prod istio-ingressgateway
+
+# Get external IP/hostname
+oc get svc istio-ingressgateway -n istio-system-prod \
+  -o jsonpath='{.status.loadBalancer.ingress[0]}'
+
+# Create route (OpenShift specific)
+oc create route edge --service=istio-ingressgateway \
+  -n istio-system-prod --hostname=<your-hostname>
+```
+
+---
+
+## Common Operations
+
+### Add New Namespace to Mesh
+
+```bash
+# 1. Create namespace with labels
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: new-app
+  labels:
+    istio-discovery: default
+    mesh-tier: prod
+    istio.io/rev: default
+EOF
+
+# 2. Deploy application
+# Pods will automatically get sidecar injected
+```
+
+### Upgrade Control Plane
+
+```bash
+# 1. Update Istio resource version
+oc patch istio default -n istio-system-prod --type=merge \
+  -p '{"spec":{"version":"v1.24.1"}}'
+
+# 2. Operator handles the upgrade
+# 3. Verify new revision
+oc get istiorevision -n istio-system-prod
+```
+
+### Canary Upgrade Workflow
+
+```bash
+# 1. Deploy canary control plane with new version
+# (Already shown in Step 3.2)
+
+# 2. Migrate test namespace to canary
+oc label namespace test-app istio-discovery=canary --overwrite
+oc label namespace test-app istio.io/rev=canary --overwrite
+
+# 3. Restart pods to get new sidecar
+oc rollout restart deployment -n test-app
+
+# 4. Validate canary
+istioctl analyze -n test-app
+
+# 5. If successful, update main control plane
+oc patch istio default -n istio-system-prod --type=merge \
+  -p '{"spec":{"version":"v1.24.1"}}'
+
+# 6. Migrate namespaces back to default
+oc label namespace test-app istio-discovery=default --overwrite
+oc label namespace test-app istio.io/rev=default --overwrite
+oc rollout restart deployment -n test-app
+
+# 7. Remove canary control plane
+oc delete istio canary -n istio-system-prod
+```
+
+---
+
+## Summary of Key Differences from Your Screenshots
+
+Based on your photos showing manual `oc apply` commands, here's what's automated with this GitOps approach:
+
+| Your Manual Steps | GitOps Equivalent |
+|-------------------|-------------------|
+| Variables ($NAMESPACE, $REV) | ApplicationSet generators with parameters |
+| Manual `oc new-project` | Namespace YAML in Git |
+| Manual `oc apply` for IstioCNI | ArgoCD Application watches Git |
+| Manual `oc apply` for Istio | ApplicationSet creates per control plane |
+| Manual `oc label namespace` | Namespace definition includes labels |
+| Manual NetworkPolicy apply | Included in control plane directory |
+
+**Result:** 
+- Push to Git → ArgoCD auto-deploys
+- Add file in `namespaces/` → Namespace auto-created with correct labels
+- No manual `oc` commands needed after initial ArgoCD setup
+
+---
+
+## Next Steps
+
+1. **Install Kiali** (separate operator for observability)
+2. **Configure Metrics** (OpenShift Monitoring or Prometheus)
+3. **Setup Distributed Tracing** (Tempo/Jaeger)
+4. **Define Gateway** (for ingress traffic)
+5. **Create VirtualServices** (for traffic routing)
+6. **Setup mTLS** (for security)
+
+---
+
+**End of Guide**
+
+For questions or issues, refer to:
+- Red Hat OSSM 3.0 Documentation: https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.0
+- Istio Documentation: https://istio.io/latest/docs/
+- Sail Operator GitHub: https://github.com/istio-ecosystem/sail-operator
