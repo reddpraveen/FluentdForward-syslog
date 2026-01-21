@@ -1,0 +1,153 @@
+# ==========================================
+# 1. OPERATOR & CNI (Cluster-wide Infrastructure)
+# ==========================================
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: sailoperator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  installPlanApproval: Automatic
+  name: sailoperator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+---
+apiVersion: sailoperator.io/v1alpha1
+kind: IstioCNI
+metadata:
+  name: default
+spec:
+  namespace: istio-cni
+---
+# ==========================================
+# 2. CONTROL PLANE APPLICATIONSET
+# ==========================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ossm3-control-planes
+  namespace: openshift-gitops
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/ossm3-gitops.git
+        revision: HEAD
+        files:
+          - path: "controlplanes/instances/*.yaml"
+  template:
+    metadata:
+      name: 'cp-{{REV}}-{{NAMESPACE}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/ossm3-gitops.git
+        targetRevision: HEAD
+        path: controlplanes/base
+        kustomize:
+          patches:
+            - target:
+                kind: Istio
+              patch: |-
+                - op: replace
+                  path: /metadata/name
+                  value: {{REV}}
+                - op: replace
+                  path: /metadata/namespace
+                  value: {{NAMESPACE}}
+                - op: replace
+                  path: /spec/namespace
+                  value: {{NAMESPACE}}
+                - op: replace
+                  path: /spec/values/meshConfig/discoverySelectors/0/matchLabels/istio-discovery
+                  value: {{REV}}
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: {{NAMESPACE}}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+---
+# ==========================================
+# 3. MEMBER NAMESPACE APPLICATIONSET
+# ==========================================
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ossm3-members
+  namespace: openshift-gitops
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/your-org/ossm3-gitops.git
+        revision: HEAD
+        files:
+          - path: "members/instances/*.yaml"
+  template:
+    metadata:
+      name: 'member-{{NAMESPACE}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/ossm3-gitops.git
+        targetRevision: HEAD
+        path: members/base
+        kustomize:
+          patches:
+            - target:
+                kind: Namespace
+              patch: |-
+                - op: replace
+                  path: /metadata/name
+                  value: {{NAMESPACE}}
+                - op: replace
+                  path: /metadata/labels/istio-discovery
+                  value: {{REV}}
+                - op: replace
+                  path: /metadata/labels/istio.io~1rev
+                  value: {{REV}}
+            - target:
+                kind: NetworkPolicy
+              patch: |-
+                - op: replace
+                  path: /metadata/namespace
+                  value: {{NAMESPACE}}
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: {{NAMESPACE}}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+---------------------------
+
+apiVersion: sailoperator.io/v1alpha1
+kind: Istio
+metadata:
+  name: REV_PLACEHOLDER
+  namespace: NAMESPACE_PLACEHOLDER
+spec:
+  namespace: NAMESPACE_PLACEHOLDER
+  values:
+    meshConfig:
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: REV_PLACEHOLDER
+
+
+
+
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: NAMESPACE_PLACEHOLDER
+  labels:
+    istio-discovery: REV_PLACEHOLDER
+    istio.io/rev: REV_PLACEHOLDER
+---
+
