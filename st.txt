@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# Script to setup Azure storage container for Tempo and create Kubernetes secret
+
+# Usage: ./setup-tempo-storage.sh <secret-name> <namespace>
+
+# Variables
+
+secretName=”${1}”
+workingNS=”${2:-tempo-system}”
+containerName=“tempo-storage”
+
+# Validate input
+
+if [ -z “${secretName}” ]; then
+echo “Usage: $0 <secret-name> [namespace]”
+echo “Example: $0 azure-storage-secret tempo-system”
+exit 1
+fi
+
+# Extract Azure credentials from secret
+
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Extracting Azure credentials from secret ${secretName} ……”
+azure_storage_account=$(oc -n${workingNS} extract secret/${secretName} –to=- –keys=storage_account_name 2>/dev/null)
+azure_storage_key=$(oc -n${workingNS} extract secret/${secretName} –to=- –keys=storage_account_key 2>/dev/null)
+
+if [ -z “${azure_storage_account}” ] || [ -z “${azure_storage_key}” ]; then
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Failed to extract credentials from secret ${secretName}”
+exit 1
+fi
+
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Storage account: ${azure_storage_account}”
+
+# Check if container exists
+
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Checking if container ${containerName} exists ……”
+containerExists=$(az storage container exists   
+–name ${containerName}   
+–account-name ${azure_storage_account}   
+–account-key ${azure_storage_key}   
+–query ‘exists’   
+–output tsv 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+if [ “${containerExists}” = “true” ]; then
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Container ${containerName} already exists, skipping creation”
+else
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Container ${containerName} does not exist, creating ……”
+az storage container create   
+–name ${containerName}   
+–account-name ${azure_storage_account}   
+–account-key ${azure_storage_key}   
+–output none
+
+```
+    if [ $? -eq 0 ]; then
+        echo "$(date '+%Y-%m-%d-%H:%M:%S')  Container ${containerName} created successfully"
+    else
+        echo "$(date '+%Y-%m-%d-%H:%M:%S')  Failed to create container ${containerName}"
+        exit 1
+    fi
+fi
+```
+
+else
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Failed to check container existence”
+exit 1
+fi
+
+##########
+
+# Create Kubernetes secret for Tempo
+
+##########
+
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Creating secret tempo-storage-secret in namespace ${workingNS} ……”
+
+# Delete existing secret if present
+
+oc get secret tempo-storage-secret -n ${workingNS} &>/dev/null
+if [ $? -eq 0 ]; then
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Deleting existing secret tempo-storage-secret ……”
+oc delete secret tempo-storage-secret -n ${workingNS}
+fi
+
+# Create new secret
+
+oc create secret generic tempo-storage-secret   
+-n ${workingNS}   
+–from-literal=account-name=${azure_storage_account}   
+–from-literal=account-key=${azure_storage_key}   
+–from-literal=container=${containerName}
+
+if [ $? -eq 0 ]; then
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Secret tempo-storage-secret created successfully”
+else
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Failed to create secret tempo-storage-secret”
+exit 1
+fi
+
+echo “$(date ‘+%Y-%m-%d-%H:%M:%S’)  Tempo storage setup completed successfully”
