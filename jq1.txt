@@ -1,0 +1,19 @@
+command:
+  - /bin/bash
+  - -c
+  - |
+    set -e
+    oc get secret logging-loki-s3 -n openshift-logging -o json | \
+    jq -r '{
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: {
+        name: "tempo-storage-secret",
+        namespace: "tracing-system"
+      },
+      type: "Opaque",
+      data: {
+        azure_storage_account: .data.azure_storage_account,
+        key: .data.key
+      }
+    }' | oc apply -f -
