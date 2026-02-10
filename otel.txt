@@ -1,3 +1,48 @@
+#!/bin/bash
+# Diagnostic script for OSSM3 monitoring issues
+
+echo "=== 1. Check if monitoring pods have Istio sidecars (CRITICAL) ==="
+echo "Prometheus pods:"
+oc get pods -n openshift-monitoring -l app.kubernetes.io/name=prometheus -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}{end}'
+
+echo -e "\nThanos Querier pods:"
+oc get pods -n openshift-monitoring -l app.kubernetes.io/name=thanos-query -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}{end}'
+
+echo -e "\nUser Workload Prometheus pods:"
+oc get pods -n openshift-user-workload-monitoring -l app.kubernetes.io/name=prometheus -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[*].name}{"\n"}{end}'
+
+echo -e "\n=== 2. Check namespace labels (sidecar injection triggers) ==="
+oc get ns openshift-monitoring -o jsonpath='{.metadata.labels}' | jq
+oc get ns openshift-user-workload-monitoring -o jsonpath='{.metadata.labels}' | jq
+
+echo -e "\n=== 3. Check your Istio discoverySelectors ==="
+oc get istio -A -o jsonpath='{range .items[*]}{"Istio: "}{.metadata.name}{" in namespace: "}{.metadata.namespace}{"\n"}{"  discoverySelectors: "}{.spec.values.meshConfig.discoverySelectors}{"\n\n"}{end}'
+
+echo -e "\n=== 4. Test Thanos Querier access directly ==="
+THANOS_ROUTE=$(oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+if [ -n "$THANOS_ROUTE" ]; then
+  echo "Testing: https://$THANOS_ROUTE"
+  curl -sk -w "\nHTTP Code: %{http_code}\n" "https://$THANOS_ROUTE/api/v1/query?query=up" -o /dev/null
+else
+  echo "No Thanos route found - testing internal service"
+  TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m)
+  PROM_POD=$(oc get pod -n openshift-user-workload-monitoring -l app.kubernetes.io/name=prometheus -o name | head -1)
+  oc exec -n openshift-user-workload-monitoring $PROM_POD -c prometheus -- \
+    curl -sk -w "\nHTTP Code: %{http_code}\n" \
+    -H "Authorization: Bearer $TOKEN" \
+    "https://thanos-querier.openshift-monitoring.svc:9091/api/v1/query?query=up"
+fi
+
+echo -e "\n=== 5. Check for mesh-wide PeerAuthentication policies ==="
+oc get peerauthentication -A -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,MODE:.spec.mtls.mode,SELECTOR:.spec.selector
+
+echo -e "\n=== 6. Check for AuthorizationPolicy blocking monitoring ==="
+oc get authorizationpolicy -A -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,ACTION:.spec.action
+
+
+
+
+
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
