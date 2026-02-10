@@ -1,3 +1,78 @@
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: mesh-metrics-permissive
+  namespace: istio-system  # Root namespace for mesh policies
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  # No selector = applies to entire mesh
+  mtls:
+    mode: PERMISSIVE
+  portLevelMtls:
+    15020:
+      mode: DISABLE
+    15090:
+      mode: DISABLE
+
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: mesh-allow-prometheus
+  namespace: istio-system
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - openshift-monitoring
+              - openshift-user-workload-monitoring
+      to:
+        - operation:
+            ports: ["15020", "15090", "15014"]
+
+#!/bin/bash
+
+echo "=== Show mesh-wide policies (apply to ALL revisions) ==="
+oc get peerauthentication mesh-metrics-permissive -n istio-system
+oc get authorizationpolicy mesh-allow-prometheus -n istio-system
+
+echo -e "\n=== Test metrics access for EACH revision ==="
+for REV in default stable canary; do
+  echo -e "\n--- Testing revision: ${REV} ---"
+  
+  # Check if this revision exists
+  if ! oc get istio ${REV} -n istio-system &>/dev/null; then
+    echo "Revision ${REV} not found, skipping"
+    continue
+  fi
+  
+  # Get istiod pod for this revision
+  ISTIOD_IP=$(oc get pod -n istio-system -l app=istiod,istio.io/rev=${REV} \
+    -o jsonpath='{.items[0].status.podIP}' 2>/dev/null)
+  
+  if [ -z "$ISTIOD_IP" ]; then
+    echo "No istiod pod found for ${REV}"
+    continue
+  fi
+  
+  # Test from Prometheus
+  PROM_POD=$(oc get pod -n openshift-user-workload-monitoring \
+    -l app.kubernetes.io/name=prometheus -o name | head -1)
+  
+  oc exec -n openshift-user-workload-monitoring ${PROM_POD} -c prometheus -- \
+    curl -s -o /dev/null -w "Revision ${REV}: HTTP %{http_code}\n" \
+    http://${ISTIOD_IP}:15014/metrics
+done
+
+
+
+
+
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
