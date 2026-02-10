@@ -1,4 +1,38 @@
 #!/bin/bash
+
+echo "=== 1. Check YOUR user permissions ==="
+oc whoami
+oc auth can-i get prometheus --namespace openshift-monitoring
+oc auth can-i get prometheus --namespace openshift-user-workload-monitoring
+
+echo -e "\n=== 2. Check what roles you have ==="
+oc describe clusterrolebinding | grep "$(oc whoami)"
+oc describe rolebinding -n openshift-monitoring | grep "$(oc whoami)"
+
+echo -e "\n=== 3. Test Thanos route directly ==="
+THANOS_URL=$(oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+if [ -n "$THANOS_URL" ]; then
+  echo "Thanos Route: https://$THANOS_URL"
+  curl -sk -L -w "\nHTTP Code: %{http_code}\n" "https://$THANOS_URL" -o /dev/null
+else
+  echo "No Thanos route exposed externally"
+fi
+
+echo -e "\n=== 4. Check if monitoring routes exist ==="
+oc get routes -n openshift-monitoring
+oc get routes -n openshift-user-workload-monitoring
+
+echo -e "\n=== 5. Check OAuth configuration ==="
+oc get pod -n openshift-monitoring -l app.kubernetes.io/name=thanos-query -o yaml | grep -A5 "oauth-proxy"
+
+
+
+
+
+
+
+
+#!/bin/bash
 # Diagnostic script for OSSM3 monitoring issues
 
 echo "=== 1. Check if monitoring pods have Istio sidecars (CRITICAL) ==="
