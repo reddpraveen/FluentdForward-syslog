@@ -1,0 +1,114 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tempostack-traces-write
+rules:
+  - apiGroups:
+      - tempo.grafana.com
+    resources:
+      - all
+    resourceNames:
+      - traces
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tempostack-traces-write-otel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tempostack-traces-write
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: istio-system
+
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tempostack-traces-read
+rules:
+  - apiGroups:
+      - tempo.grafana.com
+    resources:
+      - all
+    resourceNames:
+      - traces
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tempostack-traces-read-cluster-admins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tempostack-traces-read
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:cluster-admins
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: cluster-admins
+
+
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel
+  namespace: istio-system
+spec:
+  observability:
+    metrics:
+      enableMetrics: true
+  config:
+    exporters:
+      otlp/tempo:
+        endpoint: tempo-tempo-blobstack-gateway.tracing-system.svc.cluster.local:8090
+        tls:
+          insecure: true
+        headers:
+          x-scope-orgid: all
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http: {}
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [otlp/tempo]
+
+oc label namespace openshift-tempo-operator openshift.io/cluster-monitoring=true --overwrite
+oc label namespace openshift-cluster-observability-operator openshift.io/cluster-monitoring=true --overwrite
+oc label namespace tracing-system openshift.io/cluster-monitoring=true --overwrite
+
+# TempoStack status
+oc get tempostack tempo-blobstack -n tracing-system
+
+# Gateway pod must be running
+oc get pods -n tracing-system -l app.kubernetes.io/component=gateway
+
+# ServiceMonitors auto-created by observability.metrics
+oc get servicemonitor -n tracing-system
+
+# PrometheusRules auto-created
+oc get prometheusrule -n tracing-system
+
+# Jaeger route
+oc get route -n tracing-system
+
+# UIPlugin status
+oc get uiplugin distributed-tracing -o yaml
+
+# Generate some traces then check console
+# Observe -> Traces -> select tempo-blobstack -> tenant: all
