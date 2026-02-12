@@ -1,3 +1,23 @@
+
+for dir in "new folder/overlays"/*; do 
+  cluster=$(basename "$dir")
+  rm -f "$dir/clusterlogforwarder.yaml" "$dir/kustomization.yaml"
+  cat > "$dir/rev-ns-input.yaml" <<EOF
+- rev: default
+  namespace: istio-system
+  clusterDomain: apps.${cluster}.example.com
+  status: active
+  discoveryLabel: default
+  owner: platform-team
+  createdDate: $(date +%Y-%m-%d)
+EOF
+  echo "✓ Processed $cluster"
+done
+
+
+
+
+
 #!/bin/bash
 
 echo "=== 1. Check YOUR user permissions ==="
