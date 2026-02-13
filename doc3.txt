@@ -1,3 +1,25 @@
+#!/bin/bash
+# Save as generate-structure.sh
+
+cd /path/to/your/repo
+
+cat > STRUCTURE.md <<'EOF'
+# Repository Structure
+
+\`\`\`
+EOF
+
+find . -not -path '*/\.git/*' -print | sed -e 's;[^/]*/;|____;g;s;____|; |;g' >> STRUCTURE.md
+
+cat >> STRUCTURE.md <<'EOF'
+\`\`\`
+EOF
+
+echo "Structure saved to STRUCTURE.md"
+
+
+
+
 h1. OpenShift Service Mesh 3 (OSSM3) - ArgoCD Automated Deployment Guide
 
 h3. Acronyms and Definitions
