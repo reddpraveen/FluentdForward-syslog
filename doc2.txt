@@ -1,0 +1,1611 @@
+h1. OpenShift Service Mesh 3 (OSSM3) - ArgoCD Automated Deployment Guide
+
+{panel:title=Document Information|borderStyle=solid|borderColor=#ccc|titleBGColor=#F7F7F7}
+*Purpose:* Complete enterprise deployment guide for OSSM3 with ArgoCD automation
+*Author:* Platform Team
+*Last Updated:* {date}
+*Version:* 1.0
+*Target Audience:* Platform Engineers, SREs, Cluster Administrators
+{panel}
+
+{toc:printable=true|style=disc|maxLevel=3}
+
+----
+
+h2. Executive Summary
+
+This document provides a complete automation solution for deploying OpenShift Service Mesh 3.x using ArgoCD/OpenShift GitOps. The solution enables:
+
+* *Multi-cluster deployment* - Deploy mesh to dev, UAT, and production clusters
+* *Per-cluster control* - Enable/disable mesh deployment via Git configuration
+* *Multi-revision support* - Run multiple control plane revisions (default, stable, canary) per cluster
+* *GitOps workflow* - All configuration managed in Git with automated deployment
+* *Status lifecycle management* - Control plane states: installed, placeholder, uninstalled
+
+h3. Key Design Decisions
+
+*Pattern B Architecture:* Multiple control planes in separate namespaces per cluster (not single istio-system)
+
+*Single Multi-Cluster ApplicationSet:* One ApplicationSet dynamically deploys to all labeled clusters
+
+*Cluster Label Control:* Enable/disable mesh per cluster via ArgoCD cluster secret labels ({{ossm3: "installed"}})
+
+*Status-Based Filtering:* Use status field (installed/placeholder/uninstalled) to control deployment per control plane
+
+*Discovery Selectors:* Explicit namespace labeling to scope control plane management
+
+*Fasttemplate Mode:* ApplicationSet uses fasttemplate (not goTemplate) to enable {{{{name}}}} variable in Git paths
+
+----
+
+h2. Architecture Overview
+
+h3. OSSM3 vs OSSM2 Key Differences
+
+{code:title=Major Architectural Changes|theme=Confluence|linenumbers=false}
+OSSM2 (ServiceMeshControlPlane)          OSSM3 (Istio CR)
+=====================================    =====================================
+- ServiceMeshControlPlane CR             - Istio CR (upstream compatible)
+- ServiceMeshMemberRoll (namespace list) - discoverySelectors (label-based)
+- Bundled observability (Jaeger/Kiali)  - Separate observability operators
+- Namespace-scoped by default            - Cluster-wide by default
+- Member/MemberRoll required             - Label-based discovery
+{code}
+
+h3. Component Architecture
+
+{panel:title=OSSM3 Architecture|borderStyle=solid}
+{code:theme=Confluence}
+┌──────────────────────────────────────────────────────────────────┐
+│              ArgoCD / OpenShift GitOps (Hub Cluster)             │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  Single Multi-Cluster ApplicationSet                     │    │
+│  │  - Reads cluster secrets labeled ossm3=installed         │    │
+│  │  - Dynamically creates Applications per cluster          │    │
+│  └────┬─────────────────┬──────────────────┬────────────────┘    │
+└───────┼─────────────────┼──────────────────┼─────────────────────┘
+        │                 │                  │
+        ▼                 ▼                  ▼
+   ┌────────────┐   ┌────────────┐   ┌────────────────┐
+   │ Dev Cluster│   │ UAT Cluster│   │ Prod Cluster   │
+   │ (labeled)  │   │ (labeled)  │   │ (labeled)      │
+   ├────────────┤   ├────────────┤   ├────────────────┤
+   │ Control    │   │ Control    │   │ Control Planes │
+   │ Planes:    │   │ Planes:    │   │ - default      │
+   │ - default  │   │ - default  │   │ - stable       │
+   │            │   │ - stable   │   │ - canary       │
+   ├────────────┤   ├────────────┤   ├────────────────┤
+   │Observability│  │Observability│  │ Observability  │
+   │- TempoStack│   │- TempoStack│   │ - TempoStack   │
+   │- Kiali     │   │- Kiali     │   │ - Kiali        │
+   └────────────┘   └────────────┘   └────────────────┘
+
+Control Deployment:
+  ✓ Label cluster → mesh deploys automatically
+  ✗ Remove label → no new deployments (manual cleanup)
+  ✓ Change status in Git → controls per-revision deployment
+{code}
+{panel}
+
+h3. Repository Structure
+
+{code:title=Git Repository Layout|language=bash|theme=Confluence|linenumbers=true}
+AA-GitOps-RHServiceMeshOperator3/
+├── argocd-apps/                              # ApplicationSet definitions
+│   ├── ossm3-controlplanes-multi-cluster.yaml  # Single ApplicationSet for all clusters
+│   └── README.md
+│
+├── ossm3-controlplanes/
+│   ├── base/                                 # Shared templates
+│   │   ├── istio.yaml                       # Main control plane CR
+│   │   ├── telemetry-tracing.yaml           # OpenTelemetry config
+│   │   ├── opentelemetry-collector.yaml     # OTel Collector
+│   │   └── monitoring/
+│   │       ├── peer-auth-istiod.yaml        # mTLS exemptions for metrics
+│   │       └── authz-policy-prometheus.yaml # Prometheus access policy
+│   │
+│   └── overlays/                            # Per-cluster configurations
+│       ├── devocp4test/
+│       │   └── rev-ns-input.yaml            # Control plane definitions
+│       ├── uatocp4/
+│       │   └── rev-ns-input.yaml
+│       └── prodocp4/
+│           └── rev-ns-input.yaml
+│
+├── ossm3-observability/
+│   ├── base/
+│   │   ├── tempo/
+│   │   │   └── tempostack.yaml              # Distributed tracing
+│   │   └── kiali/
+│   │       └── kiali-cr.yaml                # Service mesh console
+│   │
+│   └── overlays/
+│       ├── dev/
+│       ├── uat/
+│       └── prod/
+│
+└── mesh-config/
+    └── peer-auth-mesh-default.yaml          # Mesh-wide mTLS policy
+{code}
+
+{info}
+*Folder Structure Requirement:* Folder names in {{overlays/}} MUST match ArgoCD cluster names exactly. For example, if cluster is named "prodocp4" in ArgoCD, the folder must be {{overlays/prodocp4/}}.
+{info}
+
+----
+
+h2. Prerequisites
+
+h3. Required Operators
+
+{note}
+All operators must be installed cluster-wide (openshift-operators namespace) before deploying mesh instances.
+{note}
+
+|| Operator Name || Namespace || Channel || Version ||
+| Red Hat OpenShift Service Mesh | openshift-operators | stable | 3.x |
+| OpenShift distributed tracing (Tempo) | openshift-operators | stable | Latest |
+| Kiali Operator | openshift-operators | stable | Latest |
+| Red Hat OpenShift distributed tracing (OpenTelemetry) | openshift-operators | stable | Latest |
+| Cluster Observability Operator (COO) | openshift-operators | development | Latest |
+| OpenShift GitOps | openshift-gitops | latest | 1.13+ |
+
+h4. Install Operators via CLI
+
+{code:language=bash|title=Install Required Operators|theme=Confluence}
+# 1. Red Hat OpenShift Service Mesh Operator
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: servicemeshoperator
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: servicemeshoperator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+# 2. Tempo Operator
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: tempo-product
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: tempo-product
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+# 3. Kiali Operator
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: kiali-ossm
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: kiali-ossm
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+# 4. OpenTelemetry Operator
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: opentelemetry-product
+  namespace: openshift-operators
+spec:
+  channel: stable
+  name: opentelemetry-product
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+# 5. Cluster Observability Operator
+cat <<EOF | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-observability-operator
+  namespace: openshift-operators
+spec:
+  channel: development
+  name: cluster-observability-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
+
+# Verify all operators are running
+oc get csv -n openshift-operators | grep -E 'servicemesh|tempo|kiali|opentelemetry|observability'
+{code}
+
+h3. ArgoCD Setup
+
+{info}
+This guide assumes OpenShift GitOps (ArgoCD) is already installed. If not, install the OpenShift GitOps operator first.
+{info}
+
+h4. Grant Cluster Monitoring View to Users
+
+{code:language=bash|title=Enable Monitoring Access for All Users|theme=Confluence}
+# Allow all authenticated users to view Prometheus/Thanos
+oc adm policy add-cluster-role-to-group cluster-monitoring-view system:authenticated
+
+# Users can now access: Observe → Metrics in OpenShift Console
+{code}
+
+----
+
+h2. Configuration Files
+
+h3. Control Plane Input Files
+
+Each cluster has a {{rev-ns-input.yaml}} file defining which control planes to deploy.
+
+{code:title=overlays/prodocp4/rev-ns-input.yaml|language=yaml|theme=Confluence|linenumbers=true}
+# Production cluster - 3 control planes
+- rev: default
+  namespace: istio-system
+  clusterDomain: apps.prodocp4.example.com
+  clusterServer: https://api.prodocp4.example.com:6443
+  status: "installed"
+  discoveryLabel: default
+  owner: platform-team
+  createdDate: 2024-01-15
+
+- rev: stable
+  namespace: istio-stable
+  clusterDomain: apps.prodocp4.example.com
+  clusterServer: https://api.prodocp4.example.com:6443
+  status: "installed"
+  discoveryLabel: stable
+  owner: platform-team
+  createdDate: 2024-06-01
+
+- rev: canary
+  namespace: istio-canary
+  clusterDomain: apps.prodocp4.example.com
+  clusterServer: https://api.prodocp4.example.com:6443
+  status: "placeholder"
+  discoveryLabel: canary
+  owner: platform-team
+  plannedDate: 2025-06-01
+{code}
+
+{code:title=overlays/devocp4test/rev-ns-input.yaml|language=yaml|theme=Confluence}
+# Development cluster - 1 control plane
+- rev: default
+  namespace: istio-system
+  clusterDomain: apps.devocp4test.example.com
+  clusterServer: https://api.devocp4test.example.com:6443
+  status: "installed"
+  discoveryLabel: default
+  owner: platform-team
+  createdDate: 2025-02-10
+{code}
+
+h4. Field Definitions
+
+|| Field || Type || Required || Description ||
+| {{rev}} | string | ✓ | Istio revision name (e.g., default, stable, canary) |
+| {{namespace}} | string | ✓ | Kubernetes namespace for this control plane |
+| {{clusterDomain}} | string | ✓ | Apps domain for OpenShift routes (e.g., apps.cluster.com) |
+| {{clusterServer}} | string | ✓ | Kubernetes API server URL |
+| {{status}} | string | ✓ | Deployment status: "installed", "placeholder", "uninstalled" |
+| {{discoveryLabel}} | string | ✓ | Value for discoverySelectors (which namespaces this CP manages) |
+| {{owner}} | string | ✗ | Team responsible for this control plane (metadata) |
+| {{createdDate}} | string | ✗ | Creation date (metadata) |
+| {{plannedDate}} | string | ✗ | Planned activation date for placeholder entries |
+
+h4. Status Field Values
+
+{code:title=Status Lifecycle|language=text|theme=Confluence}
+Status: "installed"
+  → Control plane is deployed and active
+  → ArgoCD creates Application
+  → Resources synced to cluster
+
+Status: "placeholder"
+  → Configuration exists in Git but NOT deployed
+  → ArgoCD filters out (no Application created)
+  → Used for planning future deployments
+
+Status: "uninstalled"
+  → Previously installed but now removed
+  → ArgoCD filters out (no Application created)
+  → Kept for audit trail before cleanup
+{code}
+
+h3. Base Template Files
+
+h4. Istio Control Plane Template
+
+{code:title=base/istio.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: sailoperator.io/v1alpha1
+kind: Istio
+metadata:
+  name: {{rev}}
+  namespace: {{namespace}}
+spec:
+  namespace: {{namespace}}
+  version: v1.24.2
+  
+  values:
+    global:
+      proxy:
+        trafficControl:
+          inbound:
+            excludedPorts:
+              - 15020  # Envoy metrics - exclude from mTLS
+              - 15090  # Pilot metrics
+              - 15014  # Istiod metrics
+    
+    meshConfig:
+      # CRITICAL: Limit which namespaces this control plane manages
+      discoverySelectors:
+        - matchLabels:
+            istio-discovery: {{discoveryLabel}}
+      
+      # Distributed tracing configuration
+      extensionProviders:
+        - name: otel-{{rev}}
+          opentelemetry:
+            port: 4317
+            service: otel-collector.istio-system.svc.cluster.local
+      
+      # Default mTLS mode
+      defaultConfig:
+        proxyMetadata:
+          ISTIO_META_DNS_CAPTURE: "true"
+          ISTIO_META_DNS_AUTO_ALLOCATE: "true"
+{code}
+
+h4. Telemetry Configuration
+
+{code:title=base/telemetry-tracing.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: telemetry.istio.io/v1alpha1
+kind: Telemetry
+metadata:
+  name: mesh-tracing-{{rev}}
+  namespace: {{namespace}}
+spec:
+  tracing:
+    - providers:
+        - name: otel-{{rev}}
+      randomSamplingPercentage: 100.0
+      customTags:
+        revision:
+          literal:
+            value: "{{rev}}"
+        cluster:
+          literal:
+            value: "{{clusterDomain}}"
+{code}
+
+h4. Monitoring Security Policies
+
+{code:title=base/monitoring/peer-auth-istiod.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: istiod-metrics
+  namespace: {{namespace}}
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  selector:
+    matchLabels:
+      app: istiod
+  portLevelMtls:
+    15014:
+      mode: DISABLE  # Allow plaintext Prometheus scraping
+    15020:
+      mode: DISABLE
+    15090:
+      mode: DISABLE
+{code}
+
+{code:title=base/monitoring/authz-policy-prometheus.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-prometheus
+  namespace: {{namespace}}
+  annotations:
+    argocd.argoproj.io/sync-wave: "15"
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - openshift-monitoring
+              - openshift-user-workload-monitoring
+      to:
+        - operation:
+            ports: ["15014", "15020", "15090"]
+            paths: ["/metrics", "/stats/prometheus"]
+{code}
+
+h3. ApplicationSet Configuration
+
+{info}
+*CRITICAL:* This solution uses a **single ApplicationSet** with Matrix generator to deploy to multiple clusters. The Cluster generator must come FIRST to provide {{{{name}}}} variable, and **goTemplate must be disabled** (use fasttemplate mode) for dynamic path templating to work.
+{info}
+
+{code:title=argocd-apps/ossm3-controlplanes-multi-cluster.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ossm3-controlplanes-all
+  namespace: openshift-gitops
+spec:
+  # NOTE: goTemplate is NOT set (defaults to false for fasttemplate mode)
+  # This allows cluster generator variables to be used in git generator paths
+  
+  generators:
+    - matrix:
+        generators:
+          # FIRST: Cluster generator (provides {{name}}, {{server}})
+          - clusters:
+              selector:
+                matchLabels:
+                  ossm3: "installed"  # Only clusters with this label
+          
+          # SECOND: Git generator (can use {{name}} in path)
+          - git:
+              repoURL: https://url
+              revision: main
+              files:
+                - path: "ossm3-controlplanes/overlays/{{name}}/rev-ns-input.yaml"
+      
+      # CRITICAL: Only create Applications for status="installed"
+      selector:
+        matchLabels:
+          status: "installed"
+  
+  template:
+    metadata:
+      name: '{{name}}-ossm3-{{rev}}'
+      labels:
+        cluster: '{{name}}'
+        mesh-revision: '{{rev}}'
+        owner: '{{owner}}'
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.pagerduty: mesh-oncall
+    
+    spec:
+      project: default
+      
+      source:
+        repoURL: https://url
+        targetRevision: main
+        path: ossm3-controlplanes/base
+        
+        plugin:
+          name: kustomize-with-helm
+          env:
+            - name: KUSTOMIZE_PLUGIN_HOME
+              value: /usr/local/bin/kustomize/plugin
+          parameters:
+            - name: rev
+              value: '{{rev}}'
+            - name: namespace
+              value: '{{namespace}}'
+            - name: clusterDomain
+              value: '{{clusterDomain}}'
+            - name: discoveryLabel
+              value: '{{discoveryLabel}}'
+      
+      destination:
+        server: '{{server}}'       # From cluster generator
+        namespace: '{{namespace}}'  # From git file
+      
+      syncPolicy:
+        automated:
+          selfHeal: true
+          prune: true  # ⚠️ Auto-deletes resources when Application removed
+        syncOptions:
+          - CreateNamespace=true
+          - RespectIgnoreDifferences=true
+        
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 10m
+      
+      ignoreDifferences:
+        - group: tempo.grafana.com
+          kind: TempoStack
+          jsonPointers:
+            - /status
+            - /metadata/annotations
+{code}
+
+h4. How This Works
+
+*Cluster Generator (First):* Reads ArgoCD cluster secrets, finds clusters labeled {{ossm3=installed}}, provides {{{{name}}}} and {{{{server}}}}
+
+*Git Generator (Second):* Uses {{{{name}}}} from cluster to read the correct folder path (e.g., {{overlays/prodocp4/rev-ns-input.yaml}})
+
+*Matrix Combination:* Creates one Application per (cluster × control plane) where status="installed"
+
+*Example:* If cluster {{prodocp4}} has 3 entries in its {{rev-ns-input.yaml}} with status="installed", ArgoCD creates 3 Applications:
+- {{prodocp4-ossm3-default}}
+- {{prodocp4-ossm3-stable}}
+- {{prodocp4-ossm3-canary}}
+
+h4. Cluster Secret Labeling
+
+{warning}
+Clusters must be registered in ArgoCD and labeled with {{ossm3: "installed"}} for this ApplicationSet to deploy to them.
+{warning}
+
+{code:language=bash|title=Label Clusters for Mesh Deployment|theme=Confluence}
+# Register cluster in ArgoCD (if not already done)
+argocd cluster add <context-name> --name prodocp4
+
+# Label cluster to enable mesh deployment
+argocd cluster set https://api.prodocp4.example.com:6443 \
+  --label ossm3=installed \
+  --name prodocp4
+
+# Verify cluster label
+argocd cluster list --selector ossm3=installed
+
+# Output should show:
+# SERVER                                  NAME       STATUS      LABELS
+# https://api.prodocp4.example.com:6443   prodocp4   Successful  ossm3=installed
+{code}
+  
+  template:
+    metadata:
+      name: 'prodocp4-ossm3-{{.rev}}'
+      labels:
+        cluster: prodocp4
+        mesh-revision: '{{.rev}}'
+        owner: '{{.owner}}'
+      annotations:
+        notifications.argoproj.io/subscribe.on-sync-failed.pagerduty: mesh-oncall
+    
+    spec:
+      project: default
+      
+      source:
+        repoURL: https://url
+        targetRevision: main
+        path: ossm3-controlplanes/base
+        
+        plugin:
+          name: kustomize-with-helm
+          env:
+            - name: KUSTOMIZE_PLUGIN_HOME
+              value: /usr/local/bin/kustomize/plugin
+          parameters:
+            - name: rev
+              value: '{{.rev}}'
+            - name: namespace
+              value: '{{.namespace}}'
+            - name: clusterDomain
+              value: '{{.clusterDomain}}'
+            - name: discoveryLabel
+              value: '{{.discoveryLabel}}'
+      
+      destination:
+        server: '{{.clusterServer}}'
+        namespace: '{{.namespace}}'
+      
+      syncPolicy:
+        automated:
+          selfHeal: true
+          prune: true
+        syncOptions:
+          - CreateNamespace=true
+          - RespectIgnoreDifferences=true
+        
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 10m
+      
+      ignoreDifferences:
+        - group: tempo.grafana.com
+          kind: TempoStack
+          jsonPointers:
+            - /status
+            - /metadata/annotations
+{code}
+
+----
+
+h2. Deployment Procedures
+
+h3. Initial Repository Setup
+
+{code:language=bash|title=Step 1: Create Repository Structure|theme=Confluence|linenumbers=true}
+#!/bin/bash
+
+# Clone or create repository
+git clone 
+cd AA-GitOps3
+
+# Create directory structure
+mkdir -p ossm3-controlplanes/{base/monitoring,overlays/{devocp4test,uatocp4,prodocp4}}
+mkdir -p ossm3-observability/{base/{tempo,kiali},overlays/{dev,uat,prod}}
+mkdir -p argocd-apps
+mkdir -p mesh-config
+
+echo "Repository structure created"
+{code}
+
+{code:language=bash|title=Step 2: Generate Input Files for All Clusters|theme=Confluence|linenumbers=true}
+#!/bin/bash
+
+# Define clusters and their domains
+declare -A CLUSTERS=(
+  ["devocp4test"]="apps.devocp4test.example.com"
+  ["uatocp4"]="apps.uatocp4.example.com"
+  ["prodocp4"]="apps.prodocp4.example.com"
+)
+
+# Generate input file for each cluster
+for cluster in "${!CLUSTERS[@]}"; do
+  domain="${CLUSTERS[$cluster]}"
+  
+  cat > "ossm3-controlplanes/overlays/${cluster}/rev-ns-input.yaml" <<EOF
+- rev: default
+  namespace: istio-system
+  clusterDomain: ${domain}
+  clusterServer: https://api.${cluster}.example.com:6443
+  status: "installed"
+  discoveryLabel: default
+  owner: platform-team
+  createdDate: $(date +%Y-%m-%d)
+EOF
+  
+  echo "Created input file for ${cluster}"
+done
+{code}
+
+{code:language=bash|title=Step 3: Create Multi-Cluster ApplicationSet|theme=Confluence|linenumbers=true}
+#!/bin/bash
+
+cat > "argocd-apps/ossm3-controlplanes-multi-cluster.yaml" <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ossm3-controlplanes-all
+  namespace: openshift-gitops
+spec:
+  # NOTE: goTemplate NOT set (uses fasttemplate for dynamic path support)
+  
+  generators:
+    - matrix:
+        generators:
+          # FIRST: Cluster generator (provides {{name}}, {{server}})
+          - clusters:
+              selector:
+                matchLabels:
+                  ossm3: "installed"
+          
+          # SECOND: Git generator (uses {{name}} in path)
+          - git:
+              repoURL: https://url
+              revision: main
+              files:
+                - path: "ossm3-controlplanes/overlays/{{name}}/rev-ns-input.yaml"
+      
+      selector:
+        matchLabels:
+          status: "installed"
+  
+  template:
+    metadata:
+      name: '{{name}}-ossm3-{{rev}}'
+      labels:
+        cluster: '{{name}}'
+        mesh-revision: '{{rev}}'
+        owner: '{{owner}}'
+    
+    spec:
+      project: default
+      
+      source:
+        repoURL: https://url
+        targetRevision: main
+        path: ossm3-controlplanes/base
+        
+        plugin:
+          name: kustomize-with-helm
+          parameters:
+            - name: rev
+              value: '{{rev}}'
+            - name: namespace
+              value: '{{namespace}}'
+            - name: clusterDomain
+              value: '{{clusterDomain}}'
+            - name: discoveryLabel
+              value: '{{discoveryLabel}}'
+      
+      destination:
+        server: '{{server}}'
+        namespace: '{{namespace}}'
+      
+      syncPolicy:
+        automated:
+          selfHeal: true
+          prune: true
+        syncOptions:
+          - CreateNamespace=true
+EOF
+
+echo "Created ossm3-controlplanes-multi-cluster.yaml"
+echo ""
+echo "This single ApplicationSet will deploy to ALL clusters labeled ossm3=installed"
+{code}
+
+{code:language=bash|title=Step 4: Commit and Push to Git|theme=Confluence}
+git add .
+git commit -m "feat: initial OSSM3 GitOps configuration"
+git push origin main
+{code}
+
+h3. Deploy to First Cluster
+
+{code:language=bash|title=Register and Label Cluster for Mesh Deployment|theme=Confluence|linenumbers=true}
+# 1. Register cluster in ArgoCD (if not already done)
+# Get cluster context name
+oc config get-contexts
+
+# Add cluster to ArgoCD
+argocd cluster add <context-name> --name devocp4test
+
+# 2. Label cluster to enable mesh deployment
+argocd cluster set https://api.devocp4test.example.com:6443 \
+  --label ossm3=installed \
+  --name devocp4test
+
+# 3. Verify cluster is registered and labeled
+argocd cluster list --selector ossm3=installed
+
+# Should show:
+# SERVER                                      NAME          STATUS      LABELS
+# https://api.devocp4test.example.com:6443    devocp4test   Successful  ossm3=installed
+
+# 4. Apply the multi-cluster ApplicationSet
+oc apply -f argocd-apps/ossm3-controlplanes-multi-cluster.yaml
+
+# 5. Force ArgoCD to refresh (don't wait 3 minutes)
+argocd appset get ossm3-controlplanes-all --refresh
+
+# 6. Wait for Application to appear
+sleep 10
+
+# 7. Check created Applications
+argocd app list | grep devocp4test-ossm3
+
+# Should see:
+# devocp4test-ossm3-default   Synced    Healthy   ...
+
+# 8. Check on cluster
+oc get istio -n istio-system
+oc get pods -n istio-system
+
+# 9. Verify istiod is running
+oc get pods -n istio-system -l app=istiod
+{code}
+
+h4. Deploy to Additional Clusters
+
+{code:language=bash|title=Enable Mesh on UAT and Production|theme=Confluence}
+# Register UAT cluster
+argocd cluster add <uat-context> --name uatocp4
+argocd cluster set https://api.uatocp4.example.com:6443 \
+  --label ossm3=installed \
+  --name uatocp4
+
+# Register Production cluster  
+argocd cluster add <prod-context> --name prodocp4
+argocd cluster set https://api.prodocp4.example.com:6443 \
+  --label ossm3=installed \
+  --name prodocp4
+
+# Refresh ApplicationSet to pick up new clusters
+argocd appset get ossm3-controlplanes-all --refresh
+
+# Verify Applications created for all clusters
+argocd app list | grep ossm3
+
+# Should see Applications for all labeled clusters:
+# devocp4test-ossm3-default
+# uatocp4-ossm3-default
+# uatocp4-ossm3-stable
+# prodocp4-ossm3-default
+# prodocp4-ossm3-stable
+# prodocp4-ossm3-canary (if status="installed")
+{code}
+
+h4. Disable Mesh on a Cluster
+
+{code:language=bash|title=Temporarily Disable Mesh Deployment|theme=Confluence}
+# Option 1: Remove cluster label (Applications remain but won't be recreated)
+argocd cluster set https://api.devocp4test.example.com:6443 \
+  --label ossm3-  # Remove label (note the minus sign)
+
+# Option 2: Change label value (more explicit)
+argocd cluster set https://api.devocp4test.example.com:6443 \
+  --label ossm3=disabled
+
+# Refresh ApplicationSet
+argocd appset get ossm3-controlplanes-all --refresh
+
+# Manually delete existing Applications if desired
+argocd app list | grep devocp4test-ossm3 | awk '{print $1}' | \
+  xargs -I {} argocd app delete {}
+
+# Re-enable later:
+argocd cluster set https://api.devocp4test.example.com:6443 \
+  --label ossm3=installed
+{code}
+
+h3. Label Application Namespaces
+
+{code:language=bash|title=Onboard Application to Service Mesh|theme=Confluence}
+# Label namespace to be managed by the 'default' control plane
+oc label namespace my-app istio-discovery=default
+
+# Verify namespace is discovered
+oc get namespace my-app --show-labels
+
+# Restart pods to inject sidecars
+oc rollout restart deployment -n my-app
+
+# Verify sidecar injection
+oc get pods -n my-app -o jsonpath='{.items[*].spec.containers[*].name}'
+# Should include: istio-proxy
+{code}
+
+----
+
+h2. Common Operations
+
+h3. Add New Control Plane to Existing Cluster
+
+{code:language=bash|title=Example: Add Canary Revision to Production|theme=Confluence|linenumbers=true}
+# 1. Edit the input file
+vim ossm3-controlplanes/overlays/prodocp4/rev-ns-input.yaml
+
+# Add new entry:
+- rev: canary
+  namespace: istio-canary
+  clusterDomain: apps.prodocp4.example.com
+  clusterServer: https://api.prodocp4.example.com:6443
+  status: "installed"
+  discoveryLabel: canary
+  owner: platform-team
+  createdDate: 2025-02-10
+
+# 2. Commit and push
+git add ossm3-controlplanes/overlays/prodocp4/rev-ns-input.yaml
+git commit -m "feat: add canary control plane to production"
+git push origin main
+
+# 3. ArgoCD auto-detects (3 min) or force refresh
+argocd appset get prodocp4-ossm3-controlplanes --refresh
+
+# 4. Verify new Application created
+argocd app list | grep prodocp4-ossm3-canary
+
+# 5. Check deployment
+oc get istio canary -n istio-canary
+oc get pods -n istio-canary
+{code}
+
+h3. Remove Control Plane
+
+{code:language=bash|title=Soft Delete with Audit Trail|theme=Confluence}
+# 1. Change status to "uninstalled"
+vim ossm3-controlplanes/overlays/prodocp4/rev-ns-input.yaml
+
+- rev: old-canary
+  namespace: istio-old-canary
+  status: "uninstalled"  # Changed from "installed"
+  deletedDate: 2025-02-10
+
+# 2. Commit
+git commit -am "chore: mark old-canary as uninstalled"
+git push
+
+# 3. ApplicationSet stops generating Application
+# 4. Manually delete the orphaned Application
+argocd app delete prodocp4-ossm3-old-canary --cascade
+
+# 5. Verify cleanup
+oc get istio -n istio-old-canary  # Should not exist
+oc get namespace istio-old-canary  # Should not exist
+{code}
+
+----
+
+h4. Auto-Pruning Behavior
+
+{warning}
+When you change a control plane's status from "installed" to "uninstalled" or "placeholder", ArgoCD will automatically delete all resources due to {{prune: true}} in the sync policy. This is intentional GitOps behavior.
+{warning}
+
+h5. What Happens When You Change Status
+
+{code:title=Status Change Workflow|language=text|theme=Confluence}
+1. ApplicationSet selector no longer matches entry
+   ↓
+2. ArgoCD removes Application from its inventory
+   ↓
+3. syncPolicy.automated.prune: true triggers
+   ↓
+4. ArgoCD AUTOMATICALLY DELETES all resources
+   - Istio CR deleted
+   - Namespace deleted (if CreateNamespace was used)
+   - All mesh configuration removed
+{code}
+
+h5. This Is GitOps Design - Not a Bug
+
+This behavior is *intentional* and aligns with GitOps principles:
+* Git is the source of truth
+* If something is removed from Git (or filtered out), it should be removed from cluster
+* {{prune: true}} enforces this principle
+
+h5. Control Options
+
+|| Configuration || Behavior || When to Use ||
+| {{prune: true}} | Auto-deletes resources when App removed | Production (enforces Git as source of truth) |
+| {{prune: false}} | Keeps resources when App removed | Testing/staging (manual cleanup required) |
+
+{warning}
+*Current Configuration:* This solution uses {{prune: true}} by design. Changing status to "uninstalled" will trigger automatic deletion.
+{warning}
+
+h5. Safe Deletion Workflow
+
+If you need time to verify before deletion:
+
+{code:language=bash|theme=Confluence}
+# Option 1: Manual Application deletion (retain control)
+# 1. Don't change status in Git yet
+# 2. Manually delete Application without cascade
+argocd app delete prodocp4-ossm3-canary --cascade=false
+
+# 3. Verify resources still exist
+oc get istio canary -n istio-canary
+
+# 4. When ready, delete resources manually
+oc delete istio canary -n istio-canary
+oc delete namespace istio-canary
+
+# 5. Update Git to reflect reality
+vim ossm3-controlplanes/overlays/prodocp4/rev-ns-input.yaml
+# Change status to "uninstalled"
+
+# Option 2: Use finalizers to delay deletion
+# Add to Istio CR:
+metadata:
+  finalizers:
+    - istio-finalizer.install.istio.io
+# Prevents deletion until finalizer manually removed
+{code}
+
+h5. Audit Trail Best Practice
+
+{code:language=yaml|title=Keep Uninstalled Entries for 90 Days|theme=Confluence}
+# Keep entry in Git with uninstalled status
+- rev: old-canary
+  namespace: istio-old-canary
+  status: "uninstalled"
+  deletedDate: 2025-02-10
+  deletedBy: john.doe@example.com
+  reason: "Migrated all workloads to stable revision"
+
+# After 90 days, remove entry entirely
+# Scheduled cleanup job can automate this
+{code}
+
+h3. Temporarily Disable Cluster
+
+{code:language=bash|title=Disable All Control Planes in UAT|theme=Confluence}
+# Primary Method: Remove cluster label
+argocd cluster set https://api.uatocp4.example.com:6443 \
+  --label ossm3-  # Remove label (note the minus sign)
+
+# Or change to different value:
+argocd cluster set https://api.uatocp4.example.com:6443 \
+  --label ossm3=disabled
+
+# Refresh ApplicationSet
+argocd appset get ossm3-controlplanes-all --refresh
+
+# Note: Existing Applications remain but won't be recreated if deleted
+# Manually remove Applications if desired:
+argocd app list | grep uatocp4-ossm3 | awk '{print $1}' | \
+  xargs -I {} argocd app delete {} --cascade
+
+# Re-enable later:
+argocd cluster set https://api.uatocp4.example.com:6443 \
+  --label ossm3=installed
+
+argocd appset get ossm3-controlplanes-all --refresh
+{code}
+
+{code:language=bash|title=Alternative: Change all statuses to placeholder|theme=Confluence}
+# This method keeps cluster labeled but disables all control planes
+yq eval -i '.[] | .status = "placeholder"' \
+  ossm3-controlplanes/overlays/uatocp4/rev-ns-input.yaml
+
+git commit -am "chore: disable UAT mesh temporarily"
+git push
+
+# Note: With prune:true, this will auto-delete resources!
+# See "Auto-Pruning Behavior" section for details
+{code}
+
+h3. Migration Between Revisions
+
+{code:language=bash|title=Migrate Workloads from 'default' to 'stable'|theme=Confluence}
+# 1. Ensure 'stable' control plane is deployed
+oc get istio stable -n istio-stable
+
+# 2. Relabel namespace
+oc label namespace my-app istio-discovery=stable --overwrite
+
+# 3. Restart pods to re-inject with new control plane
+oc rollout restart deployment -n my-app
+
+# 4. Verify new sidecar version
+oc get pod -n my-app -o jsonpath='{.items[0].metadata.labels.istio\.io/rev}'
+# Should show: stable
+
+# 5. After all workloads migrated, remove old control plane
+vim ossm3-controlplanes/overlays/prodocp4/rev-ns-input.yaml
+# Change 'default' status to "uninstalled"
+{code}
+
+----
+
+h2. Observability Stack
+
+h3. TempoStack Configuration
+
+{code:title=ossm3-observability/base/tempo/tempostack.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: tempo-blobstack
+  namespace: tracing-system
+  annotations:
+    argocd.argoproj.io/sync-options: "ServerSideApply=true"
+spec:
+  storage:
+    secret:
+      name: tempo-storage-secret
+      type: azure
+  storageSize: 100Gi
+  
+  template:
+    queryFrontend:
+      jaegerQuery:
+        enabled: true
+        ingress:
+          type: route
+          route:
+            termination: edge
+{code}
+
+{info}
+TempoStack automatically creates a Jaeger UI route when {{jaegerQuery.enabled: true}}.
+Access via: {{https://tempo-blobstack-jaegerquery-tracing-system.apps.cluster.com}}
+{info}
+
+h3. Kiali Configuration
+
+{code:title=ossm3-observability/base/kiali/kiali-cr.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: istio-system
+spec:
+  external_services:
+    tracing:
+      enabled: true
+      namespace: tracing-system
+      provider: tempo
+      use_grpc: true
+      # Internal gRPC endpoint for Kiali backend
+      url: "http://tempo-blobstack-query-frontend.tracing-system.svc.cluster.local:16685"
+      # External HTTP endpoint for browser links
+      external_url: "https://tempo-blobstack-jaegerquery-tracing-system.apps.cluster.com"
+      in_cluster_url: "http://tempo-blobstack-query-frontend.tracing-system.svc.cluster.local:16685"
+    
+    prometheus:
+      url: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+  
+  deployment:
+    accessible_namespaces:
+      - '**'
+{code}
+
+h3. OpenTelemetry Collector
+
+{code:title=base/opentelemetry-collector.yaml|language=yaml|theme=Confluence|linenumbers=true}
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: istio-system
+spec:
+  mode: deployment
+  
+  config: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+    
+    exporters:
+      otlp:
+        endpoint: tempo-blobstack-distributor.tracing-system.svc.cluster.local:4317
+        tls:
+          insecure: true
+    
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp]
+{code}
+
+----
+
+h2. Troubleshooting
+
+h3. ApplicationSet Not Creating Applications
+
+*Diagnosis Steps:*
+
+{code:language=bash|theme=Confluence}
+# 1. Check ApplicationSet status
+oc get appset <appset-name> -n openshift-gitops -o yaml | grep -A20 conditions
+
+# 2. View ApplicationSet controller logs
+APPSET_POD=$(oc get pod -n openshift-gitops -l app.kubernetes.io/name=argocd-applicationset-controller -o name)
+oc logs -n openshift-gitops $APPSET_POD --tail=100
+
+# 3. Check for errors in git file parsing
+oc logs -n openshift-gitops $APPSET_POD | grep "failed to get params"
+
+# 4. Verify status field is quoted string
+yq eval '.[0].status | type' ossm3-controlplanes/overlays/*/rev-ns-input.yaml
+# Should output: !!str
+
+# 5. Force ApplicationSet refresh
+argocd appset get <appset-name> --refresh
+{code}
+
+h4. Common Errors
+
+|| Error Message || Cause || Solution ||
+| {{failed to get params for the second generator}} | Cluster generator not first in matrix | Ensure cluster generator comes BEFORE git generator |
+| {{selector did not match}} | Status value mismatch | Ensure status is quoted: {{"installed"}} not {{installed}} |
+| {{template validation failed}} | Using goTemplate syntax in fasttemplate mode | Remove {{goTemplate: true}} or use {{{{.field}}}} syntax |
+| {{no matching key found}} | Git path references undefined variable | Verify cluster names match folder names exactly |
+
+h3. Control Plane Not Starting
+
+{code:language=bash|title=Debug Istio Control Plane Issues|theme=Confluence}
+# Check Istio CR status
+oc get istio <rev> -n <namespace> -o yaml | grep -A20 status
+
+# Check istiod pod logs
+oc logs -n <namespace> -l app=istiod --tail=100
+
+# Verify discovery selectors
+oc get istio <rev> -n <namespace> -o jsonpath='{.spec.values.meshConfig.discoverySelectors}'
+
+# Check if namespaces are labeled correctly
+oc get namespace -l istio-discovery=<label>
+
+# Verify operator logs
+oc logs -n openshift-operators -l name=istio-operator --tail=100
+{code}
+
+h3. Prometheus Unauthorized Errors
+
+This occurs when Istio mTLS blocks Prometheus (which is outside the mesh) from scraping metrics.
+
+{code:language=bash|theme=Confluence}
+# 1. Verify PeerAuthentication exists
+oc get peerauthentication -n <namespace>
+
+# 2. Check port-level mTLS exemptions
+oc get peerauthentication istiod-metrics -n <namespace> -o yaml
+
+# 3. Verify AuthorizationPolicy allows monitoring namespaces
+oc get authorizationpolicy allow-prometheus -n <namespace> -o yaml
+
+# 4. Test Prometheus scraping
+PROM_POD=$(oc get pod -n openshift-user-workload-monitoring -l app.kubernetes.io/name=prometheus -o name | head -1)
+ISTIOD_IP=$(oc get pod -n <namespace> -l app=istiod -o jsonpath='{.items[0].status.podIP}')
+
+oc exec -n openshift-user-workload-monitoring $PROM_POD -c prometheus -- \
+  curl -s http://${ISTIOD_IP}:15020/stats/prometheus | head -20
+
+# Should return metrics, not 401/403
+{code}
+
+h3. Tracing Not Working
+
+{code:language=bash|title=Debug Distributed Tracing|theme=Confluence}
+# 1. Verify TempoStack is healthy
+oc get tempostack -n tracing-system
+oc get pods -n tracing-system
+
+# 2. Check OpenTelemetry Collector
+oc get opentelemetrycollector -n istio-system
+oc logs -n istio-system -l app.kubernetes.io/name=otel-collector --tail=50
+
+# 3. Verify Telemetry resource
+oc get telemetry -n <namespace>
+
+# 4. Check if traces are being sent
+oc exec -n <app-namespace> <pod-name> -c istio-proxy -- \
+  curl localhost:15000/stats/prometheus | grep envoy_cluster_upstream_rq_total
+
+# 5. Access Jaeger UI
+JAEGER_ROUTE=$(oc get route -n tracing-system -o jsonpath='{.items[0].spec.host}')
+echo "Jaeger UI: https://$JAEGER_ROUTE"
+{code}
+
+----
+
+h2. Best Practices
+
+h3. Git Workflow
+
+*Recommended Git Workflow:*
+
+h4. Development Flow
+1. Create feature branch from {{main}}
+2. Make changes to input files or templates
+3. Test in dev cluster first
+4. Create pull request for review
+5. Merge to {{main}} after approval
+6. ArgoCD auto-syncs to clusters
+
+h4. Production Changes
+1. Deploy to dev → verify
+2. Deploy to UAT → test
+3. Deploy to production → monitor
+
+h4. Rollback Procedure
+1. {{git revert}} the commit
+2. Push to {{main}}
+3. ArgoCD auto-syncs rollback
+
+h3. Namespace Labels
+
+{code:language=bash|title=Standard Namespace Labeling|theme=Confluence}
+# Always label with discovery label, not sidecar injection label
+# CORRECT:
+oc label namespace my-app istio-discovery=default
+
+# WRONG (old OSSM2 pattern):
+oc label namespace my-app istio-injection=enabled
+{code}
+
+h3. Monitoring
+
+{code:language=bash|title=ServiceMonitor for Control Plane Metrics|theme=Confluence}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: istiod-{{rev}}
+  namespace: {{namespace}}
+  labels:
+    openshift.io/cluster-monitoring: "true"
+spec:
+  selector:
+    matchLabels:
+      app: istiod
+      istio.io/rev: "{{rev}}"
+  endpoints:
+    - port: http-monitoring
+      interval: 30s
+      path: /metrics
+{code}
+
+h3. Security
+
+*Security Checklist:*
+
+* Never commit secrets to Git (use sealed secrets or external secrets operator)
+* Use RBAC to restrict who can modify mesh configuration
+* Enable ArgoCD RBAC to control ApplicationSet access
+* Use separate ArgoCD Projects per environment
+* Enable audit logging for all mesh configuration changes
+* Regularly review and rotate service account tokens
+
+----
+
+h2. Reference
+
+h3. Important URLs
+
+|| Resource || URL Template ||
+| Jaeger UI | {{https://tempo-blobstack-jaegerquery-tracing-system.apps.<cluster>.com}} |
+| Kiali Console | {{https://kiali-istio-system.apps.<cluster>.com}} |
+| Grafana | {{https://grafana-route-grafana.apps.<cluster>.com}} |
+| OpenShift Console Metrics | {{https://console-openshift-console.apps.<cluster>.com/monitoring}} |
+
+h3. Key ArgoCD Commands
+
+{code:language=bash|title=ArgoCD CLI Reference|theme=Confluence}
+# List ApplicationSets
+argocd appset list
+
+# Get ApplicationSet details
+argocd appset get <name>
+
+# Force refresh
+argocd appset get <name> --refresh
+
+# List Applications
+argocd app list
+
+# Sync Application
+argocd app sync <name>
+
+# Delete Application
+argocd app delete <name> --cascade
+
+# View Application details
+argocd app get <name>
+
+# Check Application health
+argocd app health <name>
+{code}
+
+h3. Status Field Comparison
+
+{code:title=Status Value Behavior Matrix|language=text|theme=Confluence}
+╔═══════════════╦══════════════════════╦═════════════════════╗
+║ Status Value  ║ ArgoCD Behavior      ║ Use Case            ║
+╠═══════════════╬══════════════════════╬═════════════════════╣
+║ "installed"   ║ Creates Application  ║ Active deployments  ║
+║ "placeholder" ║ Filtered out         ║ Future plans        ║
+║ "uninstalled" ║ Filtered out         ║ Audit trail         ║
+╚═══════════════╩══════════════════════╩═════════════════════╝
+{code}
+
+----
+
+h2. Appendix
+
+h3. Complete Cluster Setup Automation
+
+{code:language=bash|title=end-to-end-deployment.sh|theme=Confluence|collapse=true|linenumbers=true}
+#!/bin/bash
+set -e
+
+# Configuration
+REPO_URL="https://url"
+CLUSTERS=("devocp4test" "uatocp4" "prodocp4")
+CLUSTER_URLS=(
+  "https://api.devocp4test.example.com:6443"
+  "https://api.uatocp4.example.com:6443"
+  "https://api.prodocp4.example.com:6443"
+)
+
+echo "=== OSSM3 Automated Deployment Script ==="
+echo ""
+
+# Step 1: Clone repository
+echo "Step 1: Cloning repository..."
+git clone $REPO_URL
+cd AA-GitOps-RHServiceMeshOperator3
+
+# Step 2: Create directory structure
+echo "Step 2: Creating directory structure..."
+mkdir -p ossm3-controlplanes/{base/monitoring,overlays/{devocp4test,uatocp4,prodocp4}}
+mkdir -p argocd-apps
+
+# Step 3: Generate input files
+echo "Step 3: Generating input files..."
+for cluster in "${CLUSTERS[@]}"; do
+  cat > "ossm3-controlplanes/overlays/${cluster}/rev-ns-input.yaml" <<EOF
+- rev: default
+  namespace: istio-system
+  clusterDomain: apps.${cluster}.example.com
+  status: "installed"
+  discoveryLabel: default
+  owner: platform-team
+  createdDate: $(date +%Y-%m-%d)
+EOF
+  echo "  Created ${cluster}/rev-ns-input.yaml"
+done
+
+# Step 4: Create base templates
+echo "Step 4: Creating base templates..."
+# (Templates would be created here - omitted for brevity)
+
+# Step 5: Create single multi-cluster ApplicationSet
+echo "Step 5: Creating multi-cluster ApplicationSet..."
+cat > "argocd-apps/ossm3-controlplanes-multi-cluster.yaml" <<'APPSET'
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ossm3-controlplanes-all
+  namespace: openshift-gitops
+spec:
+  generators:
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels:
+                  ossm3: "installed"
+          - git:
+              repoURL: https://url
+              revision: main
+              files:
+                - path: "ossm3-controlplanes/overlays/{{name}}/rev-ns-input.yaml"
+      selector:
+        matchLabels:
+          status: "installed"
+  template:
+    metadata:
+      name: '{{name}}-ossm3-{{rev}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://url
+        targetRevision: main
+        path: ossm3-controlplanes/base
+        plugin:
+          name: kustomize-with-helm
+          parameters:
+            - name: rev
+              value: '{{rev}}'
+            - name: namespace
+              value: '{{namespace}}'
+            - name: clusterDomain
+              value: '{{clusterDomain}}'
+            - name: discoveryLabel
+              value: '{{discoveryLabel}}'
+      destination:
+        server: '{{server}}'
+        namespace: '{{namespace}}'
+      syncPolicy:
+        automated:
+          selfHeal: true
+          prune: true
+        syncOptions:
+          - CreateNamespace=true
+APPSET
+
+echo "  Created ossm3-controlplanes-multi-cluster.yaml"
+
+# Step 6: Commit to Git
+echo "Step 6: Committing to Git..."
+git add .
+git commit -m "feat: automated OSSM3 setup"
+git push origin main
+
+# Step 7: Register and label clusters in ArgoCD
+echo "Step 7: Registering and labeling clusters in ArgoCD..."
+for i in "${!CLUSTERS[@]}"; do
+  cluster="${CLUSTERS[$i]}"
+  url="${CLUSTER_URLS[$i]}"
+  
+  echo "  Registering ${cluster}..."
+  argocd cluster add "${cluster}" --name "${cluster}" || echo "  Already registered"
+  
+  echo "  Labeling ${cluster}..."
+  argocd cluster set "${url}" --label ossm3=installed --name "${cluster}"
+done
+
+# Step 8: Apply ApplicationSet
+echo "Step 8: Applying multi-cluster ApplicationSet..."
+oc apply -f argocd-apps/ossm3-controlplanes-multi-cluster.yaml
+
+# Step 9: Verify
+echo "Step 9: Verifying deployment..."
+sleep 10
+argocd appset get ossm3-controlplanes-all --refresh
+sleep 10
+argocd app list | grep ossm3
+
+echo ""
+echo "=== Deployment Complete ==="
+echo "Monitor progress: argocd app list | grep ossm3"
+echo "Deployed to clusters: ${CLUSTERS[@]}"
+{code}
+
+h3. Cleanup Script
+
+{code:language=bash|title=cleanup-mesh.sh|theme=Confluence|collapse=true}
+#!/bin/bash
+set -e
+
+CLUSTER=$1
+
+if [ -z "$CLUSTER" ]; then
+  echo "Usage: $0 <cluster-name>"
+  echo "Example: $0 prodocp4"
+  exit 1
+fi
+
+echo "=== Cleaning up OSSM3 from ${CLUSTER} ==="
+
+# Get cluster URL
+CLUSTER_URL=$(argocd cluster list | grep "${CLUSTER}" | awk '{print $1}')
+
+if [ -z "$CLUSTER_URL" ]; then
+  echo "ERROR: Cluster ${CLUSTER} not found in ArgoCD"
+  exit 1
+fi
+
+# Remove cluster label to stop new deployments
+echo "Removing ossm3 label from cluster..."
+argocd cluster set "${CLUSTER_URL}" --label ossm3-
+
+# Refresh ApplicationSet to stop generating Applications
+argocd appset get ossm3-controlplanes-all --refresh
+
+# Delete all Applications for this cluster
+echo "Deleting Applications..."
+argocd app list | grep "${CLUSTER}-ossm3-" | awk '{print $1}' | \
+  xargs -I {} argocd app delete {} --cascade
+
+# Clean up namespaces (if they still exist)
+echo "Cleaning up namespaces..."
+oc delete namespace istio-system --ignore-not-found
+oc delete namespace istio-stable --ignore-not-found
+oc delete namespace istio-canary --ignore-not-found
+
+echo "=== Cleanup complete for ${CLUSTER} ==="
+echo "To re-enable mesh deployment, run:"
+echo "  argocd cluster set ${CLUSTER_URL} --label ossm3=installed"
+{code}
+
+----
+
+h4. Document Revision History
+
+|| Version || Date || Author || Changes ||
+| 1.0 | 2025-02-10 | Platform Team | Initial release |
+
+h4. Support Contacts
+
+*Platform Team:* platform-team@example.com
+*Slack Channel:* #mesh-support
+*Jira Project:* MESH
