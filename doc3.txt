@@ -1,3 +1,20 @@
+# Get the OAuth route
+OAUTH_ROUTE=$(oc get route oauth-openshift -n openshift-authentication -o jsonpath='{.spec.host}')
+
+# Get token using the functional ID's AD username and password
+TOKEN=$(curl -sk -u "functional_id_username:password" \
+  "https://${OAUTH_ROUTE}/oauth/authorize?response_type=token&client_id=openshift-challenging-client" \
+  -H "X-CSRF-Token: 1" -D - 2>/dev/null \
+  | grep -oP 'access_token=\K[^&]+')
+
+echo $TOKEN
+
+# Login with the token
+oc login --token=$TOKEN --server=https://api.<cluster>:6443
+
+
+
+
 #!/bin/bash
 # Save as generate-structure.sh
 
