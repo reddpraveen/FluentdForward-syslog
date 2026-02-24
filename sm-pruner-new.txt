@@ -1,3 +1,60 @@
+# Get ALL secrets in system namespaces with their status
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.metadata.namespace | test("^(openshift|kube)-")) |
+    "\(.metadata.namespace)/\(.metadata.name) | type: \(.type // "Opaque") | age: \(now - (.metadata.creationTimestamp | fromdateiso8601) | . / 86400 | floor) days"
+  ' > all-system-secrets.txt
+
+# Count by namespace
+oc get secrets --all-namespaces -o json | \
+  jq -r '.items[].metadata.namespace' | \
+  grep -E "^(openshift|kube)-" | sort | uniq -c | sort -nr
+
+# Test your CRD detection on specific namespaces
+for ns in openshift-gitops openshift-monitoring openshift-storage; do
+  echo "=== $ns ==="
+  oc get secrets -n "$ns" -o name | while read secret; do
+    secret_name=$(echo "$secret" | cut -d/ -f2)
+    
+    # Check if referenced by any CRD
+    referenced=false
+    
+    # Check GitOps CRDs
+    if oc get applications.argoproj.io -n "$ns" &>/dev/null; then
+      if oc get applications.argoproj.io -n "$ns" -o json | jq -e ".items[] | .. | select(. == \"$secret_name\")" >/dev/null; then
+        referenced=true
+      fi
+    fi
+    
+    # Check Monitoring CRDs  
+    if oc get alertmanagers.monitoring.coreos.com -n "$ns" &>/dev/null; then
+      if oc get alertmanagers.monitoring.coreos.com -n "$ns" -o json | jq -e ".items[] | .. | select(. == \"$secret_name\")" >/dev/null; then
+        referenced=true
+      fi
+    fi
+    
+    if [[ "$referenced" == "false" ]]; then
+      echo "UNREFERENCED: $secret_name"
+    else
+      echo "REFERENCED: $secret_name"
+    fi
+  done
+done
+
+
+# Find old secrets that are likely safe to delete
+oc get secrets --all-namespaces -o json | \
+  jq -r '
+    .items[] | 
+    select(.metadata.namespace | test("^(openshift|kube)-")) |
+    select(.metadata.creationTimestamp) |
+    (.metadata.creationTimestamp | fromdateiso8601) as $created |
+    (now - $created) / 86400 as $age_days |
+    select($age_days > 90) |
+    "\(.metadata.namespace)/\(.metadata.name) (\($age_days | floor) days old)"
+  ' | head -20
+-------------
 ---
 apiVersion: v1
 kind: ConfigMap
