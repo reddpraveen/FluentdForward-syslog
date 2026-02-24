@@ -1,0 +1,197 @@
+# ============================================================
+# MCG Self-Service Storage POC — Lab Validation
+# ============================================================
+
+# ---- Step 0: Verify NooBaa is healthy ----
+oc get noobaa -n openshift-storage -o jsonpath='{.items[0].status.phase}'
+# Expected: Ready
+
+# ---- Step 1: Create Azure secrets for two teams ----
+oc create secret generic team-alpha-azure-creds \
+  --from-literal=AccountName=<ALPHA_AZURE_ACCOUNT_NAME> \
+  --from-literal=AccountKey=<ALPHA_AZURE_ACCOUNT_KEY> \
+  -n openshift-storage
+
+oc create secret generic team-beta-azure-creds \
+  --from-literal=AccountName=<BETA_AZURE_ACCOUNT_NAME> \
+  --from-literal=AccountKey=<BETA_AZURE_ACCOUNT_KEY> \
+  -n openshift-storage
+
+# ---- Step 2: Create BackingStores ----
+cat << 'EOF' | oc apply -f -
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  name: team-alpha-bs
+  namespace: openshift-storage
+spec:
+  type: azure-blob
+  azureBlob:
+    secret:
+      name: team-alpha-azure-creds
+      namespace: openshift-storage
+    targetBlobContainer: <ALPHA_CONTAINER_NAME>
+---
+apiVersion: noobaa.io/v1alpha1
+kind: BackingStore
+metadata:
+  name: team-beta-bs
+  namespace: openshift-storage
+spec:
+  type: azure-blob
+  azureBlob:
+    secret:
+      name: team-beta-azure-creds
+      namespace: openshift-storage
+    targetBlobContainer: <BETA_CONTAINER_NAME>
+EOF
+
+# Wait for both to be Ready
+oc get backingstore -n openshift-storage -w
+
+# ---- Step 3: Create BucketClasses ----
+cat << 'EOF' | oc apply -f -
+apiVersion: noobaa.io/v1alpha1
+kind: BucketClass
+metadata:
+  name: team-alpha-bc
+  namespace: openshift-storage
+spec:
+  placementPolicy:
+    tiers:
+      - placement: Spread
+        backingStores:
+          - team-alpha-bs
+---
+apiVersion: noobaa.io/v1alpha1
+kind: BucketClass
+metadata:
+  name: team-beta-bc
+  namespace: openshift-storage
+spec:
+  placementPolicy:
+    tiers:
+      - placement: Spread
+        backingStores:
+          - team-beta-bs
+EOF
+
+# ---- Step 4: Create team namespaces ----
+oc new-project team-alpha 2>/dev/null || true
+oc new-project team-beta 2>/dev/null || true
+
+# ---- Step 5: Create OBCs in each team namespace ----
+cat << 'EOF' | oc apply -f -
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: alpha-app-data
+  namespace: team-alpha
+spec:
+  generateBucketName: alpha-app
+  storageClassName: openshift-storage.noobaa.io
+  additionalConfig:
+    bucketclass: team-alpha-bc
+---
+apiVersion: objectbucket.io/v1alpha1
+kind: ObjectBucketClaim
+metadata:
+  name: beta-app-data
+  namespace: team-beta
+spec:
+  generateBucketName: beta-app
+  storageClassName: openshift-storage.noobaa.io
+  additionalConfig:
+    bucketclass: team-beta-bc
+EOF
+
+# Wait for Bound
+oc get obc -n team-alpha -w
+oc get obc -n team-beta -w
+
+# ---- Step 6: Verify auto-generated credentials ----
+# Each OBC creates a Secret + ConfigMap with same name as the OBC
+oc get secret alpha-app-data -n team-alpha
+oc get configmap alpha-app-data -n team-alpha
+oc get secret beta-app-data -n team-beta
+oc get configmap beta-app-data -n team-beta
+
+# ---- Step 7: Get S3 endpoint ----
+S3_HOST=$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
+printf "S3 Endpoint: https://%s\n" "$S3_HOST"
+
+# ---- Step 8: Write data to Team Alpha bucket ----
+ALPHA_ACCESS=$(oc get secret alpha-app-data -n team-alpha -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+ALPHA_SECRET=$(oc get secret alpha-app-data -n team-alpha -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+ALPHA_BUCKET=$(oc get configmap alpha-app-data -n team-alpha -o jsonpath='{.data.BUCKET_NAME}')
+
+oc run alpha-s3-test -n team-alpha --rm -i --restart=Never \
+  --image=amazon/aws-cli \
+  --env="AWS_ACCESS_KEY_ID=$ALPHA_ACCESS" \
+  --env="AWS_SECRET_ACCESS_KEY=$ALPHA_SECRET" \
+  -- s3 cp /etc/hostname "s3://$ALPHA_BUCKET/team-alpha-test.txt" \
+  --endpoint-url "https://$S3_HOST" --no-verify-ssl
+
+# List objects
+oc run alpha-s3-list -n team-alpha --rm -i --restart=Never \
+  --image=amazon/aws-cli \
+  --env="AWS_ACCESS_KEY_ID=$ALPHA_ACCESS" \
+  --env="AWS_SECRET_ACCESS_KEY=$ALPHA_SECRET" \
+  -- s3 ls "s3://$ALPHA_BUCKET/" \
+  --endpoint-url "https://$S3_HOST" --no-verify-ssl
+
+# ---- Step 9: Write data to Team Beta bucket ----
+BETA_ACCESS=$(oc get secret beta-app-data -n team-beta -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d)
+BETA_SECRET=$(oc get secret beta-app-data -n team-beta -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d)
+BETA_BUCKET=$(oc get configmap beta-app-data -n team-beta -o jsonpath='{.data.BUCKET_NAME}')
+
+oc run beta-s3-test -n team-beta --rm -i --restart=Never \
+  --image=amazon/aws-cli \
+  --env="AWS_ACCESS_KEY_ID=$BETA_ACCESS" \
+  --env="AWS_SECRET_ACCESS_KEY=$BETA_SECRET" \
+  -- s3 cp /etc/hostname "s3://$BETA_BUCKET/team-beta-test.txt" \
+  --endpoint-url "https://$S3_HOST" --no-verify-ssl
+
+# List objects
+oc run beta-s3-list -n team-beta --rm -i --restart=Never \
+  --image=amazon/aws-cli \
+  --env="AWS_ACCESS_KEY_ID=$BETA_ACCESS" \
+  --env="AWS_SECRET_ACCESS_KEY=$BETA_SECRET" \
+  -- s3 ls "s3://$BETA_BUCKET/" \
+  --endpoint-url "https://$S3_HOST" --no-verify-ssl
+
+# ---- Step 10: Verify data landed in separate Azure accounts ----
+# Team Alpha's data should ONLY be in Alpha's Azure account
+az storage blob list \
+  --account-name <ALPHA_AZURE_ACCOUNT_NAME> \
+  --container-name <ALPHA_CONTAINER_NAME> \
+  --output table
+
+# Team Beta's data should ONLY be in Beta's Azure account
+az storage blob list \
+  --account-name <BETA_AZURE_ACCOUNT_NAME> \
+  --container-name <BETA_CONTAINER_NAME> \
+  --output table
+
+# ---- Step 11: Show the full picture ----
+printf "\n=== BackingStores ===\n"
+oc get backingstore -n openshift-storage -o custom-columns=NAME:.metadata.name,TYPE:.spec.type,PHASE:.status.phase
+
+printf "\n=== BucketClasses ===\n"
+oc get bucketclass -n openshift-storage -o custom-columns=NAME:.metadata.name,PHASE:.status.phase
+
+printf "\n=== OBCs ===\n"
+oc get obc -A -o custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,CLASS:.spec.additionalConfig.bucketclass,PHASE:.status.phase
+
+printf "\n=== Object Buckets ===\n"
+oc get ob -o custom-columns=NAME:.metadata.name,STORAGE-CLASS:.spec.storageClassName,PHASE:.status.phase
+
+# ============================================================
+# POC Cleanup (when done)
+# ============================================================
+# oc delete obc alpha-app-data -n team-alpha
+# oc delete obc beta-app-data -n team-beta
+# oc delete bucketclass team-alpha-bc team-beta-bc -n openshift-storage
+# oc delete backingstore team-alpha-bs team-beta-bs -n openshift-storage
+# oc delete secret team-alpha-azure-creds team-beta-azure-creds -n openshift-storage
+# oc delete project team-alpha team-beta
