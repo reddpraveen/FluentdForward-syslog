@@ -1,3 +1,311 @@
+# ConfigMap Pruner v1.0 — Verification Guide
+## Scope: openshift-apiserver and openshift-oauth-apiserver
+
+---
+
+## Background
+
+Red Hat Solution #6977315 (June 2024) confirms a platform bug affecting all OCP 4.x:
+`openshift-apiserver` and `openshift-oauth-apiserver` are missing the revision-pruner
+CronJob that exists in `openshift-kube-apiserver`. This causes unlimited accumulation
+of revision-stamped ConfigMaps. The bug is in the operator architecture — both
+`cluster-openshift-apiserver-operator` and `cluster-authentication-operator` use a
+pre-library-go Deployment-based workload pattern that never wired up the
+`StaticPodOperatorClient` framework (which generates the revision-pruner CronJob).
+
+**Observed accumulation in affected clusters:**
+- `revision-status-<N>`: 23 in `openshift-apiserver`, 8 in `openshift-oauth-apiserver`
+- `audit-<N>`: 24 in `openshift-apiserver`, 9 in `openshift-oauth-apiserver`
+- `config-<N>`: similar counts (correlates with revision count)
+
+Compare to healthy namespaces with working pruner: `openshift-kube-apiserver` 5, `openshift-etcd` 5.
+
+---
+
+## Architecture Differences: 4.16 vs 4.18
+
+The API field path for `latestAvailableRevision` differs by OCP version:
+
+| Version | openshiftapiserver CR | authentication CR (oauth) |
+|---------|----------------------|--------------------------|
+| 4.16/4.17 | `.status.latestAvailableRevision` | `.status.oauthAPIServer.latestAvailableRevision` |
+| 4.18+ | `.status.latestAvailableRevision` | `.status.latestAvailableRevision` (field moved to OperatorStatus base in API PR #2038, merged 4.18.0-202409250208) |
+
+The script automatically detects OCP version and uses the correct path. It also has
+a fallback that scans `revision-status-<N>` ConfigMaps directly if the CR query fails.
+
+---
+
+## Pre-Deployment: Baseline Assessment
+
+Run these on your cluster before deploying:
+
+```bash
+# How many revision-status ConfigMaps exist in each namespace?
+echo "=== openshift-apiserver ==="
+oc get cm -n openshift-apiserver --no-headers | awk '{print $1}' | grep -E '^revision-status-[0-9]+$' | wc -l
+oc get cm -n openshift-apiserver --no-headers | awk '{print $1}' | grep -E '^audit-[0-9]+$' | wc -l
+oc get cm -n openshift-apiserver --no-headers | awk '{print $1}' | grep -E '^config-[0-9]+$' | wc -l
+
+echo "=== openshift-oauth-apiserver ==="
+oc get cm -n openshift-oauth-apiserver --no-headers | awk '{print $1}' | grep -E '^revision-status-[0-9]+$' | wc -l
+oc get cm -n openshift-oauth-apiserver --no-headers | awk '{print $1}' | grep -E '^audit-[0-9]+$' | wc -l
+oc get cm -n openshift-oauth-apiserver --no-headers | awk '{print $1}' | grep -E '^config-[0-9]+$' | wc -l
+
+# What is the current latestAvailableRevision?
+echo "=== Current revision ==="
+oc get openshiftapiserver cluster -o jsonpath='{.status.latestAvailableRevision}'; echo
+# OCP 4.16/4.17 (oauth):
+oc get authentication cluster -o jsonpath='{.status.oauthAPIServer.latestAvailableRevision}'; echo
+# OCP 4.18+ (oauth):
+oc get authentication cluster -o jsonpath='{.status.latestAvailableRevision}'; echo
+
+# What revision numbers exist?
+echo "=== Revision numbers (openshift-apiserver) ==="
+oc get cm -n openshift-apiserver --no-headers | awk '{print $1}' | \
+  grep -oP '(?<=revision-status-)\d+$' | sort -n
+
+echo "=== Revision numbers (openshift-oauth-apiserver) ==="
+oc get cm -n openshift-oauth-apiserver --no-headers | awk '{print $1}' | \
+  grep -oP '(?<=revision-status-)\d+$' | sort -n
+
+# Cross-check: are audit-N and config-N present for same revision numbers?
+echo "=== ConfigMap families per revision (openshift-apiserver) ==="
+for rev in $(oc get cm -n openshift-apiserver --no-headers | awk '{print $1}' | \
+  grep -oP '(?<=revision-status-)\d+$' | sort -n); do
+  echo -n "  revision $rev: "
+  for prefix in revision-status audit config; do
+    if oc get cm "${prefix}-${rev}" -n openshift-apiserver &>/dev/null; then
+      printf '%s ' "${prefix}-${rev}"
+    fi
+  done
+  echo
+done
+```
+
+---
+
+## Deployment
+
+```bash
+# Create namespace (if not already exists from secret-pruner)
+oc apply -f configmap-pruner-v1.yaml
+
+# Verify deployment
+oc get cronjob configmap-pruner -n configmap-secret-pruner
+oc get sa cm-configmap-pruner -n configmap-secret-pruner
+oc get clusterrole cm-configmap-pruner
+oc get clusterrolebinding cm-configmap-pruner
+```
+
+---
+
+## Phase 1: Dry-Run Validation
+
+Both namespaces are in `dryRunReviewNamespaces` by default, so no deletions occur
+even if global `dryRun=false`. This is intentional.
+
+```bash
+# Trigger a manual dry-run job
+oc create job configmap-pruner-dryrun-001 \
+  --from=cronjob/configmap-pruner \
+  -n configmap-secret-pruner
+
+# Monitor progress
+oc logs -f job/configmap-pruner-dryrun-001 -n configmap-secret-pruner
+
+# Expected output includes:
+#   REVIEW-MODE: openshift-apiserver forced to DRY_RUN
+#   REVIEW-MODE: openshift-oauth-apiserver forced to DRY_RUN
+#   latestAvailableRevision: <N>
+#   Keep set (revisions): <N> <N-1> <N-2> <N-3> <N-4>
+#   DRY-RUN: Would delete revision-status-<old>
+#   DRY-RUN: Would delete audit-<old>
+#   DRY-RUN: Would delete config-<old>
+```
+
+**Verify the dry-run output:**
+
+```bash
+# What would be deleted? (parse DRY-RUN lines from logs)
+oc logs job/configmap-pruner-dryrun-001 -n configmap-secret-pruner 2>&1 | \
+  grep "DRY-RUN"
+
+# What is in the keep set?
+oc logs job/configmap-pruner-dryrun-001 -n configmap-secret-pruner 2>&1 | \
+  grep "Keep set"
+
+# How many would be deleted per namespace?
+oc logs job/configmap-pruner-dryrun-001 -n configmap-secret-pruner 2>&1 | \
+  grep "Namespace summary"
+
+# Confirm no live ConfigMaps would be deleted
+oc logs job/configmap-pruner-dryrun-001 -n configmap-secret-pruner 2>&1 | \
+  grep "latestAvailableRevision"
+```
+
+**Manual validation of keep set:**
+
+```bash
+# Get current live revision
+CURRENT_REV=$(oc get openshiftapiserver cluster \
+  -o jsonpath='{.status.latestAvailableRevision}')
+echo "Current: $CURRENT_REV"
+
+# The configmap-pruner should protect revision-status-${CURRENT_REV} and 4 before it
+# Verify it appears in the KEEP line in logs
+oc logs job/configmap-pruner-dryrun-001 -n configmap-secret-pruner 2>&1 | \
+  grep -A1 "Keep set"
+```
+
+---
+
+## Phase 2: Enable Live Deletion for openshift-oauth-apiserver First
+
+`openshift-oauth-apiserver` has lower volume (8 revision-status vs 23) and is safer
+to enable first.
+
+```bash
+# Edit the ConfigMap to remove openshift-oauth-apiserver from dryRunReviewNamespaces
+oc edit cm configmap-pruner-config -n configmap-secret-pruner
+# Change dryRunReviewNamespaces to:
+#   ^openshift-apiserver$
+# (remove the oauth line)
+
+# Also set global dryRun to false:
+# dryRun: "false"
+
+# Trigger a live run for oauth-apiserver
+oc create job configmap-pruner-live-oauth-001 \
+  --from=cronjob/configmap-pruner \
+  -n configmap-secret-pruner
+
+# Monitor
+oc logs -f job/configmap-pruner-live-oauth-001 -n configmap-secret-pruner
+
+# Verify deletion occurred
+oc get cm -n openshift-oauth-apiserver --no-headers | \
+  awk '{print $1}' | grep -E '^revision-status-[0-9]+$' | wc -l
+# Should now be ≤ 5
+
+# Verify operator is healthy after pruning
+oc get co authentication
+# Should remain Available=True, Progressing=False, Degraded=False
+```
+
+---
+
+## Phase 3: Enable Live Deletion for openshift-apiserver
+
+After oauth-apiserver validates cleanly:
+
+```bash
+# Edit ConfigMap to remove openshift-apiserver from dryRunReviewNamespaces too
+oc edit cm configmap-pruner-config -n configmap-secret-pruner
+# Change dryRunReviewNamespaces to empty (or add a comment-only line)
+
+# Trigger live run
+oc create job configmap-pruner-live-oapi-001 \
+  --from=cronjob/configmap-pruner \
+  -n configmap-secret-pruner
+
+# Monitor
+oc logs -f job/configmap-pruner-live-oapi-001 -n configmap-secret-pruner
+
+# Verify
+oc get cm -n openshift-apiserver --no-headers | \
+  awk '{print $1}' | grep -E '^revision-status-[0-9]+$' | wc -l
+# Should now be ≤ 5
+
+# Verify operator is healthy
+oc get co openshift-apiserver
+```
+
+---
+
+## Ongoing Health Checks
+
+```bash
+# Weekly count comparison (expect ≤5 for all three namespaces)
+for ns in openshift-kube-apiserver openshift-apiserver openshift-oauth-apiserver; do
+  count=$(oc get cm -n "$ns" --no-headers | awk '{print $1}' | grep -cE '^revision-status-[0-9]+$' || echo "0")
+  echo "$ns: $count revision-status ConfigMaps"
+done
+
+# Check last job status
+oc get jobs -n configmap-secret-pruner --sort-by='.metadata.creationTimestamp' | tail -5
+oc get job -n configmap-secret-pruner -o jsonpath='{range .items[-3:]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Complete")].status}{"\n"}{end}'
+```
+
+---
+
+## Secret Pruner v3.2 — Scope Assessment
+
+**Question: Does secret-pruner-v3.2 need any logic changes?**
+
+**Answer: No changes needed.** Here is why:
+
+### What accumulates in openshift-apiserver (Secrets only)
+
+The only numbered secrets in `openshift-apiserver` are `encryption-config-<N>`.
+These are managed by the `encryptionPruneController` which marks them with
+`deletionTimestamp + finalizer` when no longer needed. The **root cause of these
+secrets not being fully deleted** is the same missing revision-pruner CronJob
+(the CronJob would have removed the finalizer as part of per-node disk cleanup).
+
+However:
+- `encryption-config-<N>` secrets with `deletionTimestamp` set are **already protected**
+  by secret-pruner v3.2's Check 3 (deletionTimestamp protection).
+- `openshift-apiserver` is **not in** secret-pruner's `includedNamespaces`.
+- Adding it would be wrong: the secrets there with deletionTimestamp are sitting in
+  a "waiting for finalizer removal" state that our pruner should never touch.
+
+### Conclusion
+
+| Area | Action Needed |
+|------|--------------|
+| secret-pruner-v3.2 includedNamespaces | No change — openshift-apiserver must NOT be added |
+| secret-pruner-v3.2 protection logic | No change — already handles deletionTimestamp correctly |
+| secret-pruner-v3.2 encryption-config logic | No change — openshift-kube-apiserver logic is correct |
+| configmap-pruner-v1.0 | New file (this document) handles the gap |
+
+### Why openshift-apiserver should NOT be added to secret-pruner
+
+1. **Different resource problem**: The bug causes ConfigMap accumulation, not Secret accumulation.
+2. **Encryption secrets are operator-owned**: The `encryptionPruneController` already manages
+   their lifecycle via deletionTimestamp+finalizer. Our pruner would conflict.
+3. **Blast radius separation**: Keeping pruners scoped to their specific namespaces and
+   resource types makes incidents easier to diagnose and roll back.
+4. **No operational pressure**: `encryption-config-<N>` secrets with deletionTimestamp set
+   are tiny (a few KB each) and not causing etcd bloat at meaningful scale.
+
+---
+
+## Rollback
+
+If the configmap-pruner causes issues (it shouldn't since it only touches old revisions):
+
+```bash
+# Suspend the CronJob immediately
+oc patch cronjob configmap-pruner -n configmap-secret-pruner \
+  -p '{"spec":{"suspend":true}}'
+
+# Set global dry-run back to true
+oc patch cm configmap-pruner-config -n configmap-secret-pruner \
+  --type=merge -p '{"data":{"dryRun":"true"}}'
+
+# Verify operator health
+oc get co openshift-apiserver authentication
+```
+
+**Note:** Deleted ConfigMaps (revision-status-<N>, audit-<N>, config-<N>) for old revisions
+cannot be recovered from cluster. However, these are historical snapshots only — no running
+pod uses them. The operator creates new ones on the next rollout. etcd is the only
+persistent store, and old revision ConfigMaps have no data that needs to be recovered.
+==============
+
+
+
 ---
 # ============================================================
 # ConfigMap Pruner v1.0 - Production Ready
