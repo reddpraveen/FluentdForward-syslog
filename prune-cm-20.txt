@@ -1,3 +1,14 @@
+# What revision numbers exist in oauth namespace?
+oc get cm -n openshift-oauth-apiserver | grep revision-status
+
+# Does the data field have "revision" key?
+oc get cm -n openshift-oauth-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | {name: .metadata.name, data: .data}] | sort_by(.name) | last'
+
+
+# Also check what other CRs the authentication operator manages
+oc get oauthapiservers -o json | jq '.items[].status'
+
 # ConfigMap Pruner v1.0 — Verification Guide
 ## Scope: openshift-apiserver and openshift-oauth-apiserver
 
