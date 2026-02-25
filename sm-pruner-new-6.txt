@@ -1,3 +1,18 @@
+
+oc get cm -n openshift-oauth-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | 
+    {name: .metadata.name, rev: (.data["revision"] // "0" | tonumber), 
+     reason: .data["reason"], status: .data["reason"], ts: .metadata.creationTimestamp}] | 
+    sort_by(.ts) | reverse | .[0:10]'
+
+
+oc get cm -n openshift-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | 
+    {name: .metadata.name, rev: (.data["revision"] // "0" | tonumber), 
+     reason: .data["reason"], ts: .metadata.creationTimestamp}] | 
+    sort_by(.ts) | reverse | .[0:5]'
+
+
 # Check what's actually in the data field of the last few revision-status CMs
 oc get cm -n openshift-oauth-apiserver -o json | \
   jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | 
