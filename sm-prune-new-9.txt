@@ -1,0 +1,21 @@
+
+bash# Find last Completed revision in openshift-oauth-apiserver
+oc get cm -n openshift-oauth-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) |
+    select((.data["reason"] // "") | test("changed|InProgress|Abandoned|Failed") | not) |
+    {name: .metadata.name, rev: (.data["revision"] | tonumber), reason: .data["reason"], ts: .metadata.creationTimestamp}] |
+    sort_by(.rev) | last'
+bash# Find last Completed revision in openshift-apiserver
+oc get cm -n openshift-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) |
+    select((.data["reason"] // "") | test("changed|InProgress|Abandoned|Failed") | not) |
+    {name: .metadata.name, rev: (.data["revision"] | tonumber), reason: .data["reason"], ts: .metadata.creationTimestamp}] |
+    sort_by(.rev) | last'
+Also want to see the full reason string exactly as written:
+bash# Get the exact reason strings present across all revision-status CMs in both namespaces
+oc get cm -n openshift-oauth-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | .data["reason"]] | unique'
+
+oc get cm -n openshift-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | .data["reason"]] | unique'
+ 
