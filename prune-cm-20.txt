@@ -1,0 +1,712 @@
+---
+# ============================================================
+# ConfigMap Pruner v1.0 - Production Ready
+#
+# PURPOSE:
+#   Workaround for confirmed Red Hat platform bug (Solution #6977315):
+#   openshift-apiserver and openshift-oauth-apiserver operators are
+#   missing the revision-pruner CronJob that exists in
+#   openshift-kube-apiserver. This causes unlimited accumulation of
+#   revision-stamped ConfigMaps across both namespaces.
+#
+# ROOT CAUSE:
+#   cluster-openshift-apiserver-operator and cluster-authentication-operator
+#   use a pre-library-go workload controller pattern (Deployment-based).
+#   The library-go StaticPodOperatorClient framework (which generates the
+#   revision-pruner CronJob) was never wired up to these operators.
+#
+# WHAT THIS PRUNES:
+#   ConfigMaps matching revision-tagged patterns in each namespace:
+#     - revision-status-<N>   (primary accumulator: 23+ seen in real clusters)
+#     - audit-<N>             (secondary accumulator: 24+ seen)
+#     - config-<N>            (serving config snapshots)
+#   NOTE: only ConfigMaps with revision-status-<N> contain .data.revision;
+#   audit-<N> and config-<N> are correlated by revision number suffix.
+#
+# WHAT THIS NEVER TOUCHES:
+#   - ConfigMaps without a numeric suffix (live/unversioned configs)
+#   - The ConfigMap whose revision == latestAvailableRevision (current live)
+#   - The top-5 most recent revisions by creationTimestamp (safety buffer)
+#   - Any ConfigMap with deletionTimestamp set (operator lifecycle)
+#   - Any ConfigMap owned by ArgoCD, Helm, or other GitOps tools
+#
+# SOURCE OF TRUTH FOR CURRENT REVISION:
+#   OCP 4.16:  oc get openshiftapiserver cluster -o jsonpath='{.status.latestAvailableRevision}'
+#              oc get authentication cluster -o jsonpath='{.status.oauthAPIServer.latestAvailableRevision}'
+#   OCP 4.18+: oc get openshiftapiserver cluster -o jsonpath='{.status.latestAvailableRevision}'
+#              oc get authentication cluster -o jsonpath='{.status.latestAvailableRevision}'
+#   Script detects version and queries the correct field path.
+#
+# KEEP POLICY:
+#   Mirrors library-go's default: keep last 5 revisions (defaultRevisionLimit=5).
+#   Both current latestAvailableRevision and the 4 most recent prior revisions
+#   by creationTimestamp of their revision-status-<N> ConfigMap are kept.
+#
+# DESIGN NOTES:
+#   - Separate from secret-pruner: different resource type (ConfigMaps vs Secrets),
+#     different namespaces, simpler protection logic, independent blast radius.
+#   - dryRunReviewNamespaces: force dry-run per namespace even if global is false.
+#   - All deletions are grouped by revision family (revision-status + audit + config
+#     all deleted together for the same revision number).
+#   - Version-aware jsonpath: automatically detects OCP minor version and queries
+#     the correct status field path for latestAvailableRevision.
+#
+# OCP VERSION SUPPORT: 4.14, 4.15, 4.16, 4.17, 4.18+
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: configmap-pruner-config
+  namespace: configmap-secret-pruner
+data:
+  # Global dry-run toggle.
+  # Set to "false" to enable actual deletions.
+  # NOTE: dryRunReviewNamespaces overrides per namespace.
+  dryRun: "true"
+
+  # Number of recent revisions to keep in each namespace.
+  # Matches library-go's defaultRevisionLimit = 5.
+  # Includes the current latestAvailableRevision plus (keepRevisions-1) prior.
+  keepRevisions: "5"
+
+  # Minimum age in days before a revision-family is eligible for pruning.
+  # Guards against pruning ConfigMaps created in the last day during rollouts.
+  minAgeDays: "7"
+
+  # Rate limiting
+  delayBetweenNamespaces: "1.0"
+  delayBetweenDeletions: "0.2"
+
+  # -----------------------------------------------------------
+  # Target namespace config.
+  # Each entry: namespace|revisionCR|revisionField
+  #   namespace:    namespace to prune
+  #   revisionCR:   "kind/name" to query current revision
+  #   revisionField: jsonpath suffix to extract latestAvailableRevision
+  #                  Script detects OCP version and uses correct path.
+  # -----------------------------------------------------------
+  targetNamespaces: |
+    openshift-apiserver|openshiftapiserver/cluster|latestAvailableRevision
+    openshift-oauth-apiserver|authentication/cluster|latestAvailableRevision
+
+  # -----------------------------------------------------------
+  # Review-only namespaces (forced dry-run even if global is false).
+  # Remove a namespace from this list ONLY after dry-run validation
+  # on your specific cluster.
+  # -----------------------------------------------------------
+  dryRunReviewNamespaces: |
+    ^openshift-apiserver$
+    ^openshift-oauth-apiserver$
+
+  # ConfigMap name prefixes that are revision-tagged and should be pruned.
+  # These are pruned together for the same revision N.
+  # Format: prefix (the "-<N>" suffix is appended by the script).
+  revisionPrefixes: |
+    revision-status
+    audit
+    config
+
+  # Protection labels - ConfigMaps with any of these labels are never pruned.
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: configmap-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: configmap-pruner
+    app.kubernetes.io/component: cleanup
+    app.kubernetes.io/version: "1.0"
+spec:
+  schedule: "0 5 * * 0"
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          serviceAccountName: cm-configmap-pruner
+          restartPolicy: Never
+          tolerations:
+          - key: "node-role.kubernetes.io/infra"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "128Mi"
+                cpu: "10m"
+              limits:
+                memory: "512Mi"
+                cpu: "200m"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              # NOTE: set -e intentionally omitted.
+              set -uo pipefail
+
+              # -----------------------------------------------------------
+              # Logging helper
+              # -----------------------------------------------------------
+              log() {
+                printf '%s [%s] %s\n' "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$1" "${*:2}" >&2
+              }
+
+              error_exit() {
+                log ERROR "$1"
+                exit 1
+              }
+
+              log INFO "ConfigMap Pruner v1.0 - Starting"
+
+              # -----------------------------------------------------------
+              # Verify cluster access
+              # -----------------------------------------------------------
+              if ! oc whoami &>/dev/null; then
+                error_exit "Unable to authenticate with cluster"
+              fi
+
+              log INFO "Authenticated as: $(oc whoami 2>/dev/null)"
+
+              # -----------------------------------------------------------
+              # Detect OCP version for version-aware jsonpath selection
+              # OCP 4.18+: latestAvailableRevision moved to OperatorStatus base
+              #            (openshift/api PR #2038, merged for 4.18.0)
+              # OCP 4.16/4.17: latestAvailableRevision in type-specific status
+              #            For authentication/cluster it was under
+              #            .status.oauthAPIServer.latestAvailableRevision
+              # -----------------------------------------------------------
+              OCP_MINOR=0
+              ocp_version_raw=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "")
+              if [[ -n "$ocp_version_raw" ]]; then
+                OCP_MINOR=$(echo "$ocp_version_raw" | awk -F. '{print $2}' | grep -oP '^\d+' || echo "0")
+                log INFO "Detected OCP version: $ocp_version_raw (minor: $OCP_MINOR)"
+              else
+                log WARN "Could not detect OCP version, defaulting to 4.18+ jsonpath"
+                OCP_MINOR=18
+              fi
+
+              # -----------------------------------------------------------
+              # Load ConfigMap config
+              # -----------------------------------------------------------
+              NS="configmap-secret-pruner"
+              CM="configmap-pruner-config"
+
+              if ! oc -n "$NS" get cm "$CM" &>/dev/null; then
+                error_exit "ConfigMap $CM not found in namespace $NS"
+              fi
+
+              cm_get() {
+                oc -n "$NS" get cm "$CM" -o jsonpath="{.data.$1}" 2>/dev/null || echo ""
+              }
+
+              DRY_RUN=$(cm_get dryRun);                         [[ -z "$DRY_RUN" ]]          && DRY_RUN="true"
+              KEEP_REVISIONS=$(cm_get keepRevisions);           [[ -z "$KEEP_REVISIONS" ]]   && KEEP_REVISIONS="5"
+              MIN_AGE_DAYS=$(cm_get minAgeDays);                [[ -z "$MIN_AGE_DAYS" ]]     && MIN_AGE_DAYS="7"
+              DELAY_NS=$(cm_get delayBetweenNamespaces);        [[ -z "$DELAY_NS" ]]         && DELAY_NS="1.0"
+              DELAY_DEL=$(cm_get delayBetweenDeletions);        [[ -z "$DELAY_DEL" ]]        && DELAY_DEL="0.2"
+
+              TARGET_NS_RAW=$(cm_get targetNamespaces)
+              DRYRUN_REVIEW_NS=$(cm_get dryRunReviewNamespaces)
+              REVISION_PREFIXES=$(cm_get revisionPrefixes)
+              PROTECTED_LABELS=$(cm_get protectedLabels)
+
+              # Set defaults if empty
+              if [[ -z "$TARGET_NS_RAW" ]]; then
+                TARGET_NS_RAW=$(printf '%s\n' \
+                  'openshift-apiserver|openshiftapiserver/cluster|latestAvailableRevision' \
+                  'openshift-oauth-apiserver|authentication/cluster|latestAvailableRevision')
+                log WARN "No targetNamespaces configured, using defaults"
+              fi
+
+              if [[ -z "$DRYRUN_REVIEW_NS" ]]; then
+                DRYRUN_REVIEW_NS=$(printf '%s\n' \
+                  '^openshift-apiserver$' \
+                  '^openshift-oauth-apiserver$')
+                log WARN "No dryRunReviewNamespaces configured, using defaults"
+              fi
+
+              if [[ -z "$REVISION_PREFIXES" ]]; then
+                REVISION_PREFIXES=$(printf '%s\n' 'revision-status' 'audit' 'config')
+              fi
+
+              if [[ -z "$PROTECTED_LABELS" ]]; then
+                PROTECTED_LABELS=$(printf '%s\n' \
+                  'app.kubernetes.io/managed-by=argocd' \
+                  'app.kubernetes.io/managed-by=Helm' \
+                  'meta.helm.sh/release-name' \
+                  'prune.protected=true')
+              fi
+
+              # Trim blank lines
+              TARGET_NS_RAW=$(echo "$TARGET_NS_RAW"         | sed '/^[[:space:]]*$/d')
+              DRYRUN_REVIEW_NS=$(echo "$DRYRUN_REVIEW_NS"   | sed '/^[[:space:]]*$/d')
+              REVISION_PREFIXES=$(echo "$REVISION_PREFIXES" | sed '/^[[:space:]]*$/d')
+              PROTECTED_LABELS=$(echo "$PROTECTED_LABELS"   | sed '/^[[:space:]]*$/d')
+
+              min_age_seconds=$(( MIN_AGE_DAYS * 86400 ))
+              current_epoch=$(date +%s)
+
+              log INFO "Config: DRY_RUN=$DRY_RUN KEEP_REVISIONS=$KEEP_REVISIONS MIN_AGE=${MIN_AGE_DAYS}d"
+
+              # Global counters
+              total_deleted=0
+              total_skipped=0
+              total_protected=0
+              total_too_new=0
+              total_active=0
+              total_errors=0
+              namespaces_processed=0
+              declare -a error_list=()
+              declare -a deleted_list=()
+
+              # -----------------------------------------------------------
+              # Helper: get latestAvailableRevision from operator CR
+              # Handles OCP 4.16 vs 4.18+ field path differences for
+              # authentication/cluster (oauth-apiserver).
+              # -----------------------------------------------------------
+              get_latest_revision() {
+                local cr_ref="$1"         # e.g. "openshiftapiserver/cluster"
+                local field_hint="$2"     # "latestAvailableRevision" (unused, kept for config clarity)
+                local target_ns="$3"      # target namespace (used for version path selection)
+
+                local cr_kind cr_name
+                cr_kind=$(echo "$cr_ref" | cut -d/ -f1)
+                cr_name=$(echo "$cr_ref" | cut -d/ -f2)
+
+                local revision=""
+
+                # OCP 4.16/4.17: authentication/cluster uses nested path for oauth-apiserver
+                # OCP 4.18+: field moved to base OperatorStatus, flat path works for both
+                if [[ "$cr_kind" == "authentication" && "$OCP_MINOR" -lt 18 ]]; then
+                  # Try nested path first (4.16/4.17)
+                  revision=$(oc get "$cr_kind" "$cr_name" \
+                    -o jsonpath='{.status.oauthAPIServer.latestAvailableRevision}' 2>/dev/null || echo "")
+
+                  # Fallback to flat path in case it was backported
+                  if [[ -z "$revision" || "$revision" == "0" ]]; then
+                    revision=$(oc get "$cr_kind" "$cr_name" \
+                      -o jsonpath='{.status.latestAvailableRevision}' 2>/dev/null || echo "")
+                  fi
+                else
+                  # 4.18+ or openshiftapiserver (same flat path in all versions)
+                  revision=$(oc get "$cr_kind" "$cr_name" \
+                    -o jsonpath='{.status.latestAvailableRevision}' 2>/dev/null || echo "")
+                fi
+
+                # Last resort: scan revision-status-<N> ConfigMaps in the target namespace
+                # and take the highest revision number present
+                if [[ -z "$revision" || "$revision" == "0" ]]; then
+                  log WARN "  Could not get latestAvailableRevision from $cr_ref, scanning ConfigMaps"
+                  revision=$(oc get configmap -n "$target_ns" --no-headers 2>/dev/null \
+                    | awk '{print $1}' \
+                    | grep -oP '(?<=revision-status-)\d+$' \
+                    | sort -n | tail -1 || echo "")
+                fi
+
+                echo "${revision:-0}"
+              }
+
+              # -----------------------------------------------------------
+              # Helper: check if a ConfigMap is protected by label
+              # Returns 0 (protected) or 1 (not protected)
+              # -----------------------------------------------------------
+              is_label_protected() {
+                local cm_labels_json="$1"
+
+                while IFS= read -r label_rule; do
+                  [[ -z "$label_rule" ]] && continue
+
+                  if [[ "$label_rule" == *"/"* ]] && [[ "$label_rule" != *"="* ]]; then
+                    # Prefix match on key
+                    if echo "$cm_labels_json" | jq -e \
+                      "to_entries[] | select(.key | startswith(\"${label_rule}\"))" &>/dev/null 2>&1; then
+                      return 0
+                    fi
+                  elif [[ "$label_rule" == *"="* ]]; then
+                    # Exact key=value match
+                    local key="${label_rule%=*}"
+                    local expected="${label_rule#*=}"
+                    local actual
+                    actual=$(echo "$cm_labels_json" | jq -r ".\"$key\" // empty" 2>/dev/null || echo "")
+                    if [[ "$actual" == "$expected" ]]; then
+                      return 0
+                    fi
+                  else
+                    # Key presence check
+                    if echo "$cm_labels_json" | jq -e ".\"$label_rule\"" &>/dev/null 2>&1; then
+                      return 0
+                    fi
+                  fi
+                done <<< "$PROTECTED_LABELS"
+
+                return 1
+              }
+
+              # -----------------------------------------------------------
+              # Core: prune one namespace
+              # -----------------------------------------------------------
+              prune_namespace() {
+                local target_ns="$1"
+                local cr_ref="$2"
+                local field_hint="$3"
+                local effective_dry_run="$4"
+
+                local ns_deleted=0
+                local ns_skipped=0
+                local ns_protected=0
+                local ns_too_new=0
+                local ns_active=0
+
+                log INFO "-----------------------------------------------"
+                log INFO "Processing: $target_ns"
+                log INFO "Operator CR: $cr_ref"
+                log INFO "DRY_RUN: $effective_dry_run"
+                log INFO "-----------------------------------------------"
+
+                # --- Step 1: Get current live revision ---
+                local latest_revision
+                latest_revision=$(get_latest_revision "$cr_ref" "$field_hint" "$target_ns")
+                if [[ -z "$latest_revision" || "$latest_revision" == "0" ]]; then
+                  log ERROR "  Unable to determine latestAvailableRevision for $target_ns"
+                  error_list+=("Could not get latestAvailableRevision for $target_ns via $cr_ref")
+                  ((total_errors++)) || true
+                  return
+                fi
+                log INFO "  latestAvailableRevision: $latest_revision"
+
+                # --- Step 2: List all revision-status-<N> ConfigMaps ---
+                # These are the canonical revision markers. We sort by creationTimestamp
+                # to determine the top-N most recent, then compute which to prune.
+                local revstatus_json
+                revstatus_json=$(oc get configmap -n "$target_ns" \
+                  -o json 2>/dev/null | \
+                  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$"))]' \
+                  2>/dev/null || echo "[]")
+
+                local total_revstatus
+                total_revstatus=$(echo "$revstatus_json" | jq 'length' 2>/dev/null || echo "0")
+                log INFO "  Found $total_revstatus revision-status-<N> ConfigMaps"
+
+                if [[ "$total_revstatus" -eq 0 ]]; then
+                  log INFO "  Nothing to prune in $target_ns"
+                  return
+                fi
+
+                # --- Step 3: Build sorted revision list (newest first by creationTimestamp) ---
+                # Extract: revision number, cm name, creationTimestamp
+                # Sort descending by creationTimestamp to identify the keep window.
+                local sorted_revisions
+                sorted_revisions=$(echo "$revstatus_json" | jq -r \
+                  '[.[] |
+                    {
+                      name: .metadata.name,
+                      rev: (.metadata.name | gsub("revision-status-"; "") | tonumber),
+                      ts: .metadata.creationTimestamp,
+                      deletion_ts: (.metadata.deletionTimestamp // ""),
+                      labels: (.metadata.labels // {})
+                    }
+                  ] | sort_by(.ts) | reverse | .[] |
+                    "\(.rev) \(.name) \(.ts) \(.deletion_ts)"
+                  ' 2>/dev/null || echo "")
+
+                if [[ -z "$sorted_revisions" ]]; then
+                  log WARN "  Could not parse revision-status ConfigMaps in $target_ns"
+                  ((total_errors++)) || true
+                  error_list+=("Failed to parse revision-status CMs in $target_ns")
+                  return
+                fi
+
+                # --- Step 4: Determine keep set ---
+                # Keep: current latestAvailableRevision + top (keepRevisions-1) most recent by ts
+                # This mirrors library-go's defaultRevisionLimit=5 logic.
+                local keep_set=""
+                keep_set=$(echo "$sorted_revisions" | head -"$KEEP_REVISIONS" | awk '{print $1}')
+                # Always add the current live revision regardless of position
+                if ! echo "$keep_set" | grep -Fxq "$latest_revision" 2>/dev/null; then
+                  keep_set=$(printf '%s\n%s' "$latest_revision" "$keep_set")
+                fi
+
+                log INFO "  Keep set (revisions): $(echo "$keep_set" | tr '\n' ' ')"
+
+                # --- Step 5: Process each revision ---
+                local rev_num cm_name cm_ts deletion_ts
+                while IFS=" " read -r rev_num cm_name cm_ts deletion_ts; do
+                  [[ -z "$rev_num" ]] && continue
+
+                  log INFO "  --- Revision $rev_num (revision-status-${rev_num} ts=$cm_ts) ---"
+
+                  # Protection A: in keep set
+                  if echo "$keep_set" | grep -Fxq "$rev_num" 2>/dev/null; then
+                    log INFO "    KEEP: revision $rev_num is in keep set"
+                    ((ns_active++)) || true
+                    continue
+                  fi
+
+                  # Protection B: deletionTimestamp already set (operator managing lifecycle)
+                  if [[ -n "$deletion_ts" ]]; then
+                    log INFO "    SKIP: revision $rev_num has deletionTimestamp=$deletion_ts (operator lifecycle)"
+                    ((ns_skipped++)) || true
+                    continue
+                  fi
+
+                  # Protection C: age check on the revision-status-<N> CM
+                  local rev_age_ok=true
+                  if [[ -n "$cm_ts" && "$cm_ts" != "null" ]]; then
+                    local cm_epoch
+                    cm_epoch=$(date -d "$cm_ts" +%s 2>/dev/null || echo "0")
+                    if [[ "$cm_epoch" -gt 0 ]]; then
+                      local age_seconds age_days
+                      age_seconds=$(( current_epoch - cm_epoch ))
+                      age_days=$(( age_seconds / 86400 ))
+                      if [[ "$age_seconds" -lt "$min_age_seconds" ]]; then
+                        log INFO "    TOO-NEW: revision $rev_num (age: ${age_days}d < ${MIN_AGE_DAYS}d min)"
+                        ((ns_too_new++)) || true
+                        rev_age_ok=false
+                      fi
+                    fi
+                  fi
+
+                  if [[ "$rev_age_ok" == "false" ]]; then
+                    ((ns_skipped++)) || true
+                    continue
+                  fi
+
+                  # --- Step 6: For each prefix, find and delete revision-N ConfigMaps ---
+                  local prefix cm_to_delete has_error
+                  has_error=false
+
+                  while IFS= read -r prefix; do
+                    [[ -z "$prefix" ]] && continue
+
+                    cm_to_delete="${prefix}-${rev_num}"
+
+                    # Check if ConfigMap exists
+                    if ! oc get configmap "$cm_to_delete" -n "$target_ns" &>/dev/null 2>&1; then
+                      log INFO "    MISSING: $cm_to_delete (does not exist, skipping)"
+                      continue
+                    fi
+
+                    # Fetch labels for protection check
+                    local cm_labels_json
+                    cm_labels_json=$(oc get configmap "$cm_to_delete" -n "$target_ns" \
+                      -o jsonpath='{.metadata.labels}' 2>/dev/null | \
+                      jq '.' 2>/dev/null || echo "{}")
+
+                    # Protection D: label-based protection
+                    if is_label_protected "$cm_labels_json"; then
+                      log INFO "    PROTECTED: $cm_to_delete (protected label)"
+                      ((ns_protected++)) || true
+                      ((ns_skipped++)) || true
+                      continue
+                    fi
+
+                    # Protection E: re-check deletionTimestamp on this specific CM
+                    local cm_deletion_ts
+                    cm_deletion_ts=$(oc get configmap "$cm_to_delete" -n "$target_ns" \
+                      -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
+                    if [[ -n "$cm_deletion_ts" ]]; then
+                      log INFO "    SKIP: $cm_to_delete (deletionTimestamp set: $cm_deletion_ts)"
+                      ((ns_skipped++)) || true
+                      continue
+                    fi
+
+                    # Delete or dry-run
+                    if [[ "$effective_dry_run" == "false" ]]; then
+                      sleep "$DELAY_DEL"
+                      local delete_output
+                      delete_output=$(oc delete configmap "$cm_to_delete" -n "$target_ns" \
+                        --wait=false 2>&1)
+                      if [[ $? -eq 0 ]]; then
+                        log INFO "    DELETED: $cm_to_delete"
+                        ((ns_deleted++)) || true
+                        deleted_list+=("${target_ns}/${cm_to_delete}")
+                      else
+                        log ERROR "    DELETE-FAILED: $cm_to_delete - $delete_output"
+                        error_list+=("Failed to delete $target_ns/$cm_to_delete: $delete_output")
+                        ((total_errors++)) || true
+                        has_error=true
+                      fi
+                    else
+                      log INFO "    DRY-RUN: Would delete $cm_to_delete"
+                      ((ns_deleted++)) || true
+                    fi
+
+                  done <<< "$REVISION_PREFIXES"
+
+                  if [[ "$has_error" == "true" ]]; then
+                    log WARN "  Errors encountered for revision $rev_num, continuing with next revision"
+                  fi
+
+                done <<< "$sorted_revisions"
+
+                log INFO "  Namespace summary: would-delete/deleted=$ns_deleted kept=$ns_active skipped=$ns_skipped too-new=$ns_too_new protected=$ns_protected"
+
+                ((total_deleted  += ns_deleted))  || true
+                ((total_skipped  += ns_skipped))  || true
+                ((total_active   += ns_active))   || true
+                ((total_too_new  += ns_too_new))  || true
+                ((total_protected += ns_protected)) || true
+              }
+
+              # -----------------------------------------------------------
+              # Main loop: process each configured namespace
+              # -----------------------------------------------------------
+              start_time=$(date +%s)
+
+              while IFS="|" read -r target_ns cr_ref field_hint; do
+                [[ -z "$target_ns" ]] && continue
+
+                ((namespaces_processed++)) || true
+
+                # Per-namespace dry-run override
+                effective_dry_run="$DRY_RUN"
+                while IFS= read -r pattern; do
+                  [[ -z "$pattern" ]] && continue
+                  if echo "$target_ns" | grep -Eq "$pattern" 2>/dev/null; then
+                    effective_dry_run="true"
+                    log INFO "REVIEW-MODE: $target_ns forced to DRY_RUN (in dryRunReviewNamespaces)"
+                    break
+                  fi
+                done <<< "$DRYRUN_REVIEW_NS"
+
+                # Verify namespace exists
+                if ! oc get namespace "$target_ns" &>/dev/null 2>&1; then
+                  log WARN "Namespace $target_ns not found, skipping"
+                  continue
+                fi
+
+                prune_namespace "$target_ns" "$cr_ref" "$field_hint" "$effective_dry_run"
+
+                sleep "$DELAY_NS"
+
+              done <<< "$TARGET_NS_RAW"
+
+              # -----------------------------------------------------------
+              # Final summary
+              # -----------------------------------------------------------
+              end_time=$(date +%s)
+              duration=$(( end_time - start_time ))
+              duration_min=$(( duration / 60 ))
+              duration_sec=$(( duration % 60 ))
+              run_mode=$(if [[ "$DRY_RUN" == "true" ]]; then echo "DRY-RUN"; else echo "LIVE"; fi)
+
+              log INFO ""
+              log INFO "================================================"
+              log INFO "ConfigMap Pruner v1.0 - Job Completed"
+              log INFO "================================================"
+              log INFO "Duration: ${duration_min}m ${duration_sec}s"
+              log INFO "Mode: $run_mode"
+              log INFO "OCP Minor: $OCP_MINOR"
+              log INFO ""
+              log INFO "Namespace Statistics:"
+              log INFO "  Processed: $namespaces_processed"
+              log INFO ""
+              log INFO "ConfigMap Statistics:"
+              log INFO "  Deleted (or would-delete): $total_deleted"
+              log INFO "  Kept (active revisions):   $total_active"
+              log INFO "  Skipped total:             $total_skipped"
+              log INFO "    - Too new (<${MIN_AGE_DAYS}d):   $total_too_new"
+              log INFO "    - Protected label:         $total_protected"
+              log INFO ""
+
+              if [[ "$DRY_RUN" == "false" && "${#deleted_list[@]}" -gt 0 ]]; then
+                log INFO "=== DELETED ConfigMaps (${#deleted_list[@]} total) ==="
+                for item in "${deleted_list[@]}"; do
+                  log INFO "  $item"
+                done
+                log INFO ""
+              fi
+
+              if [[ "$total_errors" -gt 0 ]]; then
+                log ERROR "Errors: $total_errors"
+                for err_msg in "${error_list[@]}"; do
+                  log ERROR "  $err_msg"
+                done
+                exit 1
+              else
+                log INFO "Errors: 0"
+              fi
+
+              log INFO "================================================"
+              exit 0
+---
+# ============================================================
+# RBAC - ClusterRole
+# Needs get/list on openshiftapiserver and authentication CRs
+# to read latestAvailableRevision, plus configmap operations.
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cm-configmap-pruner
+  labels:
+    app.kubernetes.io/name: configmap-pruner
+    app.kubernetes.io/component: rbac
+rules:
+# ConfigMap operations (targeted namespaces only enforced at deploy time)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "delete"]
+
+# Namespace existence check
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+
+# OpenShiftAPIServer CR - read latestAvailableRevision
+- apiGroups: ["operator.openshift.io"]
+  resources: ["openshiftapiservers"]
+  verbs: ["get"]
+
+# Authentication CR - read latestAvailableRevision (oauth-apiserver)
+- apiGroups: ["operator.openshift.io"]
+  resources: ["authentications"]
+  verbs: ["get"]
+
+# ClusterVersion - detect OCP version for correct jsonpath selection
+- apiGroups: ["config.openshift.io"]
+  resources: ["clusterversions"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cm-configmap-pruner
+  labels:
+    app.kubernetes.io/name: configmap-pruner
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cm-configmap-pruner
+subjects:
+- kind: ServiceAccount
+  name: cm-configmap-pruner
+  namespace: configmap-secret-pruner
+---
+# ============================================================
+# ServiceAccount
+# Uses same namespace as secret-pruner for co-location.
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cm-configmap-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: configmap-pruner
+    app.kubernetes.io/component: rbac
