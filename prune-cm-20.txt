@@ -1,3 +1,15 @@
+# Check what's actually in the data field of the last few revision-status CMs
+oc get cm -n openshift-oauth-apiserver -o json | \
+  jq '[.items[] | select(.metadata.name | test("^revision-status-[0-9]+$")) | 
+    {name: .metadata.name, data: .data, ts: .metadata.creationTimestamp}] | 
+    sort_by(.ts) | reverse | .[0:5]'
+
+
+oc get oauthapiservers cluster -o json | jq '.status'
+
+
+
+
 # What revision numbers exist in oauth namespace?
 oc get cm -n openshift-oauth-apiserver | grep revision-status
 
