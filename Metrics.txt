@@ -1,0 +1,54 @@
+# Events received per second, by pod (maps to node)
+sum by (pod) (
+  rate(vector_component_received_events_total{
+    namespace="openshift-logging"
+  }[5m])
+)
+
+# Which Vector source component is receiving the most events
+topk(10,
+  sum by (component_id, pod) (
+    rate(vector_component_received_events_total{
+      namespace="openshift-logging"
+    }[5m])
+  )
+)
+
+# Actual CPU cores consumed per collector pod
+sum by (pod, node) (
+  rate(container_cpu_usage_seconds_total{
+    namespace="openshift-logging",
+    container="collector"
+  }[5m])
+)
+# If this is non-zero, Vector is being CPU-throttled
+sum by (pod, node) (
+  rate(container_cpu_cfs_throttled_periods_total{
+    namespace="openshift-logging",
+    container="collector"
+  }[5m])
+)
+/
+sum by (pod, node) (
+  rate(container_cpu_cfs_periods_total{
+    namespace="openshift-logging",
+    container="collector"
+  }[5m])
+)
+
+sum by (component_id, pod) (
+  rate(vector_component_sent_bytes_total{
+    namespace="openshift-logging"
+  }[5m])
+)
+
+vector_buffer_events{namespace="openshift-logging"}
+
+quantile_over_time(0.95,
+  sum by (node) (
+    rate(container_cpu_usage_seconds_total{
+      namespace="openshift-logging",
+      container="collector"
+    }[5m])
+  )[7d:5m]
+)
