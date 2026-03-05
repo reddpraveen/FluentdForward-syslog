@@ -1,3 +1,15 @@
+jq 'keys' $(find . -name "*OnBoarding*survey.json" | head -1)
+jq '.' $(find . -name "*OnBoarding*survey.json" | head -1) | head -50
+
+
+cat > filter.jq << 'EOF'
+(map(.question_name) | index("CHG")) as $idx |
+.[:($idx)] + [
+  {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Azure","On_Prem"], "default": "Azure", "required": true, "variable": "hosted_on", "new_question": true, "question_name": "hosted_on", "question_description": "onprem or azure"},
+  {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Central","East"], "default": "Central", "required": true, "variable": "location", "new_question": false, "question_name": "location", "question_description": "region"}
+] + .[($idx):]
+EOF
+
 
 #test
 cat > filter.jq << 'EOF'
