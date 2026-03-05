@@ -1,3 +1,14 @@
+find . -name "*OnBoarding*survey.json" -exec bash -c '
+  tmp=$(mktemp)
+  jq ".survey as \$s | .survey = (\$s[:(-1)] + [
+    {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Azure","On_Prem"], "default": "Azure", "required": true, "variable": "hosted_on", "new_question": true, "question_name": "hosted_on", "question_description": "onprem or azure"},
+    {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Central","East"], "default": "Central", "required": true, "variable": "location", "new_question": false, "question_name": "location", "question_description": "region"}
+  ] + [\$s[-1]])" "$1" > "$tmp" && mv "$tmp" "$1"
+' _ {} \;
+
+
+
+
 find . -name "onboarding.json" -exec sed -i '/\"question_name\":\s*\"question_tobelast\"/i\
     {"max": 1024, "min": 0, "type": "text", "question_name": "Question1"},\
     {"max": 1024, "min": 0, "type": "text", "question_name": "Question2"},\
