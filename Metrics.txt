@@ -1,3 +1,18 @@
+find . -name "onboarding.json" -exec sed -i '/\"question_name\":\s*\"question_tobelast\"/i\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question1"},\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question2"},\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question3"},' {} \;
+
+find . -name "onboarding.json" -exec sed '/\"question_name\":\s*\"question_tobelast\"/i\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question1"},\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question2"},\
+    {"max": 1024, "min": 0, "type": "text", "question_name": "Question3"},' {} \;
+
+
+
+
+
+
 # Events received per second, by pod (maps to node)
 sum by (pod) (
   rate(vector_component_received_events_total{
