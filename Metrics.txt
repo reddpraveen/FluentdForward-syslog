@@ -1,3 +1,5 @@
+
+#test
 cat > filter.jq << 'EOF'
 (.survey | map(.question_name) | index("CHG")) as $idx |
 .survey = .survey[:($idx)] + [
