@@ -1,3 +1,20 @@
+cat > filter.jq << 'EOF'
+(.survey | map(.question_name) | index("CHG")) as $idx |
+.survey = .survey[:($idx)] + [
+  {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Azure","On_Prem"], "default": "Azure", "required": true, "variable": "hosted_on", "new_question": true, "question_name": "hosted_on", "question_description": "onprem or azure"},
+  {"max": 1024, "min": 0, "type": "multiplechoice", "choices": ["Central","East"], "default": "Central", "required": true, "variable": "location", "new_question": false, "question_name": "location", "question_description": "region"}
+] + .survey[($idx):]
+EOF
+
+find . -name "*OnBoarding*survey.json" -exec bash -c '
+  tmp=$(mktemp)
+  jq -f filter.jq "$1" > "$tmp" && mv "$tmp" "$1"
+' _ {} \;
+
+
+
+
+
 find . -name "*OnBoarding*survey.json" -exec bash -c '
   tmp=$(mktemp)
   jq ".survey as \$s | .survey = (\$s[:(-1)] + [
