@@ -1,0 +1,51 @@
+# 1. Check InstallPlan phases - look for Installing (stuck)
+oc get installplan -n openshift-storage \
+  -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,APPROVED:.spec.approved' \
+  --sort-by=.metadata.creationTimestamp
+
+# 2. Find ALL failed/dead jobs regardless of InstallPlan link
+oc get jobs -n openshift-storage \
+  -o custom-columns='NAME:.metadata.name,COMPLETIONS:.status.succeeded,FAILED:.status.failed,CONDITIONS:.status.conditions[0].reason'
+
+# 3. Get the timed-out job name directly
+oc get jobs -n openshift-storage -o json | \
+  jq -r '.items[] | select(.status.conditions[]?.reason == "DeadlineExceeded") | .metadata.name'
+
+# 4. Cross-reference job to InstallPlan
+oc get installplan -n openshift-storage -o json | \
+  jq -r '.items[] | select(.status.phase != "Complete") | {name:.metadata.name, phase:.status.phase, plan:.status.plan[].resolving}'
+
+# Get the stuck Installing InstallPlan
+STUCK_IP=$(oc get installplan -n openshift-storage \
+  -o jsonpath='{.items[?(@.status.phase=="Installing")].metadata.name}')
+
+echo "Stuck InstallPlan: $STUCK_IP"
+
+# Check what it was trying to install
+oc get installplan $STUCK_IP -n openshift-storage \
+  -o jsonpath='{.spec.clusterServiceVersionNames}' | jq .
+
+# Delete it to force OLM to regenerate
+oc delete installplan $STUCK_IP -n openshift-storage
+
+# Watch for new one
+watch -n10 "oc get installplan -n openshift-storage --sort-by=.metadata.creationTimestamp"
+
+
+# Get all jobs with failures
+oc get jobs -n openshift-storage -o json | \
+  jq -r '.items[] | select(.status.failed > 0 or .status.conditions != null) | .metadata.name'
+
+# For each failed job get its pod logs
+for job in $(oc get jobs -n openshift-storage -o json | \
+  jq -r '.items[] | select(.status.conditions[]?.reason == "DeadlineExceeded") | .metadata.name'); do
+  echo "=== Job: $job ==="
+  POD=$(oc get pods -n openshift-storage -l job-name=$job \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$POD" ]; then
+    oc logs $POD -n openshift-storage --all-containers=true --tail=30
+  else
+    echo "No pod found (already cleaned up)"
+  fi
+done
+
