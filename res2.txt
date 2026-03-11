@@ -1,0 +1,2111 @@
+#!/usr/bin/env bash
+# =============================================================================
+# GitOps Platform Bootstrap v4 - Run once after git clone
+# Usage: bash bootstrap.sh
+#
+# Improvements over v3 (11 fixes from peer review):
+#   #1  Idempotency check - aborts if repo already bootstrapped
+#   #2  Dependency pinning - scripts/requirements.txt with locked versions
+#   #3  MachineSet region parameterised - location variable in template
+#   #5  Manifest filenames include run ID to prevent concurrent collision
+#   #6  Cross-LOB duplicate namespace detection in input_to_rir.py
+#   #9  MachineSet template - added subnet, resourceGroup, managedIdentity
+#   #10 Cluster registry - clusters/cluster-registry.yaml + validation
+#   #13 Template syntax validator - scripts/validate_templates.py
+#   #14 data-classification defaults to 'internal' if omitted in build_rir()
+#   #18 Input file JSON Schema - resource-catalog/schemas/input-v1-schema.json
+#   #22 DR runbook expanded with quarterly test procedure
+#
+# What this creates (full list):
+#   - Directory skeleton with .gitkeep files
+#   - onboarding/<lob>.input.yaml  (one per LOB, multi-namespace accumulated state)
+#   - resource-catalog/schemas/rir-v1-schema.json
+#   - resource-catalog/schemas/input-v1-schema.json  (NEW)
+#   - clusters/cluster-registry.yaml                 (NEW)
+#   - scripts/requirements.txt                       (NEW)
+#   - scripts/input_to_rir.py
+#   - scripts/render_rir.py
+#   - scripts/validate_templates.py                  (NEW)
+#   - templates/*.yaml.j2 (6 templates)
+#   - policies/opa/namespace.rego + machineset.rego
+#   - policies/kyverno/require-namespace-labels.yaml (Audit mode)
+#   - policies/kyverno/restrict-machineset-sku.yaml  (Audit mode)
+#   - .github/workflows/provision-resource.yml
+#   - .github/workflows/validate-pr.yml              (placeholder - Step 2)
+#   - .github/workflows/decommission.yml             (placeholder)
+#   - .github/workflows/label-propagation.yml        (placeholder)
+#   - .yamllint.yml
+#   - argocd/appsets/ + argocd/projects/ placeholders
+#   - docs/runbooks/bootstrap-from-scratch.md        (expanded with DR test)
+#   - docs/runbooks/secrets-setup.md                 (NEW)
+#   - Single git commit + push
+# =============================================================================
+
+set -euo pipefail
+
+# ── 0. Idempotency check (#1) ──────────────────────────────────────────────────
+# Abort if repo already has commits - prevents overwriting an existing bootstrap
+if git log --oneline -1 > /dev/null 2>&1; then
+  printf "ERROR: Repository already has commits. Bootstrap should only run once on a fresh clone.\n"
+  printf "       If you need to re-bootstrap, delete the repo and re-clone.\n"
+  exit 1
+fi
+
+# Trap to report failure line
+trap 'printf "Bootstrap failed at line %s. Check errors above.\n" "$LINENO"; exit 1' ERR
+
+# ── 1. Directories ─────────────────────────────────────────────────────────────
+mkdir -p \
+  .github/workflows \
+  clusters/ocp-prod-eastus-01/global/{operators,ldap,log-forwarders} \
+  clusters/ocp-prod-eastus-01/argocd-instance \
+  clusters/ocp-prod-eastus-01/lob/lob1/{namespaces,quotas,limitranges,rbac,netpol,machinesets} \
+  clusters/ocp-nonprod-eastus-01/global/{operators,ldap,log-forwarders} \
+  clusters/ocp-nonprod-eastus-01/argocd-instance \
+  clusters/ocp-nonprod-eastus-01/lob/lob1/{namespaces,quotas,limitranges,rbac,netpol,machinesets} \
+  argocd/{appsets,projects} \
+  resource-catalog/{schemas,lob1} \
+  onboarding \
+  policies/{opa,kyverno} \
+  templates \
+  scripts \
+  docs/{runbooks,architecture/decisions}
+
+# ── 2. .gitkeep (keeps empty dirs in git) ─────────────────────────────────────
+find . -type d -not -path './.git/*' -empty -exec touch {}/.gitkeep \;
+
+# ── 3. .yamllint.yml ─────────────────────────────────────────────────────────
+cat > .yamllint.yml << 'EOF'
+---
+extends: default
+rules:
+  line-length:
+    max: 160
+    level: warning
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  braces:
+    forbid-flow-sequences: false
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+ignore: |
+  .github/
+  docs/
+EOF
+
+# ── 4. Python dependency pinning (#2) ─────────────────────────────────────────
+cat > scripts/requirements.txt << 'EOF'
+# Pinned dependencies for GitOps platform scripts
+# Update versions only after testing in nonprod
+jinja2==3.1.4
+pyyaml==6.0.2
+jsonschema==4.23.0
+EOF
+
+# ── 5. Cluster registry (#10) ─────────────────────────────────────────────────
+# Source of truth for valid cluster names - validated by input_to_rir.py
+# Updated by Platform SRE only when new clusters are onboarded
+cat > clusters/cluster-registry.yaml << 'EOF'
+# =============================================================================
+# Cluster Registry - Source of Truth for Valid Cluster Names
+# Maintained by: Platform SRE Team
+# Updated when: new cluster onboarded or cluster decommissioned
+# Consumed by: scripts/input_to_rir.py (validates cluster field in input files)
+# =============================================================================
+clusters:
+  - name: ocp-prod-eastus-01
+    environment: prod
+    region: eastus
+    status: active
+  - name: ocp-nonprod-eastus-01
+    environment: nonprod
+    region: eastus
+    status: active
+EOF
+
+# ── 6. RIR v1 JSON Schema ─────────────────────────────────────────────────────
+cat > resource-catalog/schemas/rir-v1-schema.json << 'EOF'
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ResourceIntentRecord",
+  "description": "Platform GitOps Resource Intent Record v1",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "target", "governance", "namespace"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "type": "string", "enum": ["platform.company-xxx.com/v1"] },
+    "kind":       { "type": "string", "enum": ["ResourceIntentRecord"] },
+    "metadata": {
+      "type": "object", "required": ["name", "version"], "additionalProperties": false,
+      "properties": {
+        "name":      { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+        "version":   { "type": "integer", "minimum": 1 },
+        "createdBy": { "type": "string" },
+        "changeRef": { "type": "string", "pattern": "^CHG-[A-Z0-9]+$" }
+      }
+    },
+    "target": {
+      "type": "object", "required": ["cluster", "lob", "environment"], "additionalProperties": false,
+      "properties": {
+        "cluster":     { "type": "string" },
+        "lob":         { "type": "string", "enum": ["lob1","lob2","lob3","lob4","lob5"] },
+        "environment": { "type": "string", "enum": ["dev","sit","uat","prod"] }
+      }
+    },
+    "governance": {
+      "type": "object", "required": ["mapId", "toIntakeNumber", "teamName"], "additionalProperties": false,
+      "properties": {
+        "mapId":              { "type": "string", "pattern": "^[0-9]{8}$" },
+        "toIntakeNumber":     { "type": "string", "pattern": "^TO-[0-9]{6}$" },
+        "teamName":           { "type": "string", "minLength": 3, "maxLength": 64 },
+        "costCenter":         { "type": "string" },
+        "dataClassification": { "type": "string",
+                                "enum": ["public","internal","confidential","restricted"] }
+      }
+    },
+    "lifecycle": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "state":         { "type": "string",
+                           "enum": ["draft","active","suspended","decommissioning","archived"] },
+        "retentionDays": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "namespace": {
+      "type": "object", "required": ["name"], "additionalProperties": false,
+      "properties": {
+        "name":         { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+        "displayName":  { "type": "string" },
+        "customLabels": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "quota": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "profile": { "type": "string", "enum": ["small","medium","large","custom"] } }
+    },
+    "limitRange": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "profile": { "type": "string", "enum": ["standard","relaxed","strict","custom"] } }
+    },
+    "networkPolicy": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "template": { "type": "string",
+                                    "enum": ["deny-all","allow-same-namespace","lob-internal"] } }
+    },
+    "machineSet": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "instanceType":  { "type": "string",
+                           "enum": ["Standard_D4s_v3","Standard_D8s_v3","Standard_D16s_v3",
+                                    "Standard_E4s_v3","Standard_E8s_v3"] },
+        "replicas":      { "type": "integer", "minimum": 1, "maximum": 10 },
+        "zone":          { "type": "string", "enum": ["1","2","3"] },
+        "location":      { "type": "string", "description": "Azure region, default: eastus" },
+        "subnet":        { "type": "string" },
+        "resourceGroup": { "type": "string" }
+      }
+    },
+    "rbac": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "roleBindings": {
+          "type": "array",
+          "items": {
+            "type": "object", "required": ["group","clusterRole"],
+            "properties": {
+              "group":       { "type": "string" },
+              "clusterRole": { "type": "string",
+                               "enum": ["admin","edit","view","cluster-reader"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+
+# ── 7. Input file JSON Schema (#18) ───────────────────────────────────────────
+cat > resource-catalog/schemas/input-v1-schema.json << 'EOF'
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LOB Input File",
+  "description": "Schema for onboarding/<lob>.input.yaml files",
+  "type": "object",
+  "required": ["namespaces"],
+  "additionalProperties": false,
+  "properties": {
+    "namespaces": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["namespace", "cluster", "environment", "governance"],
+        "additionalProperties": false,
+        "properties": {
+          "namespace":   { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+          "cluster":     { "type": "string" },
+          "environment": { "type": "string", "enum": ["dev","sit","uat","prod"] },
+          "lob":         { "type": "string", "enum": ["lob1","lob2","lob3","lob4","lob5"] },
+          "governance": {
+            "type": "object",
+            "required": ["map-id", "to-intake", "team-name", "change-ref"],
+            "additionalProperties": false,
+            "properties": {
+              "map-id":              { "type": "string", "pattern": "^[0-9]{8}$" },
+              "to-intake":           { "type": "string", "pattern": "^TO-[0-9]{6}$" },
+              "team-name":           { "type": "string", "minLength": 3 },
+              "change-ref":          { "type": "string", "pattern": "^CHG-[A-Z0-9]+$" },
+              "cost-center":         { "type": "string" },
+              "data-classification": { "type": "string",
+                                       "enum": ["public","internal","confidential","restricted"] }
+            }
+          },
+          "quota":   { "type": "string", "enum": ["small","medium","large"] },
+          "netpol":  { "type": "string", "enum": ["deny-all","allow-same-namespace","lob-internal"] },
+          "labels":  { "type": "object", "additionalProperties": { "type": ["string","null"] } },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["group", "role"],
+              "properties": {
+                "group": { "type": "string" },
+                "role":  { "type": ["string","null"],
+                           "enum": ["admin","edit","view","reader", null] }
+              }
+            }
+          },
+          "machineSet": {
+            "type": ["object","boolean"],
+            "properties": {
+              "instanceType":  { "type": "string",
+                                 "enum": ["Standard_D4s_v3","Standard_D8s_v3","Standard_D16s_v3",
+                                          "Standard_E4s_v3","Standard_E8s_v3"] },
+              "replicas":      { "type": "integer", "minimum": 1, "maximum": 10 },
+              "zone":          { "type": "string", "enum": ["1","2","3"] },
+              "location":      { "type": "string" },
+              "subnet":        { "type": "string" },
+              "resourceGroup": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+
+# ── 8. onboarding/lob1.input.yaml ─────────────────────────────────────────────
+cat > onboarding/lob1.input.yaml << 'EOF'
+# =============================================================================
+# onboarding/lob1.input.yaml
+#
+# Source of intent for ALL lob1 namespaces.
+# This is the ONLY file engineers edit.
+#
+# ITERATION MODEL:
+#   - Add a namespace block to provision a new namespace
+#   - Edit an existing block to update resources (quota, roles, labels, etc.)
+#   - Set any value to null (~) to remove it from the RIR and cluster
+#   - Always update governance.change-ref to the current CHG number
+#
+# DEFAULTS (auto-applied on iteration 1 if omitted):
+#   quota:  small
+#   netpol: deny-all
+#   governance.data-classification: internal
+#
+# ROLES MERGE: new groups appended, existing preserved, null role removes group
+# LABELS MERGE: additive, null value removes label
+# =============================================================================
+
+namespaces:
+
+  # Iteration 1 example: namespace + governance only
+  # quota/netpol defaulted, no RBAC until added in a later iteration
+  - namespace: lob1-example-dev
+    cluster: ocp-nonprod-eastus-01
+    environment: dev
+    governance:
+      map-id: "12345678"
+      to-intake: "TO-000001"
+      team-name: lob1-example-team
+      cost-center: CC-LOB1-001
+      data-classification: internal
+      change-ref: CHG-EXAMPLE1
+EOF
+
+# ── 9. scripts/input_to_rir.py ────────────────────────────────────────────────
+cat > scripts/input_to_rir.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+input_to_rir.py
+---------------
+Reads onboarding/<lob>.input.yaml (multi-namespace LOB file).
+For each namespace entry:
+  1. Validates cluster name against clusters/cluster-registry.yaml  (#10)
+  2. Checks for duplicate namespace across other LOBs               (#6)
+  3. Merges with existing RIR using deep merge + null-removal
+  4. Applies defaults (quota: small, netpol: deny-all,
+     data-classification: internal)                                  (#14)
+  5. Validates merged state against input schema
+  6. Writes resource-catalog/<lob>/<namespace>.rir.yaml
+  7. Writes resource-catalog/<lob>/<namespace>.audit.yaml
+
+Emits a JSON render manifest consumed by render_rir.py.
+
+Usage:
+  python3 scripts/input_to_rir.py \
+    --input    onboarding/lob1.input.yaml \
+    --schema   resource-catalog/schemas/rir-v1-schema.json \
+    --registry clusters/cluster-registry.yaml \
+    --outdir   resource-catalog \
+    --author   platform-engineer \
+    --manifest /tmp/render-manifest.json
+"""
+
+import argparse
+import copy
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "quota":               "small",
+    "netpol":              "deny-all",
+    "data-classification": "internal",    # #14
+}
+
+QUOTA_PROFILES = {
+    "small":  {"requests.cpu": "2",  "requests.memory": "4Gi",  "limits.cpu": "4",  "limits.memory": "8Gi",  "pods": "20"},
+    "medium": {"requests.cpu": "8",  "requests.memory": "16Gi", "limits.cpu": "16", "limits.memory": "32Gi", "pods": "50"},
+    "large":  {"requests.cpu": "16", "requests.memory": "32Gi", "limits.cpu": "32", "limits.memory": "64Gi", "pods": "100"},
+}
+
+LIMITRANGE_FROM_QUOTA = {
+    "small":  "standard",
+    "medium": "standard",
+    "large":  "relaxed",
+}
+
+ROLE_MAP = {
+    "admin":  "admin",
+    "edit":   "edit",
+    "view":   "view",
+    "reader": "cluster-reader",
+}
+
+APPROVED_SKUS = {
+    "Standard_D4s_v3", "Standard_D8s_v3", "Standard_D16s_v3",
+    "Standard_E4s_v3", "Standard_E8s_v3",
+}
+
+VALID_LOBS         = {"lob1", "lob2", "lob3", "lob4", "lob5"}
+VALID_ENVIRONMENTS = {"dev", "sit", "uat", "prod"}
+VALID_NETPOLS      = {"deny-all", "allow-same-namespace", "lob-internal"}
+VALID_QUOTAS       = set(QUOTA_PROFILES.keys())
+VALID_DATA_CLASS   = {"public", "internal", "confidential", "restricted"}
+
+
+# ---------------------------------------------------------------------------
+# Load cluster registry (#10)
+# Returns set of active cluster names, or None if registry not found
+# ---------------------------------------------------------------------------
+def load_cluster_registry(registry_path: str) -> set | None:
+    if not os.path.exists(registry_path):
+        print(f"WARNING: cluster-registry.yaml not found at {registry_path} - skipping cluster validation")
+        return None
+    with open(registry_path) as f:
+        data = yaml.safe_load(f)
+    return {c["name"] for c in data.get("clusters", []) if c.get("status") == "active"}
+
+
+# ---------------------------------------------------------------------------
+# Cross-LOB duplicate namespace detection (#6)
+# ---------------------------------------------------------------------------
+def check_duplicate_namespace(ns_name: str, lob: str, catalog_dir: str) -> list:
+    """Returns list of other LOBs that already have a RIR for this namespace."""
+    duplicates = []
+    if not os.path.isdir(catalog_dir):
+        return duplicates
+    for lob_dir in os.listdir(catalog_dir):
+        if lob_dir == lob:
+            continue
+        lob_path = os.path.join(catalog_dir, lob_dir)
+        if not os.path.isdir(lob_path):
+            continue
+        rir_path = os.path.join(lob_path, f"{ns_name}.rir.yaml")
+        if os.path.exists(rir_path):
+            duplicates.append(lob_dir)
+    return duplicates
+
+
+# ---------------------------------------------------------------------------
+# Merge helpers
+# ---------------------------------------------------------------------------
+def merge_roles(existing: list, patch: list) -> list:
+    """
+    Merge roles keyed by group name.
+    New groups appended, existing preserved, null role removes group.
+    """
+    role_map = {r["group"]: r for r in (existing or [])}
+    for entry in (patch or []):
+        group = entry.get("group")
+        if not group:
+            continue
+        if entry.get("role") is None:
+            role_map.pop(group, None)
+        else:
+            role_map[group] = entry
+    return list(role_map.values())
+
+
+def merge_labels(existing: dict, patch: dict) -> dict:
+    """Additive label merge. Null value removes the label."""
+    result = copy.deepcopy(existing or {})
+    for k, v in (patch or {}).items():
+        if v is None:
+            result.pop(k, None)
+        else:
+            result[k] = v
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+def validate_entry(entry: dict, lob: str, valid_clusters: set | None) -> list:
+    errors = []
+
+    ns = entry.get("namespace", "")
+    if not re.match(r"^[a-z][a-z0-9-]{2,62}$", str(ns)):
+        errors.append(f"namespace '{ns}' must match ^[a-z][a-z0-9-]{{2,62}}$")
+
+    cluster = entry.get("cluster", "")
+    if valid_clusters is not None and cluster not in valid_clusters:
+        errors.append(f"cluster '{cluster}' is not in cluster-registry.yaml active clusters: {sorted(valid_clusters)}")
+
+    if entry.get("lob", lob) not in VALID_LOBS:
+        errors.append(f"lob must be one of {sorted(VALID_LOBS)}")
+
+    if entry.get("environment") not in VALID_ENVIRONMENTS:
+        errors.append(f"environment must be one of {sorted(VALID_ENVIRONMENTS)}")
+
+    gov = entry.get("governance", {})
+    if not re.match(r"^[0-9]{8}$", str(gov.get("map-id", ""))):
+        errors.append("governance.map-id must be exactly 8 digits")
+    if not re.match(r"^TO-[0-9]{6}$", str(gov.get("to-intake", ""))):
+        errors.append("governance.to-intake must match TO-XXXXXX")
+    if not re.match(r"^CHG-[A-Z0-9]+$", str(gov.get("change-ref", ""))):
+        errors.append("governance.change-ref must match CHG-XXXXXXX")
+    if not gov.get("team-name"):
+        errors.append("governance.team-name is required")
+
+    quota = entry.get("quota", DEFAULTS["quota"])
+    if quota not in VALID_QUOTAS:
+        errors.append(f"quota must be one of {sorted(VALID_QUOTAS)}")
+
+    netpol = entry.get("netpol", DEFAULTS["netpol"])
+    if netpol not in VALID_NETPOLS:
+        errors.append(f"netpol must be one of {sorted(VALID_NETPOLS)}")
+
+    data_class = gov.get("data-classification", DEFAULTS["data-classification"])
+    if data_class not in VALID_DATA_CLASS:
+        errors.append(f"data-classification must be one of {sorted(VALID_DATA_CLASS)}")
+
+    for r in entry.get("roles", []):
+        if not r.get("group"):
+            errors.append("each role entry must have a non-empty 'group'")
+        if r.get("role") not in ROLE_MAP and r.get("role") is not None:
+            errors.append(f"role '{r.get('role')}' must be one of {list(ROLE_MAP.keys())}")
+
+    ms = entry.get("machineSet")
+    if isinstance(ms, dict):
+        if ms.get("instanceType") not in APPROVED_SKUS:
+            errors.append(f"machineSet.instanceType must be one of {sorted(APPROVED_SKUS)}")
+        if not (1 <= int(ms.get("replicas", 0)) <= 10):
+            errors.append("machineSet.replicas must be 1-10")
+        if str(ms.get("zone", "")) not in {"1", "2", "3"}:
+            errors.append("machineSet.zone must be '1', '2', or '3'")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Load existing RIR
+# ---------------------------------------------------------------------------
+def load_existing_rir(rir_path: str):
+    if os.path.exists(rir_path):
+        with open(rir_path) as f:
+            return yaml.safe_load(f)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Detect changed resource types
+# ---------------------------------------------------------------------------
+def detect_changed_resources(old_rir, new_rir: dict) -> list:
+    if old_rir is None:
+        changed = ["namespace", "quota", "limitrange", "netpol"]
+        if new_rir.get("rbac", {}).get("roleBindings"):
+            changed.append("rbac")
+        if new_rir.get("machineSet"):
+            changed.append("machineSet")
+        return changed
+
+    changed = []
+    def differs(a, b):
+        return json.dumps(a, sort_keys=True) != json.dumps(b, sort_keys=True)
+
+    if differs(old_rir.get("namespace"), new_rir.get("namespace")):
+        changed.append("namespace")
+    if differs(old_rir.get("quota"), new_rir.get("quota")) or \
+       differs(old_rir.get("limitRange"), new_rir.get("limitRange")):
+        changed.append("quota")
+        changed.append("limitrange")
+    if differs(old_rir.get("networkPolicy"), new_rir.get("networkPolicy")):
+        changed.append("netpol")
+    if differs(old_rir.get("rbac"), new_rir.get("rbac")):
+        changed.append("rbac")
+    if differs(old_rir.get("machineSet"), new_rir.get("machineSet")):
+        changed.append("machineSet")
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Build RIR (#14: data-classification defaults to 'internal')
+# ---------------------------------------------------------------------------
+def build_rir(entry: dict, lob: str, existing_rir, author: str) -> dict:
+    ns      = entry["namespace"]
+    gov     = entry.get("governance", {})
+    quota   = entry.get("quota",  DEFAULTS["quota"])
+    netpol  = entry.get("netpol", DEFAULTS["netpol"])
+    version = (existing_rir or {}).get("metadata", {}).get("version", 0) + 1
+
+    # Default data-classification to 'internal' if not provided (#14)
+    data_class = gov.get("data-classification", DEFAULTS["data-classification"])
+
+    # Merge roles from existing RIR with patch
+    existing_roles_input = []
+    if existing_rir:
+        for r in existing_rir.get("rbac", {}).get("roleBindings", []):
+            role_key = next((k for k, v in ROLE_MAP.items() if v == r["clusterRole"]), None)
+            if role_key:
+                existing_roles_input.append({"group": r["group"], "role": role_key})
+    merged_roles = merge_roles(existing_roles_input, entry.get("roles", []))
+
+    # Merge custom labels
+    existing_labels = (existing_rir or {}).get("namespace", {}).get("customLabels", {})
+    merged_labels   = merge_labels(existing_labels, entry.get("labels", {}))
+
+    rir = {
+        "apiVersion": "platform.company-xxx.com/v1",
+        "kind":       "ResourceIntentRecord",
+        "metadata": {
+            "name":      ns,
+            "version":   version,
+            "createdBy": author,
+            "changeRef": gov.get("change-ref", ""),
+        },
+        "target": {
+            "cluster":     entry.get("cluster", ""),
+            "lob":         entry.get("lob", lob),
+            "environment": entry.get("environment", ""),
+        },
+        "governance": {
+            "mapId":              str(gov.get("map-id", "")),
+            "toIntakeNumber":     gov.get("to-intake", ""),
+            "teamName":           gov.get("team-name", ""),
+            "dataClassification": data_class,
+        },
+        "lifecycle": {
+            "state":         "active",
+            "retentionDays": 365,
+        },
+        "namespace": {
+            "name":        ns,
+            "displayName": ns.replace("-", " ").title(),
+        },
+        "quota":         {"profile": quota},
+        "limitRange":    {"profile": LIMITRANGE_FROM_QUOTA.get(quota, "standard")},
+        "networkPolicy": {"template": netpol},
+    }
+
+    if gov.get("cost-center"):
+        rir["governance"]["costCenter"] = gov["cost-center"]
+    if merged_labels:
+        rir["namespace"]["customLabels"] = merged_labels
+    if merged_roles:
+        rir["rbac"] = {
+            "roleBindings": [
+                {"group": r["group"], "clusterRole": ROLE_MAP[r["role"]]}
+                for r in merged_roles if r.get("role") is not None
+            ]
+        }
+
+    ms = entry.get("machineSet")
+    if isinstance(ms, dict):
+        rir["machineSet"] = {
+            "instanceType":  ms["instanceType"],
+            "replicas":      int(ms["replicas"]),
+            "zone":          str(ms["zone"]),
+            "location":      ms.get("location", "eastus"),      # #3
+            "subnet":        ms.get("subnet", "worker-subnet"),  # #9
+            "resourceGroup": ms.get("resourceGroup", ""),        # #9
+        }
+
+    return rir
+
+
+# ---------------------------------------------------------------------------
+# Write audit log
+# ---------------------------------------------------------------------------
+def write_audit_log(audit_path: str, rir: dict, changed_resources: list,
+                    author: str, input_file: str, is_new: bool) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entries = []
+    if os.path.exists(audit_path):
+        with open(audit_path) as f:
+            existing = yaml.safe_load(f) or {}
+            entries = existing.get("changelog", [])
+    entries.append({
+        "version":          rir["metadata"]["version"],
+        "timestamp":        now,
+        "action":           "created" if is_new else "updated",
+        "author":           author,
+        "changeRef":        rir["metadata"].get("changeRef", ""),
+        "changedResources": sorted(changed_resources),
+        "sourceFile":       input_file,
+    })
+    header = (
+        f"# Audit log for namespace: {rir['namespace']['name']}\n"
+        f"# AUTO-GENERATED by input_to_rir.py - DO NOT EDIT MANUALLY\n"
+        f"# Last updated: {now}\n"
+    )
+    with open(audit_path, "w") as f:
+        f.write(header)
+        yaml.dump({"namespace": rir["namespace"]["name"], "changelog": entries},
+                  f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+# ---------------------------------------------------------------------------
+# Write RIR
+# ---------------------------------------------------------------------------
+def write_rir(rir_path: str, rir: dict, input_file: str) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    header = (
+        f"# =============================================================================\n"
+        f"# ResourceIntentRecord - AUTO-GENERATED by input_to_rir.py\n"
+        f"# Source : {input_file}\n"
+        f"# Updated: {now}\n"
+        f"# Version: {rir['metadata']['version']}\n"
+        f"# DO NOT EDIT - edit {input_file} and re-run pipeline\n"
+        f"# =============================================================================\n"
+    )
+    os.makedirs(os.path.dirname(rir_path), exist_ok=True)
+    with open(rir_path, "w") as f:
+        f.write(header)
+        yaml.dump(rir, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Convert LOB input.yaml to per-namespace RIRs")
+    parser.add_argument("--input",    required=True,  help="onboarding/<lob>.input.yaml")
+    parser.add_argument("--schema",   required=True,  help="rir-v1-schema.json")
+    parser.add_argument("--registry", required=True,  help="clusters/cluster-registry.yaml")
+    parser.add_argument("--outdir",   required=True,  help="resource-catalog/")
+    parser.add_argument("--author",   default="gitops-bot")
+    parser.add_argument("--manifest", required=True,  help="output render manifest JSON")
+    args = parser.parse_args()
+
+    lob = os.path.basename(args.input).replace(".input.yaml", "")
+
+    with open(args.input) as f:
+        lob_input = yaml.safe_load(f)
+
+    namespaces = lob_input.get("namespaces", [])
+    if not namespaces:
+        print(f"No namespaces found in {args.input}")
+        sys.exit(0)
+
+    # Load cluster registry once (#10)
+    valid_clusters = load_cluster_registry(args.registry)
+
+    manifest   = []
+    has_errors = False
+
+    for entry in namespaces:
+        ns = entry.get("namespace", "<unknown>")
+        print(f"Processing: {ns}")
+
+        # Cross-LOB duplicate check (#6)
+        duplicates = check_duplicate_namespace(ns, lob, args.outdir)
+        if duplicates:
+            print(f"  ERROR: namespace '{ns}' already exists in LOB(s): {', '.join(duplicates)}", file=sys.stderr)
+            has_errors = True
+            continue
+
+        errors = validate_entry(entry, lob, valid_clusters)
+        if errors:
+            for e in errors:
+                print(f"  ERROR: {e}", file=sys.stderr)
+            has_errors = True
+            continue
+
+        rir_path   = os.path.join(args.outdir, lob, f"{ns}.rir.yaml")
+        audit_path = os.path.join(args.outdir, lob, f"{ns}.audit.yaml")
+        existing   = load_existing_rir(rir_path)
+        is_new     = existing is None
+        new_rir    = build_rir(entry, lob, existing, args.author)
+        changed    = detect_changed_resources(existing, new_rir)
+
+        if not changed and not is_new:
+            print(f"  No changes - skipping")
+            continue
+
+        write_rir(rir_path, new_rir, args.input)
+        write_audit_log(audit_path, new_rir, changed, args.author, args.input, is_new)
+        print(f"  {'Created' if is_new else 'Updated'} v{new_rir['metadata']['version']} - changed: {changed}")
+
+        manifest.append({
+            "namespace":         ns,
+            "lob":               lob,
+            "rir_path":          rir_path,
+            "audit_path":        audit_path,
+            "changed_resources": changed,
+            "is_new":            is_new,
+        })
+
+    if has_errors:
+        print("Validation errors found - aborting.", file=sys.stderr)
+        sys.exit(1)
+
+    with open(args.manifest, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"Manifest: {args.manifest} | Processed: {len(namespaces)} | Changed: {len(manifest)}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+# ── 10. scripts/render_rir.py ─────────────────────────────────────────────────
+cat > scripts/render_rir.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+render_rir.py
+-------------
+Reads the JSON manifest from input_to_rir.py.
+For each namespace, renders ONLY the resource types that changed.
+Argo CD picks up new/updated files and applies them additively.
+
+Usage:
+  python3 scripts/render_rir.py \
+    --manifest  /tmp/render-manifest.json \
+    --templates templates/ \
+    --outdir    clusters/
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+
+QUOTA_PROFILES = {
+    "small":  {"requests_cpu": "2",  "requests_memory": "4Gi",  "limits_cpu": "4",  "limits_memory": "8Gi",  "pods": "20"},
+    "medium": {"requests_cpu": "8",  "requests_memory": "16Gi", "limits_cpu": "16", "limits_memory": "32Gi", "pods": "50"},
+    "large":  {"requests_cpu": "16", "requests_memory": "32Gi", "limits_cpu": "32", "limits_memory": "64Gi", "pods": "100"},
+}
+
+LIMITRANGE_PROFILES = {
+    "standard": {"default_cpu": "500m", "default_memory": "512Mi",
+                 "default_req_cpu": "100m", "default_req_memory": "128Mi",
+                 "max_cpu": "4", "max_memory": "8Gi"},
+    "relaxed":  {"default_cpu": "1",    "default_memory": "1Gi",
+                 "default_req_cpu": "250m", "default_req_memory": "256Mi",
+                 "max_cpu": "16", "max_memory": "32Gi"},
+    "strict":   {"default_cpu": "200m", "default_memory": "256Mi",
+                 "default_req_cpu": "50m", "default_req_memory": "64Mi",
+                 "max_cpu": "2", "max_memory": "4Gi"},
+}
+
+RESOURCE_TEMPLATE_MAP = {
+    "namespace":  ("namespace.yaml.j2",     "namespaces"),
+    "quota":      ("resourcequota.yaml.j2", "quotas"),
+    "limitrange": ("limitrange.yaml.j2",    "limitranges"),
+    "rbac":       ("rolebinding.yaml.j2",   "rbac"),
+    "netpol":     ("networkpolicy.yaml.j2", "netpol"),
+    "machineSet": ("machineset.yaml.j2",    "machinesets"),
+}
+
+
+def build_context(rir: dict) -> dict:
+    quota_profile = rir.get("quota", {}).get("profile", "small")
+    lr_profile    = rir.get("limitRange", {}).get("profile", "standard")
+    gov           = rir.get("governance", {})
+    ns            = rir["namespace"]["name"]
+    ms            = rir.get("machineSet")
+    return {
+        "namespace":           ns,
+        "display_name":        rir["namespace"].get("displayName", ns),
+        "custom_labels":       rir.get("namespace", {}).get("customLabels", {}),
+        "map_id":              gov.get("mapId", ""),
+        "to_intake":           gov.get("toIntakeNumber", ""),
+        "lob":                 rir["target"]["lob"],
+        "team_name":           gov.get("teamName", ""),
+        "environment":         rir["target"]["environment"],
+        "data_classification": gov.get("dataClassification", "internal"),
+        "cost_center":         gov.get("costCenter", ""),
+        "cluster":             rir["target"]["cluster"],
+        "quota_profile":       quota_profile,
+        **QUOTA_PROFILES.get(quota_profile, QUOTA_PROFILES["small"]),
+        "lr_profile":          lr_profile,
+        **LIMITRANGE_PROFILES.get(lr_profile, LIMITRANGE_PROFILES["standard"]),
+        "netpol_template":     rir.get("networkPolicy", {}).get("template", "deny-all"),
+        "role_bindings":       rir.get("rbac", {}).get("roleBindings", []),
+        "machineset":          ms,
+        # Flattened machineset fields for template convenience (#3, #9)
+        "machineset_location":       ms.get("location", "eastus")        if ms else "",
+        "machineset_subnet":         ms.get("subnet", "worker-subnet")    if ms else "",
+        "machineset_resource_group": ms.get("resourceGroup", "")          if ms else "",
+        "generated_at":        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rir_version":         rir.get("metadata", {}).get("version", 1),
+        "change_ref":          rir.get("metadata", {}).get("changeRef", ""),
+    }
+
+
+def render_namespace(rir: dict, changed_resources: list, templates_dir: str, outdir: str) -> list:
+    env = Environment(loader=FileSystemLoader(templates_dir),
+                      undefined=StrictUndefined, trim_blocks=True, lstrip_blocks=True)
+    ctx     = build_context(rir)
+    cluster = rir["target"]["cluster"]
+    lob     = rir["target"]["lob"]
+    ns      = rir["namespace"]["name"]
+    rendered = []
+
+    for resource in changed_resources:
+        if resource not in RESOURCE_TEMPLATE_MAP:
+            print(f"  WARNING: no template for '{resource}' - skipping")
+            continue
+        tmpl_file, subdir = RESOURCE_TEMPLATE_MAP[resource]
+        tmpl_path = os.path.join(templates_dir, tmpl_file)
+        if not os.path.exists(tmpl_path):
+            print(f"  WARNING: template not found: {tmpl_path} - skipping")
+            continue
+        out_path = os.path.join(outdir, cluster, "lob", lob, subdir, f"{ns}.yaml")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as f:
+            f.write(env.get_template(tmpl_file).render(**ctx))
+        print(f"  Rendered [{resource}]: {out_path}")
+        rendered.append(out_path)
+
+    return rendered
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest",  required=True)
+    parser.add_argument("--templates", required=True)
+    parser.add_argument("--outdir",    required=True)
+    args = parser.parse_args()
+
+    with open(args.manifest) as f:
+        manifest = json.load(f)
+
+    if not manifest:
+        print("No changes in manifest - nothing to render.")
+        return
+
+    total = []
+    for item in manifest:
+        ns       = item["namespace"]
+        rir_path = item["rir_path"]
+        changed  = item["changed_resources"]
+        print(f"Rendering: {ns} ({len(changed)} resource types)")
+        if not os.path.exists(rir_path):
+            print(f"  ERROR: RIR not found: {rir_path}", file=sys.stderr)
+            continue
+        with open(rir_path) as f:
+            rir = yaml.safe_load(f)
+        total.extend(render_namespace(rir, changed, args.templates, args.outdir))
+
+    print(f"Render complete. Files written: {len(total)}")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+# ── 11. scripts/validate_templates.py (#13) ───────────────────────────────────
+cat > scripts/validate_templates.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+validate_templates.py
+---------------------
+Validates Jinja2 template syntax in templates/ directory.
+Run as part of bootstrap and in CI before merge.
+
+Usage:
+  python3 scripts/validate_templates.py --templates templates/
+"""
+
+import argparse
+import sys
+from jinja2 import Environment, FileSystemLoader, TemplateSyntaxError
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Validate Jinja2 template syntax")
+    parser.add_argument("--templates", default="templates/", help="Path to templates directory")
+    args = parser.parse_args()
+
+    env    = Environment(loader=FileSystemLoader(args.templates))
+    tmpls  = env.list_templates()
+    errors = []
+
+    if not tmpls:
+        print(f"WARNING: No templates found in {args.templates}")
+        sys.exit(0)
+
+    for tmpl_name in sorted(tmpls):
+        try:
+            env.get_template(tmpl_name)
+            print(f"  OK: {tmpl_name}")
+        except TemplateSyntaxError as e:
+            print(f"  FAIL: {tmpl_name}: {e}")
+            errors.append(tmpl_name)
+
+    if errors:
+        print(f"\n{len(errors)} template(s) failed syntax validation")
+        sys.exit(1)
+
+    print(f"\nAll {len(tmpls)} templates passed syntax validation")
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+# ── 12. Jinja2 templates ──────────────────────────────────────────────────────
+cat > templates/namespace.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+# Source: resource-catalog/{{ lob }}/{{ namespace }}.rir.yaml
+# DO NOT EDIT MANUALLY
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ namespace }}
+  annotations:
+    openshift.io/display-name: "{{ display_name }}"
+    platform.company-xxx.com/change-ref: "{{ change_ref }}"
+    platform.company-xxx.com/generated-at: "{{ generated_at }}"
+    platform.company-xxx.com/rir-version: "{{ rir_version }}"
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/to-intake-number: "{{ to_intake }}"
+    company-xxx.com/lob: "{{ lob }}"
+    company-xxx.com/team: "{{ team_name }}"
+    company-xxx.com/environment: "{{ environment }}"
+    company-xxx.com/data-classification: "{{ data_classification }}"
+    app.kubernetes.io/managed-by: "gitops"
+{% for key, value in custom_labels.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+EOF
+
+cat > templates/resourcequota.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+# Quota profile: {{ quota_profile }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ namespace }}-quota
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  hard:
+    requests.cpu: "{{ requests_cpu }}"
+    requests.memory: "{{ requests_memory }}"
+    limits.cpu: "{{ limits_cpu }}"
+    limits.memory: "{{ limits_memory }}"
+    pods: "{{ pods }}"
+EOF
+
+cat > templates/limitrange.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+# LimitRange profile: {{ lr_profile }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ namespace }}-limitrange
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "{{ default_cpu }}"
+        memory: "{{ default_memory }}"
+      defaultRequest:
+        cpu: "{{ default_req_cpu }}"
+        memory: "{{ default_req_memory }}"
+      max:
+        cpu: "{{ max_cpu }}"
+        memory: "{{ max_memory }}"
+EOF
+
+cat > templates/rolebinding.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+{% for rb in role_bindings %}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ namespace }}-{{ rb.clusterRole }}-{{ loop.index }}
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ rb.clusterRole }}
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "{{ rb.group }}"
+{% endfor %}
+EOF
+
+cat > templates/networkpolicy.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+# NetworkPolicy template: {{ netpol_template }}
+{% if netpol_template == "deny-all" %}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-openshift-ingress
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+  policyTypes:
+    - Ingress
+{% elif netpol_template == "allow-same-namespace" %}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-openshift-ingress
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+  policyTypes:
+    - Ingress
+{% elif netpol_template == "lob-internal" %}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-lob-internal
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              company-xxx.com/lob: "{{ lob }}"
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-openshift-ingress
+  namespace: {{ namespace }}
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  podSelector: {}
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+  policyTypes:
+    - Ingress
+{% endif %}
+EOF
+
+# MachineSet template - updated with location, subnet, resourceGroup (#3, #9)
+cat > templates/machineset.yaml.j2 << 'EOF'
+# Generated by render_rir.py | RIR v{{ rir_version }} | {{ generated_at }}
+# MachineSet for dedicated node pool - namespace: {{ namespace }}
+---
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  name: {{ cluster }}-{{ lob }}-{{ namespace }}-{{ machineset.zone }}
+  namespace: openshift-machine-api
+  labels:
+    company-xxx.com/map-id: "{{ map_id }}"
+    company-xxx.com/lob: "{{ lob }}"
+    company-xxx.com/namespace: "{{ namespace }}"
+    app.kubernetes.io/managed-by: "gitops"
+spec:
+  replicas: {{ machineset.replicas }}
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: {{ cluster }}
+      machine.openshift.io/cluster-api-machineset: {{ cluster }}-{{ lob }}-{{ namespace }}-{{ machineset.zone }}
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: {{ cluster }}
+        machine.openshift.io/cluster-api-machineset: {{ cluster }}-{{ lob }}-{{ namespace }}-{{ machineset.zone }}
+        company-xxx.com/lob: "{{ lob }}"
+        company-xxx.com/namespace: "{{ namespace }}"
+    spec:
+      taints:
+        - key: dedicated
+          value: "{{ namespace }}"
+          effect: NoSchedule
+      providerSpec:
+        value:
+          apiVersion: azureproviderconfig.openshift.io/v1beta1
+          kind: AzureMachineProviderSpec
+          location: {{ machineset_location }}
+          vmSize: {{ machineset.instanceType }}
+          zone: "{{ machineset.zone }}"
+          subnet: "{{ machineset_subnet }}"
+          resourceGroup: "{{ machineset_resource_group }}"
+          managedIdentity: {{ cluster }}-identity
+          userDataSecret:
+            name: default-ignition
+          osDisk:
+            diskSizeGB: 128
+            osType: Linux
+            managedDisk:
+              storageAccountType: Premium_LRS
+          publicIP: false
+          securityGroup: {{ cluster }}-nsg
+EOF
+
+# ── 13. OPA policies ──────────────────────────────────────────────────────────
+cat > policies/opa/namespace.rego << 'EOF'
+# policies/opa/namespace.rego
+# CI enforcement via conftest. Cluster-level via Kyverno.
+package namespace
+
+required_labels := {
+  "company-xxx.com/map-id",
+  "company-xxx.com/to-intake-number",
+  "company-xxx.com/lob",
+  "company-xxx.com/team",
+  "company-xxx.com/environment",
+  "app.kubernetes.io/managed-by"
+}
+
+deny[msg] {
+  input.kind == "Namespace"
+  label := required_labels[_]
+  not input.metadata.labels[label]
+  msg := sprintf("Namespace missing required label: %v", [label])
+}
+
+deny[msg] {
+  input.kind == "Namespace"
+  not regex.match(`^[0-9]{8}$`, input.metadata.labels["company-xxx.com/map-id"])
+  msg := "company-xxx.com/map-id must be exactly 8 digits"
+}
+
+deny[msg] {
+  input.kind == "Namespace"
+  not regex.match(`^TO-[0-9]{6}$`, input.metadata.labels["company-xxx.com/to-intake-number"])
+  msg := "company-xxx.com/to-intake-number must match TO-XXXXXX"
+}
+
+deny[msg] {
+  input.kind == "Namespace"
+  input.metadata.labels["app.kubernetes.io/managed-by"] != "gitops"
+  msg := "app.kubernetes.io/managed-by must be 'gitops'"
+}
+EOF
+
+cat > policies/opa/machineset.rego << 'EOF'
+# policies/opa/machineset.rego
+package machineset
+
+approved_skus := {
+  "Standard_D4s_v3", "Standard_D8s_v3", "Standard_D16s_v3",
+  "Standard_E4s_v3", "Standard_E8s_v3"
+}
+
+deny[msg] {
+  input.kind == "MachineSet"
+  sku := input.spec.template.spec.providerSpec.value.vmSize
+  not approved_skus[sku]
+  msg := sprintf("MachineSet vmSize '%v' is not in the approved SKU list", [sku])
+}
+
+deny[msg] {
+  input.kind == "MachineSet"
+  input.spec.replicas > 10
+  msg := sprintf("MachineSet replicas %v exceeds maximum of 10", [input.spec.replicas])
+}
+EOF
+
+# ── 14. Kyverno policies (Audit mode) ─────────────────────────────────────────
+cat > policies/kyverno/require-namespace-labels.yaml << 'EOF'
+# AUDIT MODE - switch to Enforce after 2-week observation window (Week 3)
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-namespace-labels
+  annotations:
+    policies.kyverno.io/title: Require Namespace Labels
+    platform.company-xxx.com/mode: audit
+    platform.company-xxx.com/enforce-from: "TBD - switch after 2-week audit window"
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-required-labels
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      validate:
+        message: >
+          Namespace must have all required company-xxx.com governance labels
+          and app.kubernetes.io/managed-by=gitops
+        pattern:
+          metadata:
+            labels:
+              company-xxx.com/map-id: "?*"
+              company-xxx.com/to-intake-number: "?*"
+              company-xxx.com/lob: "?*"
+              company-xxx.com/team: "?*"
+              company-xxx.com/environment: "?*"
+              app.kubernetes.io/managed-by: "gitops"
+    - name: auto-inject-managed-by
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: "gitops"
+EOF
+
+cat > policies/kyverno/restrict-machineset-sku.yaml << 'EOF'
+# AUDIT MODE - switch to Enforce after audit window
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-machineset-sku
+  annotations:
+    policies.kyverno.io/title: Restrict MachineSet Instance Types
+    platform.company-xxx.com/mode: audit
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: check-approved-sku
+      match:
+        any:
+          - resources:
+              kinds: [MachineSet]
+      validate:
+        message: >
+          MachineSet vmSize must be one of the approved SKUs
+        pattern:
+          spec:
+            template:
+              spec:
+                providerSpec:
+                  value:
+                    vmSize: "Standard_D4s_v3 | Standard_D8s_v3 | Standard_D16s_v3 | Standard_E4s_v3 | Standard_E8s_v3"
+EOF
+
+# ── 15. GHA workflows ─────────────────────────────────────────────────────────
+# provision-resource.yml - manifest filename uses run_id to prevent collision (#5)
+cat > .github/workflows/provision-resource.yml << 'EOF'
+---
+# provision-resource.yml
+# TWO entry points:
+#   1. workflow_dispatch: form -> patches onboarding/<lob>.input.yaml -> generate job
+#   2. pull_request on onboarding/*.input.yaml: generate job runs directly
+#
+# Generate job:
+#   Step 1: validate input file against input-v1-schema.json
+#   Step 2: input_to_rir.py  -> per-namespace RIR + audit log + render manifest
+#   Step 3: render_rir.py    -> renders ONLY changed resource types
+#   Step 4: commit + open PR (dispatch path only)
+#
+# Note: manifest filenames include github.run_id to prevent concurrent collisions (#5)
+
+name: "Provision Resource"
+
+on:
+  workflow_dispatch:
+    inputs:
+      lob:
+        description: "Line of Business"
+        required: true
+        type: choice
+        options: [lob1, lob2, lob3, lob4, lob5]
+      namespace:
+        description: "Namespace name (e.g. lob1-payments-dev)"
+        required: true
+        type: string
+      cluster:
+        description: "Target cluster"
+        required: true
+        type: choice
+        options: [ocp-prod-eastus-01, ocp-nonprod-eastus-01]
+      environment:
+        description: "Environment"
+        required: true
+        type: choice
+        options: [dev, sit, uat, prod]
+      map_id:
+        description: "MAP ID (8 digits)"
+        required: true
+        type: string
+      to_intake:
+        description: "TO Intake Number (TO-XXXXXX)"
+        required: true
+        type: string
+      team_name:
+        description: "Team name"
+        required: true
+        type: string
+      change_ref:
+        description: "ServiceNow Change Ref (CHG-XXXXXXX)"
+        required: true
+        type: string
+      cost_center:
+        description: "Cost center (optional)"
+        required: false
+        type: string
+      data_classification:
+        description: "Data classification (default: internal)"
+        required: false
+        type: choice
+        options: ["", public, internal, confidential, restricted]
+      quota_profile:
+        description: "Quota profile (default: small)"
+        required: false
+        type: choice
+        options: ["", small, medium, large]
+      netpol_template:
+        description: "Network policy (default: deny-all)"
+        required: false
+        type: choice
+        options: ["", deny-all, allow-same-namespace, lob-internal]
+      role_admin_group:
+        description: "AD group for admin role (optional)"
+        required: false
+        type: string
+      role_edit_group:
+        description: "AD group for edit role (optional)"
+        required: false
+        type: string
+      role_view_group:
+        description: "AD group for view role (optional)"
+        required: false
+        type: string
+      labels:
+        description: "Custom labels as key=value,key=value (optional)"
+        required: false
+        type: string
+      enable_machineset:
+        description: "Provision MachineSet?"
+        required: false
+        type: choice
+        options: ["", "true", "false"]
+      machineset_sku:
+        description: "MachineSet SKU (if enable_machineset=true)"
+        required: false
+        type: choice
+        options: ["", Standard_D4s_v3, Standard_D8s_v3, Standard_D16s_v3, Standard_E4s_v3, Standard_E8s_v3]
+      machineset_replicas:
+        description: "MachineSet replicas 1-10"
+        required: false
+        type: string
+      machineset_zone:
+        description: "MachineSet zone"
+        required: false
+        type: choice
+        options: ["", "1", "2", "3"]
+      machineset_location:
+        description: "Azure region for MachineSet (default: eastus)"
+        required: false
+        type: string
+      machineset_subnet:
+        description: "Subnet name for MachineSet (default: worker-subnet)"
+        required: false
+        type: string
+      machineset_resource_group:
+        description: "Azure resource group for MachineSet"
+        required: false
+        type: string
+
+  pull_request:
+    branches: [main]
+    paths:
+      - "onboarding/*.input.yaml"
+
+env:
+  PYTHON_VERSION: "3.11"
+  GIT_USER_EMAIL: "gitops-bot@company-xxx.com"
+  GIT_USER_NAME:  "gitops-bot"
+
+jobs:
+
+  patch-input:
+    name: "Step 1 - Patch LOB input.yaml from form"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      branch_name: ${{ steps.branch.outputs.branch_name }}
+      input_file:  ${{ steps.patch.outputs.input_file }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_BOT_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: pip install -r scripts/requirements.txt
+
+      - name: Set branch name
+        id: branch
+        run: |
+          printf "branch_name=provision/${{ github.event.inputs.namespace }}-$(date +%Y%m%d%H%M%S)\n" >> "$GITHUB_OUTPUT"
+
+      - run: git checkout -b "${{ steps.branch.outputs.branch_name }}"
+
+      - name: Patch input.yaml
+        id: patch
+        shell: python3 {0}
+        env:
+          LOB:            "${{ github.event.inputs.lob }}"
+          NAMESPACE:      "${{ github.event.inputs.namespace }}"
+          CLUSTER:        "${{ github.event.inputs.cluster }}"
+          ENVIRONMENT:    "${{ github.event.inputs.environment }}"
+          MAP_ID:         "${{ github.event.inputs.map_id }}"
+          TO_INTAKE:      "${{ github.event.inputs.to_intake }}"
+          TEAM_NAME:      "${{ github.event.inputs.team_name }}"
+          CHANGE_REF:     "${{ github.event.inputs.change_ref }}"
+          COST_CENTER:    "${{ github.event.inputs.cost_center }}"
+          DATA_CLASS:     "${{ github.event.inputs.data_classification }}"
+          QUOTA:          "${{ github.event.inputs.quota_profile }}"
+          NETPOL:         "${{ github.event.inputs.netpol_template }}"
+          ROLE_ADMIN:     "${{ github.event.inputs.role_admin_group }}"
+          ROLE_EDIT:      "${{ github.event.inputs.role_edit_group }}"
+          ROLE_VIEW:      "${{ github.event.inputs.role_view_group }}"
+          LABELS:         "${{ github.event.inputs.labels }}"
+          ENABLE_MS:      "${{ github.event.inputs.enable_machineset }}"
+          MS_SKU:         "${{ github.event.inputs.machineset_sku }}"
+          MS_REPLICAS:    "${{ github.event.inputs.machineset_replicas }}"
+          MS_ZONE:        "${{ github.event.inputs.machineset_zone }}"
+          MS_LOCATION:    "${{ github.event.inputs.machineset_location }}"
+          MS_SUBNET:      "${{ github.event.inputs.machineset_subnet }}"
+          MS_RG:          "${{ github.event.inputs.machineset_resource_group }}"
+          ACTOR:          "${{ github.actor }}"
+        run: |
+          import os, yaml
+
+          lob        = os.environ["LOB"]
+          namespace  = os.environ["NAMESPACE"]
+          input_file = f"onboarding/{lob}.input.yaml"
+          os.makedirs("onboarding", exist_ok=True)
+
+          if os.path.exists(input_file):
+              with open(input_file) as f:
+                  lob_data = yaml.safe_load(f) or {}
+          else:
+              lob_data = {}
+
+          namespaces = lob_data.get("namespaces", [])
+          idx   = next((i for i, n in enumerate(namespaces) if n.get("namespace") == namespace), None)
+          entry = namespaces[idx] if idx is not None else {}
+
+          entry["namespace"]   = namespace
+          entry["cluster"]     = os.environ["CLUSTER"]
+          entry["environment"] = os.environ["ENVIRONMENT"]
+          entry.setdefault("governance", {})
+          entry["governance"]["map-id"]     = os.environ["MAP_ID"]
+          entry["governance"]["to-intake"]  = os.environ["TO_INTAKE"]
+          entry["governance"]["team-name"]  = os.environ["TEAM_NAME"]
+          entry["governance"]["change-ref"] = os.environ["CHANGE_REF"]
+
+          if os.environ.get("COST_CENTER"):
+              entry["governance"]["cost-center"] = os.environ["COST_CENTER"]
+          if os.environ.get("DATA_CLASS"):
+              entry["governance"]["data-classification"] = os.environ["DATA_CLASS"]
+          if os.environ.get("QUOTA"):
+              entry["quota"] = os.environ["QUOTA"]
+          if os.environ.get("NETPOL"):
+              entry["netpol"] = os.environ["NETPOL"]
+
+          roles_map = {r["group"]: r for r in entry.get("roles", [])}
+          for role_key, env_var in [("admin","ROLE_ADMIN"),("edit","ROLE_EDIT"),("view","ROLE_VIEW")]:
+              group = os.environ.get(env_var, "").strip()
+              if group:
+                  roles_map[group] = {"group": group, "role": role_key}
+          if roles_map:
+              entry["roles"] = list(roles_map.values())
+
+          labels_str = os.environ.get("LABELS", "").strip()
+          if labels_str:
+              existing = entry.get("labels", {})
+              for pair in labels_str.split(","):
+                  if "=" in pair:
+                      k, v = pair.strip().split("=", 1)
+                      existing[k.strip()] = v.strip()
+              entry["labels"] = existing
+
+          if os.environ.get("ENABLE_MS") == "true":
+              ms = {
+                  "instanceType": os.environ["MS_SKU"],
+                  "replicas":     int(os.environ["MS_REPLICAS"]),
+                  "zone":         os.environ["MS_ZONE"],
+              }
+              if os.environ.get("MS_LOCATION"):
+                  ms["location"] = os.environ["MS_LOCATION"]
+              if os.environ.get("MS_SUBNET"):
+                  ms["subnet"] = os.environ["MS_SUBNET"]
+              if os.environ.get("MS_RG"):
+                  ms["resourceGroup"] = os.environ["MS_RG"]
+              entry["machineSet"] = ms
+          elif os.environ.get("ENABLE_MS") == "false":
+              entry.pop("machineSet", None)
+
+          if idx is not None:
+              namespaces[idx] = entry
+          else:
+              namespaces.append(entry)
+          lob_data["namespaces"] = namespaces
+
+          header = (f"# onboarding/{lob}.input.yaml\n"
+                    f"# LOB: {lob} | Last updated by: {os.environ['ACTOR']} | Change: {os.environ['CHANGE_REF']}\n")
+          with open(input_file, "w") as f:
+              f.write(header)
+              yaml.dump(lob_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"input_file={input_file}\n")
+
+      - name: Commit input.yaml
+        run: |
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+          git config user.name  "${{ env.GIT_USER_NAME }}"
+          git add onboarding/
+          git commit -m "feat(onboarding): patch ${{ github.event.inputs.namespace }}
+
+          Actor:  ${{ github.actor }}
+          Change: ${{ github.event.inputs.change_ref }}"
+          git push origin "${{ steps.branch.outputs.branch_name }}"
+
+  generate:
+    name: "Steps 2-4 - Validate + Generate RIRs + Render + PR"
+    runs-on: ubuntu-latest
+    needs: [patch-input]
+    if: |
+      always() &&
+      (github.event_name == 'pull_request' ||
+       needs.patch-input.result == 'success')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITOPS_BOT_TOKEN }}
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || needs.patch-input.outputs.branch_name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: pip install -r scripts/requirements.txt
+
+      - name: Detect changed LOB input files
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin main
+            CHANGED=$(git diff --name-only origin/main...HEAD -- 'onboarding/*.input.yaml' | tr '\n' ' ')
+          else
+            CHANGED="${{ needs.patch-input.outputs.input_file }}"
+          fi
+          printf "changed_files=%s\n" "$CHANGED" >> "$GITHUB_OUTPUT"
+
+      - name: Step 1 - Validate input files against schema (#18)
+        run: |
+          for INPUT_FILE in ${{ steps.detect.outputs.changed_files }}; do
+            python3 - << PYEOF
+          import json, yaml, sys
+          from jsonschema import validate, ValidationError
+          with open("${INPUT_FILE}") as f:
+              data = yaml.safe_load(f)
+          with open("resource-catalog/schemas/input-v1-schema.json") as f:
+              schema = json.load(f)
+          try:
+              validate(instance=data, schema=schema)
+              print("Schema valid: ${INPUT_FILE}")
+          except ValidationError as e:
+              print(f"Schema error in ${INPUT_FILE}: {e.message}", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+          done
+
+      - name: Step 2 - Generate RIRs and audit logs
+        id: generate
+        run: |
+          MANIFESTS=""
+          for INPUT_FILE in ${{ steps.detect.outputs.changed_files }}; do
+            MANIFEST="${{ runner.temp }}/manifest-$(basename $INPUT_FILE .input.yaml)-${{ github.run_id }}.json"
+            python3 scripts/input_to_rir.py \
+              --input    "$INPUT_FILE" \
+              --schema   resource-catalog/schemas/rir-v1-schema.json \
+              --registry clusters/cluster-registry.yaml \
+              --outdir   resource-catalog \
+              --author   "${{ github.actor }}" \
+              --manifest "$MANIFEST"
+            MANIFESTS="$MANIFESTS $MANIFEST"
+          done
+          printf "manifests=%s\n" "$MANIFESTS" >> "$GITHUB_OUTPUT"
+
+      - name: Step 3 - Render changed resources only
+        run: |
+          for MANIFEST in ${{ steps.generate.outputs.manifests }}; do
+            python3 scripts/render_rir.py \
+              --manifest  "$MANIFEST" \
+              --templates templates/ \
+              --outdir    clusters/
+          done
+
+      - name: Commit generated files
+        run: |
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+          git config user.name  "${{ env.GIT_USER_NAME }}"
+          git add resource-catalog/ clusters/
+          if git diff --cached --quiet; then
+            printf "No generated changes to commit\n"
+          else
+            git commit -m "chore(generate): RIRs + cluster YAMLs
+
+            Actor: ${{ github.actor }}"
+            git push
+          fi
+
+      - name: Step 4 - Open PR (dispatch path only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITOPS_BOT_TOKEN }}
+          script: |
+            const ns     = "${{ github.event.inputs.namespace }}";
+            const lob    = "${{ github.event.inputs.lob }}";
+            const env    = "${{ github.event.inputs.environment }}";
+            const chg    = "${{ github.event.inputs.change_ref }}";
+            const branch = "${{ needs.patch-input.outputs.branch_name }}";
+
+            const body = [
+              "## Provision / Update: `" + ns + "`",
+              "",
+              "| Field | Value |",
+              "|---|---|",
+              "| Namespace | `" + ns + "` |",
+              "| LOB | `" + lob + "` |",
+              "| Environment | `" + env + "` |",
+              "| Change Ref | `" + chg + "` |",
+              "",
+              "## Files in this PR",
+              "| Layer | File | Purpose |",
+              "|---|---|---|",
+              "| LOB Input | `onboarding/" + lob + ".input.yaml` | Accumulated state (all LOB namespaces) |",
+              "| RIR | `resource-catalog/" + lob + "/" + ns + ".rir.yaml` | Source of truth |",
+              "| Audit | `resource-catalog/" + lob + "/" + ns + ".audit.yaml` | What changed this iteration |",
+              "| Rendered | `clusters/.../" + ns + ".yaml` | Only changed resource types |",
+              "",
+              "## Review checklist",
+              "- [ ] LOB input diff shows only expected changes",
+              "- [ ] RIR version incremented correctly",
+              "- [ ] Audit log reflects this change accurately",
+              "- [ ] Only changed resource types in clusters/ diff",
+              "- [ ] AD groups verified (if RBAC changed)",
+              "- [ ] Cluster name exists in cluster-registry.yaml",
+              "",
+              "_Triggered by @" + context.actor + " via workflow\\_dispatch_",
+            ].join("\n");
+
+            await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: "feat(provision): " + ns + " [" + env + "] - " + chg,
+              head:  branch,
+              base:  "main",
+              body:  body,
+            });
+EOF
+
+cat > .github/workflows/validate-pr.yml << 'EOF'
+# validate-pr.yml - PLACEHOLDER - Step 2 implementation pending
+# 7-stage: schema -> yamllint -> kubeconform -> conftest -> kyverno-cli -> scope-control -> server-dry-run
+name: "Validate PR"
+on:
+  pull_request:
+    branches: [main]
+    paths: ["clusters/**", "resource-catalog/**", "onboarding/**"]
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "validate-pr.yml - Step 2 implementation pending"
+EOF
+
+cat > .github/workflows/decommission.yml << 'EOF'
+# decommission.yml - PLACEHOLDER - ordered teardown with kill switch
+name: "Decommission Resource"
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:  {description: "Namespace to decommission", required: true, type: string}
+      lob:        {description: "LOB", required: true, type: choice, options: [lob1,lob2,lob3,lob4,lob5]}
+      change_ref: {description: "CHG reference", required: true, type: string}
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "decommission.yml - implementation pending"
+EOF
+
+cat > .github/workflows/label-propagation.yml << 'EOF'
+# label-propagation.yml - PLACEHOLDER - Azure tag reconciliation post-merge
+name: "Azure Label Propagation"
+on:
+  push:
+    branches: [main]
+    paths: ["clusters/**/namespaces/**"]
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "label-propagation.yml - implementation pending"
+EOF
+
+# ── 16. Argo CD placeholders ───────────────────────────────────────────────────
+cat > argocd/appsets/appset-l2-lob.yaml << 'EOF'
+# PLACEHOLDER - Step 3 (Argo CD setup)
+# Matrix generator: cluster x lob x resource-type
+# Sync policy: prune=true, selfHeal=true, retry=3, ServerSideApply=true
+# Prod SyncWindow: Saturday 02:00-06:00 EST, manualSync: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: l2-lob-resources
+  namespace: openshift-gitops-l2
+  annotations:
+    platform.company-xxx.com/status: placeholder
+    platform.company-xxx.com/implement-in: step-3
+spec: {}
+EOF
+
+cat > argocd/projects/project-l2-lob.yaml << 'EOF'
+# PLACEHOLDER - Step 3 (Argo CD setup)
+# SyncWindows: prod Saturday 02:00-06:00 EST, manualSync: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: l2-lob-project
+  namespace: openshift-gitops-l2
+  annotations:
+    platform.company-xxx.com/status: placeholder
+    platform.company-xxx.com/implement-in: step-3
+spec: {}
+EOF
+
+# ── 17. Runbooks (#22 expanded + secrets doc) ──────────────────────────────────
+cat > docs/runbooks/bootstrap-from-scratch.md << 'EOF'
+# Bootstrap From Scratch - Disaster Recovery Runbook
+
+## Scenario
+GitHub repo lost or corrupted. Rebuild Argo CD sync state from Git mirror.
+
+## Pre-requisites
+- Azure DevOps read-only mirror configured
+- Cluster kubeconfig access for SRE team
+- GITOPS_BOT_TOKEN available in new repo secrets
+
+## Recovery Steps
+
+### 1. Restore from mirror
+```bash
+git clone https://dev.azure.com/org-xxx/mirror/ocp-gitops-platform
+cd ocp-gitops-platform
+```
+
+### 2. Reinstall OpenShift GitOps operator
+```bash
+oc apply -f clusters/<cluster>/global/operators/openshift-gitops.yaml
+```
+
+### 3. Recreate hub Argo CD instance
+```bash
+oc apply -f clusters/<cluster>/argocd-instance/
+```
+
+### 4. Recreate ApplicationSets and Projects
+```bash
+oc apply -f argocd/appsets/
+oc apply -f argocd/projects/
+```
+
+### 5. Verify sync
+```bash
+argocd app list
+argocd app sync --all
+```
+
+### 6. Validate templates and scripts
+```bash
+pip install -r scripts/requirements.txt
+python3 scripts/validate_templates.py --templates templates/
+```
+
+## Quarterly DR Test Procedure (#22)
+
+### Pre-Test Checklist
+- [ ] Notify Platform SRE team and schedule maintenance window
+- [ ] Confirm Azure DevOps mirror is current (check last sync timestamp)
+- [ ] Confirm kubeconfig access for all clusters
+
+### Test Steps
+1. Clone mirror to a scratch directory (not production clone)
+```bash
+git clone https://dev.azure.com/org-xxx/mirror/ocp-gitops-platform /tmp/dr-test
+cd /tmp/dr-test
+```
+2. Validate scripts and templates run clean
+```bash
+pip install -r scripts/requirements.txt
+python3 scripts/validate_templates.py --templates templates/
+```
+3. Run input_to_rir.py in dry-run mode against example input
+```bash
+cp onboarding/lob1.input.yaml /tmp/test-input.yaml
+python3 scripts/input_to_rir.py \
+  --input    /tmp/test-input.yaml \
+  --schema   resource-catalog/schemas/rir-v1-schema.json \
+  --registry clusters/cluster-registry.yaml \
+  --outdir   /tmp/dr-catalog \
+  --author   dr-test \
+  --manifest /tmp/dr-manifest.json
+```
+4. Verify rendered output looks correct
+```bash
+python3 scripts/render_rir.py \
+  --manifest  /tmp/dr-manifest.json \
+  --templates templates/ \
+  --outdir    /tmp/dr-clusters
+find /tmp/dr-clusters -name "*.yaml" | sort
+```
+5. Clean up scratch directory
+```bash
+rm -rf /tmp/dr-test /tmp/dr-catalog /tmp/dr-clusters /tmp/dr-manifest.json
+```
+
+### Post-Test Sign-off
+| Date | Tester | Result | Notes |
+|------|--------|--------|-------|
+| TBD  | TBD    | TBD    | TBD   |
+
+## TODO
+- Add Azure DevOps mirror setup instructions (post Step 1)
+- Add VSO secret recovery steps (post Step 3)
+EOF
+
+cat > docs/runbooks/secrets-setup.md << 'EOF'
+# Required GitHub Secrets Setup
+
+## Secrets Required Before Running Workflows
+
+| Secret | Required Scopes | Purpose |
+|--------|-----------------|---------|
+| `GITOPS_BOT_TOKEN` | `contents: write`, `pull-requests: write` | Bot commits and PR creation |
+
+Note: `workflows: write` is NOT required and should NOT be granted -
+this would allow the bot to modify workflow files, which is a security risk.
+
+## Create GITOPS_BOT_TOKEN
+
+### Option 1: Fine-grained Personal Access Token (Minimum viable)
+1. GitHub Settings > Developer Settings > Personal Access Tokens > Fine-grained
+2. Repository: ocp-gitops-platform only
+3. Permissions:
+   - Contents: Read and Write
+   - Pull Requests: Read and Write
+4. Add as repository secret: Settings > Secrets > Actions > New secret
+
+### Option 2: GitHub App (Recommended for production)
+1. GitHub Settings > Developer Settings > GitHub Apps > New GitHub App
+2. Permissions:
+   - Repository contents: Read and Write
+   - Pull Requests: Read and Write
+3. Install on organisation, restrict to ocp-gitops-platform repo
+4. Generate private key, store in vault
+5. Use a GitHub App token action to generate short-lived tokens per run
+
+## Future Secrets (added in later steps)
+
+| Secret | Step | Purpose |
+|--------|------|---------|
+| `AZURE_CLIENT_ID` | Step 5 | Azure Workload Identity for label propagation |
+| `AZURE_SUBSCRIPTION_ID` | Step 5 | Azure label propagation scope |
+| `AZURE_TENANT_ID` | Step 5 | Azure Workload Identity |
+EOF
+
+# ── 18. Run template validation before committing (#13) ───────────────────────
+printf "Running template syntax validation...\n"
+python3 scripts/validate_templates.py --templates templates/ || {
+  printf "ERROR: Template validation failed - fix templates before committing\n"
+  exit 1
+}
+
+# ── 19. Final git commit and push ─────────────────────────────────────────────
+git config user.email "gitops-bot@company-xxx.com"
+git config user.name  "gitops-bot"
+git add -A
+git commit -m "feat: bootstrap repo structure - Step 1 v4
+
+Directory skeleton:
+  clusters/           prod + nonprod, lob1 subfolders
+  onboarding/         one input.yaml per LOB, all namespaces accumulated
+  resource-catalog/   per-namespace RIR + audit log (auto-generated)
+  argocd/             appsets + projects placeholders (Step 3)
+  policies/           OPA (conftest) + Kyverno (Audit mode, Enforce Week 3)
+  templates/          6 Jinja2 templates
+  scripts/            input_to_rir.py + render_rir.py + validate_templates.py
+  docs/runbooks/      DR runbook (with quarterly test) + secrets setup
+
+Improvements over v3 (11 fixes from peer review):
+  #1  idempotency check on git history
+  #2  scripts/requirements.txt with pinned versions
+  #3  MachineSet location parameterised
+  #5  manifest filenames include run_id
+  #6  cross-LOB duplicate namespace detection
+  #9  MachineSet subnet + resourceGroup + managedIdentity
+  #10 clusters/cluster-registry.yaml + validation in input_to_rir.py
+  #13 scripts/validate_templates.py + run at bootstrap
+  #14 data-classification defaults to internal in build_rir()
+  #18 resource-catalog/schemas/input-v1-schema.json + validated in workflow
+  #22 DR runbook expanded with quarterly test procedure
+
+Next: Step 2 - validate-pr.yml (7-stage pipeline)"
+
+git push origin main
+
+printf "\nBootstrap complete. Step 1 v4.\n"
+printf "Next: Step 2 - validate-pr.yml\n"
