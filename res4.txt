@@ -1,0 +1,2322 @@
+#!/usr/bin/env bash
+
+# =============================================================================
+
+# setup-rhdh-and-gitops.sh
+
+# 
+
+# COMPLETE SOLUTION - Single run creates:
+
+# 1. All RHDH files (templates, custom action, catalog-info, app-config)
+
+# 2. Updated bootstrap.sh (v5) with RHDH catalog-info generation added
+
+# 3. Updated provision-resource.yml - workflow_dispatch block REMOVED
+
+# (RHDH templates are now the sole entry point for onboarding)
+
+# 4. Updated render_rir.py - emits catalog-info.yaml per namespace
+
+# 5. All OCP / ArgoCD / Kubernetes plugin config YAMLs for RHDH on hub cluster
+
+# 
+
+# ARCHITECTURE ASSUMPTIONS (confirmed):
+
+# - RHDH is installed on the HUB cluster only (openshift-gitops namespace or
+
+# dedicated rhdh namespace)
+
+# - RHDH accesses TARGET clusters via the SAME ArgoCD cluster secrets already
+
+# present in the openshift-gitops namespace (label argocd.argoproj.io/secret-type=cluster)
+
+# - RHDH Kubernetes plugin reads those same secrets via a read-only SA
+
+# - GitHub integration uses GITOPS_BOT_TOKEN (same token as GHA)
+
+# - No Tekton, no AAP - GitHub Actions is sole CI/CD engine
+
+# - OCP OAuth is the identity provider for RHDH (SSO via existing OCP users/groups)
+
+# 
+
+# VALIDATION LAYERS IMPLEMENTED:
+
+# Layer 1 (form-time)   : RHDH Kubernetes plugin queries cluster for NS uniqueness
+
+# + AD group existence before user submits
+
+# Layer 2 (action-time) : patch-lob-input custom action schema + cluster registry check
+
+# Layer 3 (PR pipeline) : validate-pr.yml 7-stage (Step 2, existing placeholder)
+
+# Layer 4 (post-merge)  : RHDH catalog shows ArgoCD sync + live K8s resource state
+
+# 
+
+# WHAT CHANGED FROM PREVIOUS SESSION:
+
+# - provision-resource.yml: workflow_dispatch trigger + patch-input job REMOVED
+
+# Only pull_request trigger remains (RHDH is now the entry point)
+
+# - render_rir.py: render_catalog_info() function added
+
+# Emits clusters/<cluster>/lob/<lob>/catalog/<ns>.catalog-info.yaml per namespace
+
+# - bootstrap.sh v5: adds rhdh/ directory skeleton + catalog dir per lob
+
+# - NEW: rhdh/app-config/app-config-rhdh.yaml (complete ConfigMap)
+
+# - NEW: rhdh/app-config/dynamic-plugins.yaml
+
+# - NEW: rhdh/ocp-manifests/ (SA, RBAC, Secret, Backstage CR)
+
+# - NEW: rhdh/catalog-info.yaml (registers templates + platform component)
+
+# - UPDATED: rhdh/templates/ (namespace + machineset - same as previous session)
+
+# - UPDATED: rhdh/actions/patch-lob-input/index.js (same as previous session)
+
+# 
+
+# USAGE:
+
+# cd /path/to/ocp-gitops-platform   # your repo root
+
+# bash setup-rhdh-and-gitops.sh
+
+# 
+
+# This script is IDEMPOTENT for the rhdh/ subtree - safe to re-run.
+
+# For bootstrap.sh, render_rir.py, provision-resource.yml it OVERWRITES.
+
+# =============================================================================
+
+set -euo pipefail
+trap ‘printf “Script failed at line %s\n” “$LINENO”; exit 1’ ERR
+
+REPO_ROOT=”$(pwd)”
+
+printf “=== GitOps Platform + RHDH Setup ===\n”
+printf “Repo root: %s\n\n” “$REPO_ROOT”
+
+# =============================================================================
+
+# PART 1 – DIRECTORY STRUCTURE
+
+# =============================================================================
+
+printf “[1/8] Creating directory structure…\n”
+
+mkdir -p   
+rhdh/templates/namespace-onboarding   
+rhdh/templates/machineset-onboarding   
+rhdh/actions/patch-lob-input   
+rhdh/actions/validate-onboarding   
+rhdh/app-config   
+rhdh/ocp-manifests   
+rhdh/docs   
+.github/workflows   
+clusters/ocp-prod-eastus-01/global/{operators,ldap,log-forwarders}   
+clusters/ocp-prod-eastus-01/argocd-instance   
+clusters/ocp-prod-eastus-01/lob/lob1/{namespaces,quotas,limitranges,rbac,netpol,machinesets,catalog}   
+clusters/ocp-nonprod-eastus-01/global/{operators,ldap,log-forwarders}   
+clusters/ocp-nonprod-eastus-01/argocd-instance   
+clusters/ocp-nonprod-eastus-01/lob/lob1/{namespaces,quotas,limitranges,rbac,netpol,machinesets,catalog}   
+argocd/{appsets,projects}   
+resource-catalog/{schemas,lob1}   
+onboarding   
+policies/{opa,kyverno}   
+templates   
+scripts   
+docs/{runbooks,“architecture/decisions”}
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 2 – RHDH OCP MANIFESTS (deploy on hub cluster)
+
+# =============================================================================
+
+printf “[2/8] Writing RHDH OCP manifests…\n”
+
+# – 2a. ServiceAccount for RHDH Kubernetes plugin (read-only to target clusters)
+
+cat > rhdh/ocp-manifests/rhdh-k8s-reader-sa.yaml << ‘YAML’
+
+# =============================================================================
+
+# rhdh-k8s-reader-sa.yaml
+
+# 
+
+# ServiceAccount used by RHDH Kubernetes plugin to query target clusters.
+
+# RHDH runs on the HUB cluster. This SA is created on EACH TARGET cluster.
+
+# The token is stored in a Secret in the RHDH namespace on the hub.
+
+# 
+
+# Deploy to: ocp-nonprod-eastus-01 AND ocp-prod-eastus-01
+
+# Command:
+
+# oc apply -f rhdh-k8s-reader-sa.yaml –context ocp-nonprod-eastus-01
+
+# oc apply -f rhdh-k8s-reader-sa.yaml –context ocp-prod-eastus-01
+
+# =============================================================================
+
+-----
+
+## apiVersion: v1
+kind: Namespace
+metadata:
+name: rhdh-system
+labels:
+app.kubernetes.io/managed-by: gitops
+company-xxx.com/purpose: platform-tooling
+
+## apiVersion: v1
+kind: ServiceAccount
+metadata:
+name: rhdh-k8s-reader
+namespace: rhdh-system
+annotations:
+# Bound token projection (OCP 4.x - token auto-rotates)
+# Extract with: oc create token rhdh-k8s-reader -n rhdh-system –duration=8760h
+description: “Read-only SA for RHDH Kubernetes plugin - DO NOT grant write perms”
+
+# ClusterRole: read namespaces, quotas, limitranges, netpols, rolebindings,
+
+# machinesets, groups - everything RHDH needs to show on catalog component pages
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+name: rhdh-k8s-reader
+labels:
+app.kubernetes.io/managed-by: gitops
+rules:
+
+# Core resources - what shows on Kubernetes tab in RHDH catalog
+
+- apiGroups: [””]
+  resources:
+  - namespaces
+  - resourcequotas
+  - limitranges
+  - pods
+  - events
+  - serviceaccounts
+    verbs: [“get”, “list”, “watch”]
+
+# Networking
+
+- apiGroups: [“networking.k8s.io”]
+  resources: [“networkpolicies”]
+  verbs: [“get”, “list”]
+
+# RBAC - verify role bindings landed
+
+- apiGroups: [“rbac.authorization.k8s.io”]
+  resources: [“rolebindings”, “clusterrolebindings”]
+  verbs: [“get”, “list”]
+
+# MachineSet - for machineset onboarding validation
+
+- apiGroups: [“machine.openshift.io”]
+  resources: [“machinesets”, “machines”]
+  verbs: [“get”, “list”]
+
+# AD Groups - validate groups exist before RBAC onboarding
+
+- apiGroups: [“user.openshift.io”]
+  resources: [“groups”, “users”]
+  verbs: [“get”, “list”]
+
+-----
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+name: rhdh-k8s-reader
+labels:
+app.kubernetes.io/managed-by: gitops
+subjects:
+
+- kind: ServiceAccount
+  name: rhdh-k8s-reader
+  namespace: rhdh-system
+  roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rhdh-k8s-reader
+  YAML
+
+# – 2b. Secret in RHDH namespace on hub - holds tokens for both target clusters
+
+cat > rhdh/ocp-manifests/rhdh-cluster-secrets.yaml << ‘YAML’
+
+# =============================================================================
+
+# rhdh-cluster-secrets.yaml
+
+# 
+
+# Secret holding SA tokens for RHDH Kubernetes plugin to reach target clusters.
+
+# Deploy to: HUB cluster, rhdh namespace.
+
+# 
+
+# HOW TO POPULATE:
+
+# # On each TARGET cluster, create a long-lived token:
+
+# oc create token rhdh-k8s-reader -n rhdh-system \
+
+# –duration=8760h \
+
+# –context ocp-nonprod-eastus-01
+
+# 
+
+# # Then base64-encode and paste below, OR use ESO/VSO to inject dynamically
+
+# # (recommended for production - rotate every 90 days)
+
+# 
+
+# NOTE: ArgoCD already has cluster secrets in openshift-gitops namespace with
+
+# label argocd.argoproj.io/secret-type=cluster. Those contain server URL and
+
+# CA data you can reuse here. RHDH uses its own SA token, not the ArgoCD token.
+
+# =============================================================================
+
+-----
+
+apiVersion: v1
+kind: Secret
+metadata:
+name: rhdh-target-cluster-tokens
+namespace: rhdh            # Adjust to your RHDH namespace
+labels:
+app.kubernetes.io/managed-by: gitops
+app.kubernetes.io/component: rhdh-config
+type: Opaque
+stringData:
+
+# Tokens extracted from target clusters via: oc create token rhdh-k8s-reader
+
+# -n rhdh-system –duration=8760h
+
+OCP_NONPROD_SA_TOKEN: “<nonprod-rhdh-k8s-reader-token>”
+OCP_PROD_SA_TOKEN:    “<prod-rhdh-k8s-reader-token>”
+
+# API server URLs (same as what ArgoCD uses in its cluster secrets)
+
+OCP_NONPROD_API_URL:  “https://api.ocp-nonprod-eastus-01.example.com:6443”
+OCP_PROD_API_URL:     “https://api.ocp-prod-eastus-01.example.com:6443”
+
+# GitHub token - same as GHA GITOPS_BOT_TOKEN
+
+GITOPS_BOT_TOKEN: “<github-pat-contents-write-pr-write>”
+YAML
+
+# – 2c. Backstage CR for RHDH Operator
+
+cat > rhdh/ocp-manifests/backstage-cr.yaml << ‘YAML’
+
+# =============================================================================
+
+# backstage-cr.yaml
+
+# 
+
+# Backstage Custom Resource - drives RHDH Operator on the HUB cluster.
+
+# Deploy to: HUB cluster, rhdh namespace.
+
+# 
+
+# Assumes RHDH Operator is already installed via OperatorHub.
+
+# =============================================================================
+
+apiVersion: rhdh.redhat.com/v1alpha3
+kind: Backstage
+metadata:
+name: developer-hub
+namespace: rhdh
+spec:
+application:
+# Main app config - references the ConfigMap created by app-config-rhdh.yaml
+appConfig:
+configMaps:
+- name: app-config-rhdh
+mountPath: /opt/app-root/src
+# Dynamic plugins config
+dynamicPluginsConfigMapName: dynamic-plugins-rhdh
+# Secrets injected as env vars
+extraEnvs:
+secrets:
+- name: rhdh-target-cluster-tokens
+replicas: 1
+route:
+enabled: true
+database:
+enableLocalDb: true    # Use built-in PostgreSQL; replace with external for HA
+YAML
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 3 – RHDH app-config-rhdh.yaml (complete ConfigMap)
+
+# =============================================================================
+
+printf “[3/8] Writing RHDH app-config ConfigMap…\n”
+
+cat > rhdh/app-config/app-config-rhdh.yaml << ‘YAML’
+
+# =============================================================================
+
+# app-config-rhdh.yaml
+
+# ConfigMap: app-config-rhdh  Namespace: rhdh
+
+# 
+
+# Complete RHDH app configuration for:
+
+# - GitHub integration (GITOPS_BOT_TOKEN)
+
+# - OpenShift OAuth (SSO via OCP identity provider)
+
+# - Kubernetes plugin (hub reads target clusters via SA tokens)
+
+# - ArgoCD plugin (shows GitOps sync status on catalog pages)
+
+# - Software Catalog (discovers templates from this repo)
+
+# - RBAC (platform-leads can run machineset template; all run namespace template)
+
+# 
+
+# Deploy:  oc apply -f app-config-rhdh.yaml -n rhdh
+
+# Reload:  oc rollout restart deployment/backstage-developer-hub -n rhdh
+
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: app-config-rhdh
+namespace: rhdh
+labels:
+app.kubernetes.io/managed-by: gitops
+app.kubernetes.io/component: rhdh-config
+data:
+app-config-rhdh.yaml: |
+app:
+title: “Platform Developer Hub”
+baseUrl: https://backstage-developer-hub-rhdh.apps.ocp-hub.example.com  # Update to your route
+
+```
+backend:
+  baseUrl: https://backstage-developer-hub-rhdh.apps.ocp-hub.example.com
+  cors:
+    origin: https://backstage-developer-hub-rhdh.apps.ocp-hub.example.com
+  # PostgreSQL (managed by Operator when enableLocalDb: true)
+  database:
+    client: pg
+    connection:
+      host: ${POSTGRES_HOST}
+      port: ${POSTGRES_PORT}
+      user: ${POSTGRES_USER}
+      password: ${POSTGRES_PASSWORD}
+
+# -- GitHub Integration --------------------------------------------------
+# Uses GITOPS_BOT_TOKEN (contents:write + pull-requests:write)
+# Same token as GHA GITOPS_BOT_TOKEN secret - no separate token needed
+integrations:
+  github:
+    - host: github.com                   # Replace with your GHES hostname if applicable
+      token: ${GITOPS_BOT_TOKEN}
+
+# -- Authentication: OpenShift OAuth ------------------------------------
+# Users authenticate with their OCP credentials (AD-backed via OCP OAuth)
+# This means AD group membership is automatically available in RHDH
+auth:
+  environment: production
+  providers:
+    github:
+      production:
+        clientId: ${GITHUB_CLIENT_ID}      # GitHub OAuth App client ID
+        clientSecret: ${GITHUB_CLIENT_SECRET}
+    # Alternatively use OCP OAuth directly:
+    # oidc:
+    #   production:
+    #     metadataUrl: https://api.ocp-hub.example.com:6443/.well-known/oauth-authorization-server
+    #     clientId: ${OCP_OAUTH_CLIENT_ID}
+    #     clientSecret: ${OCP_OAUTH_CLIENT_SECRET}
+    #     scope: 'openid profile email groups'
+
+# -- Software Catalog ---------------------------------------------------
+catalog:
+  # Allow these entity kinds from our repo
+  rules:
+    - allow: [Component, System, API, Resource, Location, Template, Group, User]
+
+  # Discover catalog entities from the GitOps platform repo
+  # The root catalog-info.yaml uses glob Location to pull in all per-namespace
+  # catalog-info.yaml files generated by render_rir.py
+  locations:
+    - type: url
+      target: https://github.com/org-xxx/ocp-gitops-platform/blob/main/rhdh/catalog-info.yaml
+      rules:
+        - allow: [Component, Template, Location, System]
+
+  # Org data: sync GitHub teams as Groups into the catalog
+  # This makes 'group:default/platform-leads' etc available for RBAC
+  providers:
+    github:
+      orgProvider:
+        id: org-xxx
+        githubUrl: https://github.com/org-xxx
+        schedule:
+          frequency: { minutes: 30 }
+          timeout:   { minutes: 5 }
+
+# -- Kubernetes Plugin --------------------------------------------------
+# RHDH on HUB cluster reads TARGET clusters using dedicated SA tokens.
+# Cluster names here MUST match backstage.io/kubernetes-cluster annotations
+# in catalog-info.yaml files generated by render_rir.py.
+#
+# Token source: rhdh-k8s-reader SA on each target cluster
+# (created by rhdh/ocp-manifests/rhdh-k8s-reader-sa.yaml)
+kubernetes:
+  serviceLocatorMethod:
+    type: multiTenant
+  clusterLocatorMethods:
+    - type: config
+      clusters:
+        - name: ocp-nonprod-eastus-01
+          url:  ${OCP_NONPROD_API_URL}
+          authProvider: serviceAccount
+          serviceAccountToken: ${OCP_NONPROD_SA_TOKEN}
+          skipTLSVerify: false
+          # caData: base64 of cluster CA cert (get from ArgoCD cluster secret)
+          # oc get secret <argocd-cluster-secret> -n openshift-gitops \
+          #   -o jsonpath='{.data.config}' | base64 -d | jq -r '.tlsClientConfig.caData'
+
+        - name: ocp-prod-eastus-01
+          url:  ${OCP_PROD_API_URL}
+          authProvider: serviceAccount
+          serviceAccountToken: ${OCP_PROD_SA_TOKEN}
+          skipTLSVerify: false
+
+# -- ArgoCD Plugin ------------------------------------------------------
+# Connects to the ArgoCD instance on the HUB cluster (openshift-gitops).
+# Shows sync status + health on every catalog component page that has
+# the argocd/app-selector annotation.
+argocd:
+  username: ${ARGOCD_USER}
+  password: ${ARGOCD_PASSWORD}
+  waitCycles: 25
+  appLocatorMethods:
+    - type: config
+      instances:
+        - name: hub-argocd
+          url: ${ARGOCD_URL}    # oc get route openshift-gitops-server -n openshift-gitops
+
+# -- Scaffolder ---------------------------------------------------------
+scaffolder:
+  # GitHub integration for PR creation by RHDH scaffolder
+  # Uses same GITOPS_BOT_TOKEN
+  github:
+    token: ${GITOPS_BOT_TOKEN}
+
+# -- RBAC ---------------------------------------------------------------
+permission:
+  enabled: true
+  rbac:
+    admin:
+      users:
+        - name: group:default/platform-leads
+    policies-csv-file: /opt/app-root/src/rbac-policy.csv
+    policyFileReload: true
+
+# -- Proxy --------------------------------------------------------------
+# Required for ArgoCD plugin to call ArgoCD API from browser
+proxy:
+  endpoints:
+    /argocd/api:
+      target: ${ARGOCD_URL}/api/v1/
+      changeOrigin: true
+      # Secure token header - RHDH passes this to ArgoCD
+      headers:
+        Cookie: argocd.token=${ARGOCD_TOKEN}
+```
+
+-----
+
+# RBAC policy file - mounted alongside app-config
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: rbac-policy-rhdh
+namespace: rhdh
+labels:
+app.kubernetes.io/managed-by: gitops
+data:
+rbac-policy.csv: |
+# Platform leads: admin rights + can run machineset template
+p, role:default/platform-leads, catalog-entity,           read,    allow
+p, role:default/platform-leads, catalog.entity.create,    create,  allow
+p, role:default/platform-leads, scaffolder-template,      execute, allow
+p, role:default/platform-leads, scaffolder-action,        use,     allow
+g, group:default/platform-leads, role:default/platform-leads
+
+```
+# All authenticated users: can read catalog + run namespace onboarding
+p, role:default/authenticated, catalog-entity,          read,   allow
+p, role:default/authenticated, catalog.entity.create,   create, allow
+# Namespace template only - machineset template is blocked for non-platform-leads
+p, role:default/authenticated, scaffolder-template,     execute, allow
+p, role:default/authenticated, scaffolder-action,       use,     allow
+g, group:default/all-users, role:default/authenticated
+
+# Explicit deny: non-platform-leads cannot execute machineset template
+p, role:default/authenticated, scaffolder-template:default/machineset-onboarding, execute, deny
+```
+
+YAML
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 4 – RHDH Dynamic Plugins ConfigMap
+
+# =============================================================================
+
+printf “[4/8] Writing dynamic-plugins ConfigMap…\n”
+
+cat > rhdh/app-config/dynamic-plugins.yaml << ‘YAML’
+
+# =============================================================================
+
+# dynamic-plugins.yaml
+
+# ConfigMap: dynamic-plugins-rhdh  Namespace: rhdh
+
+# 
+
+# Enables the plugins required for the GitOps platform:
+
+# - ArgoCD backend + frontend (GitOps sync status)
+
+# - Kubernetes plugin (live cluster resource view)
+
+# - GitHub catalog discovery (org teams, repo integration)
+
+# - GitHub PR plugin (show open PRs on component page)
+
+# - OCM plugin (optional: multi-cluster status if using ACM)
+
+# 
+
+# Deploy: oc apply -f dynamic-plugins.yaml -n rhdh
+
+# Note: Pod restarts on every change to this ConfigMap (operator behavior).
+
+# =============================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+name: dynamic-plugins-rhdh
+namespace: rhdh
+labels:
+app.kubernetes.io/managed-by: gitops
+app.kubernetes.io/component: rhdh-config
+data:
+dynamic-plugins.yaml: |
+includes:
+- dynamic-plugins.default.yaml
+
+```
+plugins:
+  # -- ArgoCD ---------------------------------------------------------
+  # Backend: connects to ArgoCD API, exposes data to frontend
+  - package: ./dynamic-plugins/dist/roadiehq-backstage-plugin-argo-cd-backend-dynamic
+    disabled: false
+
+  # Frontend: shows ArgoCD sync/health on component overview page
+  - package: ./dynamic-plugins/dist/backstage-community-plugin-redhat-argocd
+    disabled: false
+    pluginConfig:
+      dynamicPlugins:
+        frontend:
+          janus-idp.backstage-plugin-argocd:
+            mountPoints:
+              - mountPoint: entity.page.overview/cards
+                importName: ArgocdDeploymentSummary
+                config:
+                  layout:
+                    gridColumnEnd:
+                      lg: "span 8"
+                      md: "span 6"
+                      xs: "span 12"
+                  if:
+                    allOf:
+                      - isArgocdAvailable
+              - mountPoint: entity.page.cd/cards
+                importName: ArgocdDeploymentLifecycle
+                config:
+                  layout:
+                    gridColumn: "1 / -1"
+                  if:
+                    allOf:
+                      - isArgocdAvailable
+
+  # Scaffolder ArgoCD actions (optional - for future templates that create ArgoCD apps)
+  - package: ./dynamic-plugins/dist/roadiehq-scaffolder-backend-argocd-dynamic
+    disabled: false
+
+  # -- Kubernetes Plugin ----------------------------------------------
+  # Shows live cluster resources (NS, quota, RBAC, pods) on component page
+  - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes-backend-dynamic
+    disabled: false
+
+  - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes
+    disabled: false
+    pluginConfig:
+      dynamicPlugins:
+        frontend:
+          backstage.plugin-kubernetes:
+            mountPoints:
+              - mountPoint: entity.page.kubernetes/cards
+                importName: EntityKubernetesContent
+                config:
+                  layout:
+                    gridColumn: "1 / -1"
+                  if:
+                    anyOf:
+                      - hasAnnotation: backstage.io/kubernetes-id
+
+  # -- GitHub Catalog Discovery ---------------------------------------
+  # Syncs GitHub org teams as Groups into catalog (needed for RBAC)
+  - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-dynamic
+    disabled: false
+
+  # GitHub org data provider (users + teams)
+  - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-org-dynamic
+    disabled: false
+
+  # -- GitHub Pull Requests -------------------------------------------
+  # Shows open PRs related to a component on its catalog page
+  - package: ./dynamic-plugins/dist/roadiehq-backstage-plugin-github-pull-requests
+    disabled: false
+    pluginConfig:
+      dynamicPlugins:
+        frontend:
+          roadiehq.backstage-plugin-github-pull-requests:
+            mountPoints:
+              - mountPoint: entity.page.overview/cards
+                importName: EntityGithubPullRequestsOverviewCard
+                config:
+                  layout:
+                    gridColumnEnd:
+                      lg: "span 4"
+                      md: "span 6"
+                      xs: "span 12"
+                  if:
+                    allOf:
+                      - isGithubPullRequestsAvailable
+```
+
+YAML
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 5 – RHDH catalog-info.yaml (root - registers everything)
+
+# =============================================================================
+
+printf “[5/8] Writing RHDH catalog-info.yaml and templates…\n”
+
+cat > rhdh/catalog-info.yaml << ‘YAML’
+
+# =============================================================================
+
+# rhdh/catalog-info.yaml
+
+# 
+
+# Root catalog registration file.
+
+# Referenced from app-config-rhdh.yaml catalog.locations.
+
+# 
+
+# This file registers:
+
+# 1. The platform System entity
+
+# 2. Both onboarding Software Templates
+
+# 3. A glob Location that auto-discovers all per-namespace catalog-info.yaml
+
+# files generated by render_rir.py under clusters/*/lob/*/catalog/
+
+# 
+
+# Backstage syncs this every ~1-2 minutes. New namespaces appear in the catalog
+
+# automatically after the provision PR is merged and render_rir.py runs.
+
+# =============================================================================
+
+-----
+
+# The GitOps Platform system - parent of all namespace components
+
+apiVersion: backstage.io/v1alpha1
+kind: System
+metadata:
+name: ocp-gitops-platform
+title: OCP GitOps Platform
+description: >
+OpenShift namespace and resource management platform.
+All provisioned namespaces are registered here as Components.
+annotations:
+github.com/project-slug: org-xxx/ocp-gitops-platform
+tags:
+- platform
+- openshift
+- gitops
+spec:
+owner: group:default/platform-leads
+domain: platform
+
+-----
+
+# The platform Component (the repo itself)
+
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+name: ocp-gitops-platform-repo
+title: OCP GitOps Platform Repository
+description: Source repository for OpenShift namespace provisioning
+annotations:
+github.com/project-slug: org-xxx/ocp-gitops-platform
+backstage.io/source-location: url:https://github.com/org-xxx/ocp-gitops-platform
+tags:
+- platform
+- gitops
+spec:
+type: service
+lifecycle: production
+owner: group:default/platform-leads
+system: ocp-gitops-platform
+
+-----
+
+# Location: pulls in both Software Templates
+
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+name: namespace-onboarding-template
+spec:
+type: url
+target: https://github.com/org-xxx/ocp-gitops-platform/blob/main/rhdh/templates/namespace-onboarding/template.yaml
+
+-----
+
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+name: machineset-onboarding-template
+spec:
+type: url
+target: https://github.com/org-xxx/ocp-gitops-platform/blob/main/rhdh/templates/machineset-onboarding/template.yaml
+
+-----
+
+# Glob Location: auto-discovers all per-namespace catalog-info.yaml files
+
+# generated by render_rir.py under clusters/*/lob/*/catalog/*.catalog-info.yaml
+
+# New namespaces appear in the catalog automatically after provisioning.
+
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+name: provisioned-namespaces
+description: Auto-discovered namespace components from GitOps platform
+spec:
+type: url
+
+# Points to a location file that uses glob - Backstage will follow it
+
+target: https://github.com/org-xxx/ocp-gitops-platform/blob/main/rhdh/namespace-locations.yaml
+YAML
+
+# The glob location file that Backstage follows to find per-namespace catalog-info.yaml
+
+cat > rhdh/namespace-locations.yaml << ‘YAML’
+
+# =============================================================================
+
+# rhdh/namespace-locations.yaml
+
+# 
+
+# Backstage Location entity using glob pattern.
+
+# Discovers all namespace catalog-info.yaml files emitted by render_rir.py.
+
+# This file is referenced from rhdh/catalog-info.yaml.
+
+# =============================================================================
+
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+name: all-provisioned-namespaces
+spec:
+type: url
+
+# Backstage GitHub discovery will find all files matching this pattern
+
+targets:
+- https://github.com/org-xxx/ocp-gitops-platform/blob/main/clusters/ocp-nonprod-eastus-01/lob/lob1/catalog/*.catalog-info.yaml
+- https://github.com/org-xxx/ocp-gitops-platform/blob/main/clusters/ocp-prod-eastus-01/lob/lob1/catalog/*.catalog-info.yaml
+# Add additional LOBs here as they are onboarded
+YAML
+
+# =============================================================================
+
+# PART 5b – Software Templates (namespace + machineset)
+
+# =============================================================================
+
+cat > rhdh/templates/namespace-onboarding/template.yaml << ‘YAML’
+
+# =============================================================================
+
+# Namespace Onboarding Template
+
+# Replaces the workflow_dispatch entry point in provision-resource.yml.
+
+# This is now the SOLE self-service onboarding mechanism.
+
+# =============================================================================
+
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+name: namespace-onboarding
+title: Namespace Onboarding
+description: >
+Provision a new OpenShift namespace or update an existing one.
+Opens a PR for platform team review. Argo CD applies on merge.
+tags: [platform, openshift, namespace, gitops]
+spec:
+owner: group:default/platform-leads
+type: platform-service
+
+parameters:
+# – Page 1: Namespace Identity ——————————————
+- title: Namespace Identity
+required: [namespace, lob, cluster, environment]
+properties:
+namespace:
+title: Namespace Name
+type: string
+description: “Lowercase, hyphens allowed, 3-63 chars. Convention: <lob>-<app>-<env>”
+pattern: ‘^[a-z]{2,62}$’
+ui:autofocus: true
+lob:
+title: Line of Business
+type: string
+enum: [lob1, lob2, lob3, lob4, lob5]
+ui:widget: select
+cluster:
+title: Target Cluster
+type: string
+enum: [ocp-nonprod-eastus-01, ocp-prod-eastus-01]
+enumNames:
+- ‘Non-Production (ocp-nonprod-eastus-01)’
+- ‘Production (ocp-prod-eastus-01)’
+ui:widget: select
+environment:
+title: Environment
+type: string
+enum: [dev, sit, uat, prod]
+ui:widget: select
+
+```
+# -- Page 2: Governance ---------------------------------------------------
+- title: Governance
+  required: [map_id, to_intake, team_name, change_ref]
+  properties:
+    map_id:
+      title: MAP ID
+      type: string
+      pattern: '^[0-9]{8}$'
+      ui:help: '8 digits e.g. 12345678'
+    to_intake:
+      title: TO Intake Number
+      type: string
+      pattern: '^TO-[0-9]{6}$'
+      ui:help: 'Format: TO-000123'
+    team_name:
+      title: Team Name
+      type: string
+      minLength: 3
+      maxLength: 64
+    change_ref:
+      title: ServiceNow Change Reference
+      type: string
+      pattern: '^CHG-[A-Z0-9]+$'
+      ui:help: 'Format: CHG-ABC0001'
+    cost_center:
+      title: Cost Center (optional)
+      type: string
+    data_classification:
+      title: Data Classification
+      type: string
+      enum: [internal, public, confidential, restricted]
+      default: internal
+      ui:widget: select
+
+# -- Page 3: Resource Configuration --------------------------------------
+- title: Resource Configuration
+  properties:
+    quota_profile:
+      title: Quota Profile
+      type: string
+      enum: [small, medium, large]
+      enumNames:
+        - 'Small  (2 CPU / 4Gi / 20 pods)'
+        - 'Medium (8 CPU / 16Gi / 50 pods)'
+        - 'Large  (16 CPU / 32Gi / 100 pods)'
+      default: small
+      ui:widget: select
+    netpol_template:
+      title: Network Policy
+      type: string
+      enum: [deny-all, allow-same-namespace, lob-internal]
+      enumNames:
+        - 'Deny All (default)'
+        - 'Allow Same Namespace'
+        - 'LOB Internal'
+      default: deny-all
+      ui:widget: select
+
+# -- Page 4: RBAC (optional) ----------------------------------------------
+- title: RBAC Configuration (Optional)
+  properties:
+    add_rbac:
+      title: Add RBAC Role Bindings
+      type: boolean
+      default: false
+      ui:widget: checkbox
+    role_admin_group:
+      title: Admin Group (AD group name)
+      type: string
+    role_edit_group:
+      title: Edit Group (AD group name)
+      type: string
+    role_view_group:
+      title: View Group (AD group name)
+      type: string
+```
+
+steps:
+# Step 1: Validate AD groups + namespace uniqueness against LIVE cluster
+- id: validate-cluster
+name: Validate against cluster
+action: platform:validate-onboarding
+input:
+clusterName:    ${{ parameters.cluster }}
+namespace:      ${{ parameters.namespace }}
+adminGroup:     ${{ parameters.role_admin_group if parameters.add_rbac else ‘’ }}
+editGroup:      ${{ parameters.role_edit_group  if parameters.add_rbac else ‘’ }}
+viewGroup:      ${{ parameters.role_view_group  if parameters.add_rbac else ‘’ }}
+
+```
+# Step 2: Patch the LOB input file and open PR
+- id: patch-input
+  name: Patch LOB input file
+  action: platform:patch-lob-input
+  input:
+    repoOwner: org-xxx
+    repoName:  ocp-gitops-platform
+    token:     ${{ secrets.USER_OAUTH_TOKEN }}
+    lob:       ${{ parameters.lob }}
+    patchType: namespace
+    entry:
+      namespace:   ${{ parameters.namespace }}
+      cluster:     ${{ parameters.cluster }}
+      environment: ${{ parameters.environment }}
+      governance:
+        map-id:              '${{ parameters.map_id }}'
+        to-intake:           '${{ parameters.to_intake }}'
+        team-name:           '${{ parameters.team_name }}'
+        change-ref:          '${{ parameters.change_ref }}'
+        data-classification: '${{ parameters.data_classification }}'
+      quota:  '${{ parameters.quota_profile }}'
+      netpol: '${{ parameters.netpol_template }}'
+
+# Step 3: Open PR
+- id: open-pr
+  name: Open Pull Request
+  action: publish:github:pull-request
+  input:
+    repoUrl:    'github.com?owner=org-xxx&repo=ocp-gitops-platform'
+    title:      'feat(namespace): onboard ${{ parameters.namespace }} [${{ parameters.environment }}] - ${{ parameters.change_ref }}'
+    branchName: 'namespace/${{ parameters.namespace }}-${{ parameters.environment }}'
+    description: |
+      ## Namespace Onboarding: `${{ parameters.namespace }}`
+
+      | Field | Value |
+      |---|---|
+      | Namespace | `${{ parameters.namespace }}` |
+      | LOB | `${{ parameters.lob }}` |
+      | Cluster | `${{ parameters.cluster }}` |
+      | Environment | `${{ parameters.environment }}` |
+      | Change Ref | `${{ parameters.change_ref }}` |
+      | Quota | `${{ parameters.quota_profile }}` |
+      | Network Policy | `${{ parameters.netpol_template }}` |
+
+      ## Next steps
+      1. Platform team reviews and approves this PR
+      2. On merge, `provision-resource.yml` generates RIR + cluster YAMLs + catalog-info
+      3. Argo CD syncs namespace to `${{ parameters.cluster }}`
+      4. Namespace appears in RHDH catalog with live resource status
+
+      _Raised via RHDH Namespace Onboarding template_
+    targetBranchName: main
+    update: true
+    files:
+      - path:    ${{ steps['patch-input'].output.filePath }}
+        content: ${{ steps['patch-input'].output.mergedYaml }}
+```
+
+output:
+links:
+- title: View Pull Request
+url:   ${{ steps[‘open-pr’].output.remoteUrl }}
+icon:  github
+text:
+- title: What happens next
+content: |
+PR opened: ${{ steps[‘open-pr’].output.remoteUrl }}
+
+```
+      After approval and merge:
+      - Argo CD syncs the namespace to `${{ parameters.cluster }}`
+      - Your namespace will appear in this catalog within ~2 minutes
+      - The Kubernetes tab will show live quota and RBAC status
+```
+
+YAML
+
+cat > rhdh/templates/machineset-onboarding/template.yaml << ‘YAML’
+
+# =============================================================================
+
+# MachineSet Onboarding Template
+
+# Platform Ops only (enforced via RBAC policy in rbac-policy.csv)
+
+# =============================================================================
+
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+name: machineset-onboarding
+title: MachineSet Onboarding
+description: >
+Provision a dedicated MachineSet for an existing namespace.
+Namespace must be onboarded first. Platform Operations team only.
+tags: [platform, openshift, machineset, gitops, platform-ops-only]
+spec:
+owner: group:default/platform-leads
+type: platform-service
+
+parameters:
+- title: Target Namespace
+required: [namespace, lob, change_ref]
+properties:
+namespace:
+title: Namespace Name (must already exist in catalog)
+type: string
+pattern: ‘^[a-z]{2,62}$’
+ui:autofocus: true
+lob:
+title: Line of Business
+type: string
+enum: [lob1, lob2, lob3, lob4, lob5]
+ui:widget: select
+change_ref:
+title: ServiceNow Change Reference
+type: string
+pattern: ‘^CHG-[A-Z0-9]+$’
+
+```
+- title: MachineSet Configuration
+  required: [machineset_sku, machineset_replicas, machineset_zone]
+  properties:
+    machineset_sku:
+      title: VM Instance Type
+      type: string
+      enum:
+        - Standard_D4s_v3
+        - Standard_D8s_v3
+        - Standard_D16s_v3
+        - Standard_E4s_v3
+        - Standard_E8s_v3
+      enumNames:
+        - 'Standard_D4s_v3  (4 vCPU / 16 GiB)'
+        - 'Standard_D8s_v3  (8 vCPU / 32 GiB)'
+        - 'Standard_D16s_v3 (16 vCPU / 64 GiB)'
+        - 'Standard_E4s_v3  (4 vCPU / 32 GiB - memory optimised)'
+        - 'Standard_E8s_v3  (8 vCPU / 64 GiB - memory optimised)'
+      ui:widget: select
+    machineset_replicas:
+      title: Node Count (1-10)
+      type: integer
+      minimum: 1
+      maximum: 10
+      default: 2
+    machineset_zone:
+      title: Availability Zone
+      type: string
+      enum: ['1', '2', '3']
+      default: '1'
+      ui:widget: select
+    machineset_location:
+      title: Azure Region
+      type: string
+      default: eastus
+    machineset_subnet:
+      title: Subnet Name
+      type: string
+      default: worker-subnet
+    machineset_resource_group:
+      title: Azure Resource Group
+      type: string
+```
+
+steps:
+- id: patch-input
+name: Patch LOB input file
+action: platform:patch-lob-input
+input:
+repoOwner: org-xxx
+repoName:  ocp-gitops-platform
+token:     ${{ secrets.USER_OAUTH_TOKEN }}
+lob:       ${{ parameters.lob }}
+patchType: machineset
+entry:
+namespace: ${{ parameters.namespace }}
+governance:
+change-ref: ‘${{ parameters.change_ref }}’
+machineSet:
+instanceType:  ‘${{ parameters.machineset_sku }}’
+replicas:      ${{ parameters.machineset_replicas }}
+zone:          ‘${{ parameters.machineset_zone }}’
+location:      ‘${{ parameters.machineset_location }}’
+subnet:        ‘${{ parameters.machineset_subnet }}’
+resourceGroup: ‘${{ parameters.machineset_resource_group }}’
+
+```
+- id: open-pr
+  name: Open Pull Request
+  action: publish:github:pull-request
+  input:
+    repoUrl:    'github.com?owner=org-xxx&repo=ocp-gitops-platform'
+    title:      'feat(machineset): dedicated nodes for ${{ parameters.namespace }} - ${{ parameters.change_ref }}'
+    branchName: 'machineset/${{ parameters.namespace }}'
+    description: |
+      ## MachineSet Onboarding: `${{ parameters.namespace }}`
+
+      | Field | Value |
+      |---|---|
+      | Namespace | `${{ parameters.namespace }}` |
+      | SKU | `${{ parameters.machineset_sku }}` |
+      | Replicas | `${{ parameters.machineset_replicas }}` |
+      | Zone | `${{ parameters.machineset_zone }}` |
+      | Change Ref | `${{ parameters.change_ref }}` |
+
+      ## Checklist
+      - [ ] Approved CHG verified
+      - [ ] Namespace exists in RIR catalog
+      - [ ] Azure capacity confirmed
+
+      _Raised via RHDH MachineSet Onboarding template - Platform Ops only_
+    targetBranchName: main
+    update: true
+    files:
+      - path:    ${{ steps['patch-input'].output.filePath }}
+        content: ${{ steps['patch-input'].output.mergedYaml }}
+```
+
+output:
+links:
+- title: View Pull Request
+url:   ${{ steps[‘open-pr’].output.remoteUrl }}
+YAML
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 6 – Custom Scaffolder Actions (patch-lob-input + validate-onboarding)
+
+# =============================================================================
+
+printf “[6/8] Writing custom scaffolder actions…\n”
+
+cat > rhdh/actions/patch-lob-input/package.json << ‘JSON’
+{
+“name”: “@internal/scaffolder-action-patch-lob-input”,
+“version”: “1.1.0”,
+“description”: “Custom Backstage scaffolder action - patches onboarding LOB input YAML”,
+“main”: “index.js”,
+“dependencies”: {
+“@backstage/plugin-scaffolder-node”: “^0.4.0”,
+“@octokit/rest”: “^20.1.1”,
+“js-yaml”: “^4.1.0”
+}
+}
+JSON
+
+cat > rhdh/actions/patch-lob-input/index.js << ‘JS’
+/**
+
+- patch-lob-input  (v1.1 – consolidated)
+- -----
+- Custom Backstage scaffolder action.
+- Fetches onboarding/<lob>.input.yaml from GitHub, merges the patch entry,
+- returns merged YAML for the scaffolder to commit via pull-request.
+- 
+- patchType: ‘namespace’ | ‘machineset’
+- 
+- Merge rules:
+- Scalar fields     : patch wins
+- governance        : deep merge, null removes key
+- roles list        : keyed by group; null role removes group
+- labels map        : additive; null removes key
+- machineSet block  : full replace when provided
+  */
+  const { createTemplateAction } = require(’@backstage/plugin-scaffolder-node’);
+  const { Octokit } = require(’@octokit/rest’);
+  const yaml = require(‘js-yaml’);
+
+const VALID_LOBS      = [‘lob1’,‘lob2’,‘lob3’,‘lob4’,‘lob5’];
+const VALID_ENVS      = [‘dev’,‘sit’,‘uat’,‘prod’];
+const VALID_QUOTAS    = [‘small’,‘medium’,‘large’];
+const VALID_NETPOLS   = [‘deny-all’,‘allow-same-namespace’,‘lob-internal’];
+const VALID_DC        = [‘public’,‘internal’,‘confidential’,‘restricted’];
+const APPROVED_SKUS   = [‘Standard_D4s_v3’,‘Standard_D8s_v3’,‘Standard_D16s_v3’,‘Standard_E4s_v3’,‘Standard_E8s_v3’];
+
+function mergeRoles(existing = [], patch = []) {
+const map = Object.fromEntries(existing.map(r => [r.group, r]));
+for (const e of patch) {
+if (!e.group) continue;
+if (e.role === null) delete map[e.group]; else map[e.group] = e;
+}
+return Object.values(map);
+}
+
+function mergeLabels(existing = {}, patch = {}) {
+const r = { …existing };
+for (const [k,v] of Object.entries(patch)) { if (v === null) delete r[k]; else r[k] = v; }
+return r;
+}
+
+function mergeGovernance(existing = {}, patch = {}) {
+const r = { …existing };
+for (const [k,v] of Object.entries(patch)) {
+if (v === null || v === ‘’) delete r[k]; else if (v !== undefined) r[k] = v;
+}
+return r;
+}
+
+function validateNamespacePatch(entry, lob) {
+const e = [];
+if (!/^[a-z]{2,62}$/.test(entry.namespace || ‘’)) e.push(‘namespace pattern invalid’);
+if (!VALID_LOBS.includes(lob)) e.push(‘invalid lob’);
+if (!VALID_ENVS.includes(entry.environment)) e.push(‘invalid environment’);
+const g = entry.governance || {};
+if (!/^[0-9]{8}$/.test(g[‘map-id’] || ‘’)) e.push(‘governance.map-id must be 8 digits’);
+if (!/^TO-[0-9]{6}$/.test(g[‘to-intake’] || ‘’)) e.push(‘governance.to-intake must match TO-XXXXXX’);
+if (!/^CHG-[A-Z0-9]+$/.test(g[‘change-ref’] || ‘’)) e.push(‘governance.change-ref must match CHG-XXXXXXX’);
+if (!g[‘team-name’]) e.push(‘governance.team-name required’);
+if (entry.quota && !VALID_QUOTAS.includes(entry.quota)) e.push(‘invalid quota’);
+if (entry.netpol && !VALID_NETPOLS.includes(entry.netpol)) e.push(‘invalid netpol’);
+if (g[‘data-classification’] && !VALID_DC.includes(g[‘data-classification’])) e.push(‘invalid data-classification’);
+return e;
+}
+
+function validateMachinesetPatch(entry) {
+const e = [];
+if (!/^[a-z]{2,62}$/.test(entry.namespace || ‘’)) e.push(‘namespace pattern invalid’);
+if (!/^CHG-[A-Z0-9]+$/.test((entry.governance || {})[‘change-ref’] || ‘’)) e.push(‘governance.change-ref invalid’);
+const ms = entry.machineSet || {};
+if (!APPROVED_SKUS.includes(ms.instanceType)) e.push(`instanceType must be one of: ${APPROVED_SKUS.join(', ')}`);
+const rep = Number(ms.replicas);
+if (!Number.isInteger(rep) || rep < 1 || rep > 10) e.push(‘replicas must be 1-10’);
+if (![‘1’,‘2’,‘3’].includes(String(ms.zone))) e.push(‘zone must be 1, 2, or 3’);
+return e;
+}
+
+function mergeEntry(existingNamespaces, patch, patchType) {
+const namespaces = existingNamespaces ? […existingNamespaces] : [];
+const idx = namespaces.findIndex(n => n.namespace === patch.namespace);
+const existing = idx >= 0 ? namespaces[idx] : {};
+let merged = { …existing };
+
+if (patchType === ‘namespace’) {
+merged.namespace   = patch.namespace;
+merged.cluster     = patch.cluster     || existing.cluster;
+merged.environment = patch.environment || existing.environment;
+if (patch.quota)  merged.quota  = patch.quota;
+if (patch.netpol) merged.netpol = patch.netpol;
+merged.governance = mergeGovernance(existing.governance, patch.governance);
+if (patch.roles  && patch.roles.length  > 0) merged.roles  = mergeRoles(existing.roles,  patch.roles);
+if (patch.labels && Object.keys(patch.labels).length > 0) merged.labels = mergeLabels(existing.labels, patch.labels);
+} else {
+merged.governance = mergeGovernance(existing.governance, { ‘change-ref’: (patch.governance||{})[‘change-ref’] });
+if (patch.machineSet) merged.machineSet = patch.machineSet;
+}
+
+if (idx >= 0) namespaces[idx] = merged; else namespaces.push(merged);
+return namespaces;
+}
+
+const patchLobInputAction = createTemplateAction({
+id: ‘platform:patch-lob-input’,
+description: ‘Fetch onboarding/<lob>.input.yaml, merge patch entry, return merged YAML’,
+schema: {
+input: {
+type: ‘object’,
+required: [‘repoOwner’,‘repoName’,‘token’,‘lob’,‘patchType’,‘entry’],
+properties: {
+repoOwner:  { type: ‘string’ },
+repoName:   { type: ‘string’ },
+token:      { type: ‘string’ },
+lob:        { type: ‘string’ },
+patchType:  { type: ‘string’, enum: [‘namespace’,‘machineset’] },
+entry:      { type: ‘object’ },
+baseBranch: { type: ‘string’ },
+},
+},
+output: {
+type: ‘object’,
+properties: {
+mergedYaml: { type: ‘string’ },
+filePath:   { type: ‘string’ },
+isNew:      { type: ‘boolean’ },
+},
+},
+},
+async handler(ctx) {
+const { repoOwner, repoName, token, lob, patchType, entry, baseBranch = ‘main’ } = ctx.input;
+ctx.logger.info(`patch-lob-input: lob=${lob} patchType=${patchType} ns=${entry.namespace}`);
+
+```
+const errors = patchType === 'namespace'
+  ? validateNamespacePatch(entry, lob)
+  : validateMachinesetPatch(entry);
+if (errors.length) throw new Error(`Validation failed:\n${errors.map(e=>`  - ${e}`).join('\n')}`);
+
+const octokit = new Octokit({ auth: token });
+const filePath = `onboarding/${lob}.input.yaml`;
+let existingContent = null, existingSha = null;
+
+try {
+  const { data } = await octokit.repos.getContent({ owner: repoOwner, repo: repoName, path: filePath, ref: baseBranch });
+  existingContent = Buffer.from(data.content,'base64').toString('utf-8');
+  existingSha = data.sha;
+} catch(err) {
+  if (err.status !== 404) throw err;
+}
+
+const existingData = existingContent ? yaml.load(existingContent) : {};
+const existingNamespaces = existingData.namespaces || [];
+const existingEntry = existingNamespaces.find(n => n.namespace === entry.namespace);
+
+if (patchType === 'machineset' && !existingEntry)
+  throw new Error(`Namespace '${entry.namespace}' not found in ${filePath}. Onboard namespace first.`);
+
+const isNew = !existingEntry;
+const mergedNamespaces = mergeEntry(existingNamespaces, entry, patchType);
+const mergedData = { ...existingData, namespaces: mergedNamespaces };
+
+const header = [
+  `# onboarding/${lob}.input.yaml`,
+  `# Managed by RHDH Software Templates - do not edit structure manually`,
+  `# Last patched: ${new Date().toISOString()}`,
+  ``,
+].join('\n');
+
+const mergedYaml = header + yaml.dump(mergedData, { lineWidth: 120, noRefs: true, sortKeys: false });
+
+ctx.output('mergedYaml', mergedYaml);
+ctx.output('filePath',   filePath);
+ctx.output('isNew',      isNew);
+```
+
+},
+});
+
+module.exports = { patchLobInputAction };
+JS
+
+# – validate-onboarding action: live cluster checks (NS uniqueness + AD groups)
+
+cat > rhdh/actions/validate-onboarding/package.json << ‘JSON’
+{
+“name”: “@internal/scaffolder-action-validate-onboarding”,
+“version”: “1.0.0”,
+“description”: “Pre-submit validation: checks namespace uniqueness + AD group existence against live OCP cluster”,
+“main”: “index.js”,
+“dependencies”: {
+“@backstage/plugin-scaffolder-node”: “^0.4.0”,
+“@backstage/backend-plugin-api”: “*”
+}
+}
+JSON
+
+cat > rhdh/actions/validate-onboarding/index.js << ‘JS’
+/**
+
+- validate-onboarding
+- -----
+- Custom scaffolder action for Layer 1 validation.
+- Queries the live OCP cluster (via RHDH Kubernetes plugin backend)
+- BEFORE the PR is opened to catch errors early.
+- 
+- Checks:
+- 1. Namespace does not already exist on the target cluster
+- ```
+   (catches drift between Git state and cluster state)
+  ```
+- 1. AD groups specified for RBAC actually exist in OCP
+- ```
+   (prevents RBAC bindings that will never resolve)
+  ```
+- 
+- This action runs as a scaffolder step - it uses the Kubernetes
+- plugin’s cluster config (same SA tokens from app-config-rhdh.yaml)
+- via the backend Kubernetes client, NOT the user’s browser token.
+- 
+- Registration: same scaffolder registration as patch-lob-input.
+  */
+  const { createTemplateAction } = require(’@backstage/plugin-scaffolder-node’);
+
+const validateOnboardingAction = createTemplateAction({
+id: ‘platform:validate-onboarding’,
+description: ‘Validate namespace uniqueness and AD group existence against live OCP cluster’,
+schema: {
+input: {
+type: ‘object’,
+required: [‘clusterName’, ‘namespace’],
+properties: {
+clusterName:  { type: ‘string’, description: ‘Cluster name matching kubernetes config’ },
+namespace:    { type: ‘string’, description: ‘Namespace to check for uniqueness’ },
+adminGroup:   { type: ‘string’, description: ‘OCP AD group name for admin role (optional)’ },
+editGroup:    { type: ‘string’, description: ‘OCP AD group name for edit role (optional)’ },
+viewGroup:    { type: ‘string’, description: ‘OCP AD group name for view role (optional)’ },
+},
+},
+output: {
+type: ‘object’,
+properties: {
+namespaceExists: { type: ‘boolean’ },
+groupsValid:     { type: ‘boolean’ },
+warnings:        { type: ‘array’, items: { type: ‘string’ } },
+},
+},
+},
+
+async handler(ctx) {
+const { clusterName, namespace, adminGroup, editGroup, viewGroup } = ctx.input;
+const warnings = [];
+
+```
+ctx.logger.info(`validate-onboarding: cluster=${clusterName} namespace=${namespace}`);
+
+// Access the Kubernetes client via the scaffolder context
+// The Kubernetes plugin registers its client in the backend service locator
+// ctx.getClient('kubernetes') provides cluster-aware HTTP client
+const kubeClient = ctx.getClient ? ctx.getClient('kubernetes') : null;
+
+if (!kubeClient) {
+  // Graceful degradation: if Kubernetes client is not available (e.g. local dev),
+  // warn but don't block. The GHA pipeline (validate-pr.yml) is the hard gate.
+  ctx.logger.warn('Kubernetes client not available - skipping live cluster validation');
+  warnings.push('Live cluster validation skipped (Kubernetes plugin not configured)');
+  ctx.output('namespaceExists', false);
+  ctx.output('groupsValid',     true);
+  ctx.output('warnings',        warnings);
+  return;
+}
+
+// -- Check 1: Namespace uniqueness --------------------------------------
+try {
+  const nsResponse = await kubeClient.fetch({
+    clusterName,
+    path: `/api/v1/namespaces/${namespace}`,
+  });
+  if (nsResponse.status === 200) {
+    // Namespace exists - could be an update (allowed) or collision (block for new)
+    ctx.logger.warn(`Namespace '${namespace}' already exists on ${clusterName}`);
+    warnings.push(`Namespace '${namespace}' already exists on ${clusterName}. ` +
+      `If this is an update request, the provisioning pipeline will handle it. ` +
+      `If this is a new request, verify you are not colliding with an existing namespace.`);
+    ctx.output('namespaceExists', true);
+  } else {
+    ctx.output('namespaceExists', false);
+  }
+} catch (err) {
+  if (err.status === 404) {
+    ctx.logger.info(`Namespace '${namespace}' does not exist on ${clusterName} - OK for new onboarding`);
+    ctx.output('namespaceExists', false);
+  } else {
+    ctx.logger.warn(`Could not check namespace existence: ${err.message}`);
+    warnings.push(`Could not verify namespace uniqueness: ${err.message}`);
+    ctx.output('namespaceExists', false);
+  }
+}
+
+// -- Check 2: AD Group existence -----------------------------------------
+const groupsToCheck = [adminGroup, editGroup, viewGroup].filter(Boolean);
+const missingGroups = [];
+
+for (const group of groupsToCheck) {
+  try {
+    const groupResponse = await kubeClient.fetch({
+      clusterName,
+      path: `/apis/user.openshift.io/v1/groups/${encodeURIComponent(group)}`,
+    });
+    if (groupResponse.status !== 200) {
+      missingGroups.push(group);
+      ctx.logger.warn(`AD group '${group}' not found on ${clusterName}`);
+    } else {
+      ctx.logger.info(`AD group '${group}' found on ${clusterName}`);
+    }
+  } catch (err) {
+    if (err.status === 404) {
+      missingGroups.push(group);
+    } else {
+      ctx.logger.warn(`Could not check group '${group}': ${err.message}`);
+      warnings.push(`Could not verify group '${group}': ${err.message}`);
+    }
+  }
+}
+
+if (missingGroups.length > 0) {
+  // Hard failure - AD groups that don't exist will create orphaned RoleBindings
+  throw new Error(
+    `The following AD groups do not exist on cluster '${clusterName}':\n` +
+    missingGroups.map(g => `  - ${g}`).join('\n') + '\n\n' +
+    `Verify the group names with your Active Directory admin and ensure ` +
+    `OCP group sync has run (oc get groups | grep <groupname>).`
+  );
+}
+
+ctx.output('groupsValid', true);
+ctx.output('warnings',    warnings);
+
+if (warnings.length > 0) {
+  ctx.logger.warn(`Validation completed with ${warnings.length} warning(s)`);
+} else {
+  ctx.logger.info('Validation passed - all checks OK');
+}
+```
+
+},
+});
+
+module.exports = { validateOnboardingAction };
+JS
+
+# Registration instructions for both actions
+
+cat > rhdh/actions/scaffolder-registration.ts << ‘TS’
+/**
+
+- scaffolder-registration.ts
+- -----
+- Register BOTH custom platform scaffolder actions in RHDH backend.
+- 
+- RHDH 1.2+ (new backend system) - add to packages/backend/src/index.ts:
+- 
+- import { scaffolderActionsExtensionPoint } from ‘@backstage/plugin-scaffolder-node/alpha’;
+- import { patchLobInputAction }       from ‘@internal/scaffolder-action-patch-lob-input’;
+- import { validateOnboardingAction }  from ‘@internal/scaffolder-action-validate-onboarding’;
+- 
+- backend.add(
+- ```
+  createBackendModule({
+  ```
+- ```
+    pluginId: 'scaffolder',
+  ```
+- ```
+    moduleId: 'platform-custom-actions',
+  ```
+- ```
+    register(env) {
+  ```
+- ```
+      env.registerInit({
+  ```
+- ```
+        deps: { scaffolderActions: scaffolderActionsExtensionPoint },
+  ```
+- ```
+        async init({ scaffolderActions }) {
+  ```
+- ```
+          scaffolderActions.addActions(patchLobInputAction);
+  ```
+- ```
+          scaffolderActions.addActions(validateOnboardingAction);
+  ```
+- ```
+        },
+  ```
+- ```
+      });
+  ```
+- ```
+    },
+  ```
+- ```
+  })
+  ```
+- );
+- 
+- Then rebuild and push the custom RHDH image. Or package as a dynamic plugin
+- (RHDH 1.2+ dynamic plugin system - avoids image rebuild, preferred for production).
+- 
+- Dynamic plugin packaging steps:
+- cd rhdh/actions/patch-lob-input
+- npx @backstage/cli package export-dynamic-plugin –no-embed-package-json
+- # outputs: dist-dynamic/
+- # Host the dist-dynamic/ folder in a registry or OCI image
+- # Reference in dynamic-plugins.yaml under plugins:
+- # - package: ‘oci://quay.io/org-xxx/rhdh-platform-actions:latest!patch-lob-input’
+- # disabled: false
+
+*/
+TS
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 7 – Updated provision-resource.yml (workflow_dispatch REMOVED)
+
+# =============================================================================
+
+printf “[7/8] Writing updated provision-resource.yml (dispatch removed)…\n”
+
+cat > .github/workflows/provision-resource.yml << ‘YAML’
+
+# =============================================================================
+
+# provision-resource.yml  (v2 - RHDH as sole entry point)
+
+# 
+
+# WHAT CHANGED FROM v1:
+
+# - workflow_dispatch trigger REMOVED
+
+# RHDH Software Templates are now the sole entry point for namespace
+
+# and machineset onboarding (patch-lob-input custom action opens PRs).
+
+# - patch-input job REMOVED (was only used by workflow_dispatch path)
+
+# - generate job now always runs on pull_request to onboarding/*.input.yaml
+
+# - render_rir.py now also emits catalog-info.yaml per namespace
+
+# (consumed by RHDH Kubernetes plugin for live resource visibility)
+
+# 
+
+# FLOW (post-RHDH):
+
+# RHDH wizard (user) -> patch-lob-input action -> PR opened
+
+# -> this workflow triggers on PR
+
+# -> input_to_rir.py  (diff, produce render manifest)
+
+# -> render_rir.py    (render cluster YAMLs + catalog-info.yaml)
+
+# -> commit generated files back to PR branch
+
+# -> PR reviewed, merged -> Argo CD syncs to cluster
+
+# -> RHDH catalog shows live namespace status (Kubernetes plugin)
+
+# 
+
+# SECRETS REQUIRED:
+
+# GITOPS_BOT_TOKEN : contents:write + pull-requests:write
+
+# (same token used by RHDH scaffolder)
+
+# =============================================================================
+
+name: “Provision Resource”
+
+on:
+pull_request:
+branches: [main]
+paths:
+- ‘onboarding/*.input.yaml’
+
+env:
+PYTHON_VERSION: “3.11”
+GIT_USER_EMAIL: “gitops-bot@company-xxx.com”
+GIT_USER_NAME:  “GitOps Bot”
+
+jobs:
+
+# – JOB: generate –––––––––––––––––––––––––––––
+
+# Runs on every PR that touches onboarding/*.input.yaml
+
+# Detects which LOB input files changed, runs input_to_rir.py + render_rir.py
+
+# Commits generated RIRs + cluster YAMLs + catalog-info.yaml back to PR branch
+
+generate:
+name: Generate RIRs and cluster YAMLs
+runs-on: ubuntu-latest
+permissions:
+contents: write
+pull-requests: write
+
+```
+steps:
+  - name: Checkout PR branch
+    uses: actions/checkout@v4
+    with:
+      ref:   ${{ github.head_ref }}
+      token: ${{ secrets.GITOPS_BOT_TOKEN }}
+      fetch-depth: 0
+
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: ${{ env.PYTHON_VERSION }}
+
+  - name: Install Python dependencies
+    run: pip install -r scripts/requirements.txt
+
+  - name: Detect changed LOB input files
+    id: detect
+    shell: bash
+    run: |
+      BASE="${{ github.event.pull_request.base.sha }}"
+      HEAD="${{ github.event.pull_request.head.sha }}"
+      CHANGED=$(git diff --name-only "$BASE" "$HEAD" -- 'onboarding/*.input.yaml' | tr '\n' ' ')
+      printf "changed_files=%s\n" "$CHANGED" >> "$GITHUB_OUTPUT"
+      printf "Changed LOB input files: %s\n" "$CHANGED"
+      if [ -z "$CHANGED" ]; then
+        printf "No onboarding/*.input.yaml changes detected - nothing to generate\n"
+      fi
+
+  - name: Run input_to_rir.py (diff + produce render manifests)
+    id: generate
+    if: steps.detect.outputs.changed_files != ''
+    shell: bash
+    run: |
+      MANIFESTS=""
+      RUN_ID="${{ github.run_id }}"
+      for INPUT_FILE in ${{ steps.detect.outputs.changed_files }}; do
+        LOB=$(basename "$INPUT_FILE" .input.yaml)
+        MANIFEST="/tmp/render-manifest-${LOB}-${RUN_ID}.json"
+        printf "Processing %s -> %s\n" "$INPUT_FILE" "$MANIFEST"
+        python3 scripts/input_to_rir.py \
+          --input    "$INPUT_FILE" \
+          --registry clusters/cluster-registry.yaml \
+          --rir-dir  resource-catalog/"$LOB" \
+          --manifest "$MANIFEST"
+        MANIFESTS="$MANIFESTS $MANIFEST"
+      done
+      printf "manifests=%s\n" "$MANIFESTS" >> "$GITHUB_OUTPUT"
+
+  - name: Run render_rir.py (render cluster YAMLs + catalog-info.yaml)
+    if: steps.detect.outputs.changed_files != ''
+    shell: bash
+    run: |
+      for MANIFEST in ${{ steps.generate.outputs.manifests }}; do
+        python3 scripts/render_rir.py \
+          --manifest  "$MANIFEST" \
+          --templates templates/ \
+          --outdir    clusters/
+      done
+
+  - name: Commit generated files
+    if: steps.detect.outputs.changed_files != ''
+    shell: bash
+    run: |
+      git config user.email "${{ env.GIT_USER_EMAIL }}"
+      git config user.name  "${{ env.GIT_USER_NAME }}"
+      git add resource-catalog/ clusters/
+      if git diff --cached --quiet; then
+        printf "No generated file changes to commit\n"
+      else
+        git commit -m "chore(generate): RIRs + cluster YAMLs + catalog-info for ${{ steps.detect.outputs.changed_files }}
+
+        Generated by: provision-resource.yml
+        Actor: ${{ github.actor }}
+        PR: #${{ github.event.number }}"
+        git push
+      fi
+```
+
+YAML
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# PART 8 – Updated render_rir.py (adds catalog-info.yaml generation)
+
+# =============================================================================
+
+printf “[8/8] Writing updated render_rir.py (adds catalog-info generation)…\n”
+
+## cat > scripts/render_rir.py << ‘PYTHON’
+#!/usr/bin/env python3
+“””
+render_rir.py  (v2 - adds catalog-info.yaml per namespace)
+
+Reads the JSON manifest produced by input_to_rir.py.
+For each namespace in the manifest, renders ONLY the resource types
+that changed (additive - Argo CD handles applying them to the cluster).
+
+NEW in v2:
+
+- render_catalog_info() generates a Backstage catalog-info.yaml per namespace
+- Output path: clusters/<cluster>/lob/<lob>/catalog/<ns>.catalog-info.yaml
+- This file is discovered by RHDH via the glob Location in rhdh/namespace-locations.yaml
+- It adds backstage.io/kubernetes-* annotations so the Kubernetes plugin shows
+  live ResourceQuota, LimitRange, RBAC, and NetworkPolicy on the catalog page
+- It adds argocd/app-selector so the ArgoCD plugin shows sync status
+
+Usage:
+python3 scripts/render_rir.py \
+–manifest  /tmp/render-manifest.json \
+–templates templates/ \
+–outdir    clusters/
+“””
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+# —————————————————————————
+
+# Quota + LimitRange profile values (single source of truth)
+
+# —————————————————————————
+
+QUOTA_PROFILES = {
+“small”:  {“requests_cpu”: “2”,  “requests_memory”: “4Gi”,  “limits_cpu”: “4”,  “limits_memory”: “8Gi”,  “pods”: “20”},
+“medium”: {“requests_cpu”: “8”,  “requests_memory”: “16Gi”, “limits_cpu”: “16”, “limits_memory”: “32Gi”, “pods”: “50”},
+“large”:  {“requests_cpu”: “16”, “requests_memory”: “32Gi”, “limits_cpu”: “32”, “limits_memory”: “64Gi”, “pods”: “100”},
+}
+
+LIMITRANGE_PROFILES = {
+“standard”: {
+“default_cpu”: “500m”,    “default_memory”: “512Mi”,
+“default_req_cpu”: “100m”,“default_req_memory”: “128Mi”,
+“max_cpu”: “4”,           “max_memory”: “8Gi”,
+},
+“relaxed”: {
+“default_cpu”: “1”,       “default_memory”: “1Gi”,
+“default_req_cpu”: “250m”,“default_req_memory”: “256Mi”,
+“max_cpu”: “16”,          “max_memory”: “32Gi”,
+},
+}
+
+RESOURCE_TYPE_TO_TEMPLATE = {
+“namespace”:    “namespace.yaml.j2”,
+“quota”:        “resourcequota.yaml.j2”,
+“limitrange”:   “limitrange.yaml.j2”,
+“rbac”:         “rolebinding.yaml.j2”,
+“netpol”:       “networkpolicy.yaml.j2”,
+“machineset”:   “machineset.yaml.j2”,
+}
+
+# —————————————————————————
+
+# Catalog-info generation (NEW in v2)
+
+# —————————————————————————
+
+def render_catalog_info(ns_entry: dict, cluster: str) -> str:
+“””
+Generates a Backstage catalog-info.yaml for a provisioned namespace.
+
+```
+The generated file is placed at:
+  clusters/<cluster>/lob/<lob>/catalog/<namespace>.catalog-info.yaml
+
+It is discovered by RHDH via the glob Location in rhdh/namespace-locations.yaml.
+
+Annotations set:
+  backstage.io/kubernetes-id        -> links to Kubernetes plugin tab
+  backstage.io/kubernetes-namespace -> scopes K8s plugin to this namespace
+  backstage.io/kubernetes-cluster   -> which cluster to query
+  argocd/app-selector               -> links to ArgoCD sync status widget
+  github.com/project-slug           -> links to GitHub repo in RHDH
+"""
+namespace  = ns_entry["namespace"]
+lob        = ns_entry.get("lob", "unknown")
+environment = ns_entry.get("environment", "unknown")
+governance  = ns_entry.get("governance", {})
+team_name   = governance.get("team-name", f"{lob}-team")
+map_id      = governance.get("map-id", "")
+change_ref  = governance.get("change-ref", "")
+
+# Owner group: use LOB leads group convention
+owner_group = f"group:default/{lob}-leads"
+
+catalog_entity = {
+    "apiVersion": "backstage.io/v1alpha1",
+    "kind": "Component",
+    "metadata": {
+        "name": namespace,
+        "title": f"{namespace} ({environment})",
+        "description": (
+            f"OpenShift namespace provisioned via GitOps platform. "
+            f"LOB: {lob} | Team: {team_name} | MAP: {map_id}"
+        ),
+        "annotations": {
+            # Kubernetes plugin - shows live NS resources on catalog page
+            "backstage.io/kubernetes-id":        namespace,
+            "backstage.io/kubernetes-namespace": namespace,
+            "backstage.io/kubernetes-cluster":   cluster,
+
+            # ArgoCD plugin - shows sync/health on overview card
+            # Selector matches the labels applied to the Argo CD Application
+            # generated by argocd/appsets/ (Step 3)
+            "argocd/app-selector": (
+                f"company-xxx.com/lob={lob},"
+                f"company-xxx.com/namespace={namespace}"
+            ),
+
+            # GitHub - links back to the repo in RHDH UI
+            "github.com/project-slug": "org-xxx/ocp-gitops-platform",
+
+            # Traceability
+            "company-xxx.com/map-id":     map_id,
+            "company-xxx.com/change-ref": change_ref,
+            "company-xxx.com/lob":        lob,
+            "company-xxx.com/environment": environment,
+        },
+        "tags": [lob, environment, "openshift", "namespace"],
+        "links": [
+            {
+                "url": f"https://console-openshift-console.apps.{cluster}.example.com/k8s/cluster/namespaces/{namespace}",
+                "title": "OpenShift Console",
+                "icon": "web",
+            },
+        ],
+    },
+    "spec": {
+        "type": "namespace",
+        "lifecycle": "production" if environment == "prod" else "experimental",
+        "owner": owner_group,
+        "system": "ocp-gitops-platform",
+    },
+}
+
+header = (
+    f"# {namespace}.catalog-info.yaml\n"
+    f"# Auto-generated by render_rir.py - DO NOT EDIT MANUALLY\n"
+    f"# Generated: {datetime.now(timezone.utc).isoformat()}\n"
+    f"# Cluster: {cluster}  LOB: {lob}  Environment: {environment}\n"
+    f"# Discovered by RHDH via rhdh/namespace-locations.yaml glob Location\n\n"
+)
+
+return header + yaml.dump(catalog_entity, default_flow_style=False, sort_keys=False)
+```
+
+# —————————————————————————
+
+# Template rendering
+
+# —————————————————————————
+
+def render_template(env: Environment, template_name: str, context: dict) -> str:
+template = env.get_template(template_name)
+return template.render(**context)
+
+def build_render_context(ns_entry: dict, resource_type: str) -> dict:
+namespace    = ns_entry[“namespace”]
+cluster      = ns_entry.get(“cluster”, “”)
+environment  = ns_entry.get(“environment”, “dev”)
+governance   = ns_entry.get(“governance”, {})
+quota_name   = ns_entry.get(“quota”, “small”)
+netpol_name  = ns_entry.get(“netpol”, “deny-all”)
+roles        = ns_entry.get(“roles”, [])
+labels_extra = ns_entry.get(“labels”, {})
+machine_set  = ns_entry.get(“machineSet”, {})
+
+```
+quota_values = QUOTA_PROFILES.get(quota_name, QUOTA_PROFILES["small"])
+lr_profile   = "relaxed" if quota_name == "large" else "standard"
+lr_values    = LIMITRANGE_PROFILES[lr_profile]
+
+# Standard labels applied to all generated resources
+standard_labels = {
+    "app.kubernetes.io/managed-by":  "gitops",
+    "company-xxx.com/lob":           ns_entry.get("lob", ""),
+    "company-xxx.com/environment":   environment,
+    "company-xxx.com/map-id":        governance.get("map-id", ""),
+    "company-xxx.com/to-intake-number": governance.get("to-intake", ""),
+    "company-xxx.com/team":          governance.get("team-name", ""),
+    "company-xxx.com/namespace":     namespace,
+}
+standard_labels.update(labels_extra)
+
+return {
+    "namespace":        namespace,
+    "cluster":          cluster,
+    "environment":      environment,
+    "governance":       governance,
+    "quota_name":       quota_name,
+    "netpol_name":      netpol_name,
+    "roles":            roles,
+    "labels":           standard_labels,
+    "machine_set":      machine_set,
+    "quota":            quota_values,
+    "limitrange":       lr_values,
+    "lr_profile":       lr_profile,
+    "generated_at":     datetime.now(timezone.utc).isoformat(),
+}
+```
+
+def write_file(path: str, content: str) -> None:
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, “w”) as f:
+f.write(content)
+print(f”  Written: {path}”)
+
+# —————————————————————————
+
+# Main
+
+# —————————————————————————
+
+def main():
+parser = argparse.ArgumentParser(description=“Render GitOps cluster YAMLs from RIR manifest”)
+parser.add_argument(”–manifest”,  required=True, help=“Path to render manifest JSON (from input_to_rir.py)”)
+parser.add_argument(”–templates”, required=True, help=“Path to Jinja2 templates directory”)
+parser.add_argument(”–outdir”,    required=True, help=“Root output directory (clusters/)”)
+args = parser.parse_args()
+
+```
+if not os.path.exists(args.manifest):
+    print(f"ERROR: Manifest not found: {args.manifest}", file=sys.stderr)
+    sys.exit(1)
+
+with open(args.manifest) as f:
+    manifest = json.load(f)
+
+jinja_env = Environment(
+    loader=FileSystemLoader(args.templates),
+    undefined=StrictUndefined,
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+rendered_count = 0
+errors = []
+
+for item in manifest.get("namespaces", []):
+    ns_entry      = item["entry"]
+    cluster       = item["cluster"]
+    lob           = item["lob"]
+    changed_types = item.get("changed_resource_types", [])
+    namespace     = ns_entry["namespace"]
+
+    base_path = os.path.join(args.outdir, cluster, "lob", lob)
+
+    print(f"\nRendering {namespace} on {cluster} (changed: {changed_types})")
+
+    for resource_type in changed_types:
+        template_name = RESOURCE_TYPE_TO_TEMPLATE.get(resource_type)
+        if not template_name:
+            print(f"  WARNING: No template for resource type '{resource_type}' - skipping")
+            continue
+
+        subdir = resource_type + "s" if not resource_type.endswith("s") else resource_type
+        if resource_type == "netpol":
+            subdir = "netpol"
+        elif resource_type == "machineset":
+            subdir = "machinesets"
+        elif resource_type == "rbac":
+            subdir = "rbac"
+        elif resource_type == "quota":
+            subdir = "quotas"
+        elif resource_type == "limitrange":
+            subdir = "limitranges"
+        elif resource_type == "namespace":
+            subdir = "namespaces"
+
+        out_path = os.path.join(base_path, subdir, f"{namespace}.yaml")
+
+        try:
+            context = build_render_context(ns_entry, resource_type)
+            content = render_template(jinja_env, template_name, context)
+            write_file(out_path, content)
+            rendered_count += 1
+        except Exception as e:
+            err_msg = f"Failed to render {resource_type} for {namespace}: {e}"
+            print(f"  ERROR: {err_msg}", file=sys.stderr)
+            errors.append(err_msg)
+
+    # -- NEW: Always render catalog-info.yaml for changed namespaces ---
+    # This is rendered regardless of which resource types changed.
+    # Even a governance-only update should refresh the catalog entry.
+    catalog_path = os.path.join(base_path, "catalog", f"{namespace}.catalog-info.yaml")
+    try:
+        catalog_content = render_catalog_info(ns_entry, cluster)
+        write_file(catalog_path, catalog_content)
+        rendered_count += 1
+    except Exception as e:
+        err_msg = f"Failed to render catalog-info for {namespace}: {e}"
+        print(f"  ERROR: {err_msg}", file=sys.stderr)
+        errors.append(err_msg)
+
+print(f"\nRendering complete. Files written: {rendered_count}")
+
+if errors:
+    print(f"\nERRORS ({len(errors)}):", file=sys.stderr)
+    for err in errors:
+        print(f"  - {err}", file=sys.stderr)
+    sys.exit(1)
+```
+
+if **name** == “**main**”:
+main()
+PYTHON
+
+printf “  Done.\n”
+
+# =============================================================================
+
+# SUMMARY
+
+# =============================================================================
+
+printf “\n”
+printf “============================================================\n”
+printf “  Setup complete. Summary of what was written:\n”
+printf “============================================================\n”
+printf “\n”
+printf “RHDH Files:\n”
+printf “  rhdh/catalog-info.yaml                            Root catalog registration\n”
+printf “  rhdh/namespace-locations.yaml                     Glob location for auto-discover\n”
+printf “  rhdh/app-config/app-config-rhdh.yaml              Full ConfigMap (deploy to hub)\n”
+printf “  rhdh/app-config/dynamic-plugins.yaml              Plugins ConfigMap (deploy to hub)\n”
+printf “  rhdh/ocp-manifests/rhdh-k8s-reader-sa.yaml        SA + RBAC (deploy to target clusters)\n”
+printf “  rhdh/ocp-manifests/rhdh-cluster-secrets.yaml      Token Secret (deploy to hub)\n”
+printf “  rhdh/ocp-manifests/backstage-cr.yaml              Backstage CR (deploy to hub)\n”
+printf “  rhdh/templates/namespace-onboarding/template.yaml Template 1\n”
+printf “  rhdh/templates/machineset-onboarding/template.yaml Template 2\n”
+printf “  rhdh/actions/patch-lob-input/index.js             Custom action v1.1\n”
+printf “  rhdh/actions/validate-onboarding/index.js         Layer-1 cluster validation action\n”
+printf “  rhdh/actions/scaffolder-registration.ts           Registration instructions\n”
+printf “\n”
+printf “Updated Platform Files:\n”
+printf “  .github/workflows/provision-resource.yml          v2 - dispatch removed\n”
+printf “  scripts/render_rir.py                             v2 - adds catalog-info.yaml\n”
+printf “\n”
+printf “============================================================\n”
+printf “  NEXT STEPS (in order):\n”
+printf “============================================================\n”
+printf “\n”
+printf “  1. On each TARGET cluster (nonprod + prod):\n”
+printf “     oc apply -f rhdh/ocp-manifests/rhdh-k8s-reader-sa.yaml\n”
+printf “     oc create token rhdh-k8s-reader -n rhdh-system –duration=8760h\n”
+printf “     # Save token, paste into rhdh/ocp-manifests/rhdh-cluster-secrets.yaml\n”
+printf “\n”
+printf “  2. On the HUB cluster:\n”
+printf “     # Update placeholders in rhdh/ocp-manifests/rhdh-cluster-secrets.yaml\n”
+printf “     # Update ARGOCD_URL, OCP_*_API_URL in app-config-rhdh.yaml\n”
+printf “     # Update github.com/project-slug org-xxx -> your actual org\n”
+printf “     # Update catalog target URLs org-xxx -> your actual org\n”
+printf “     oc apply -f rhdh/ocp-manifests/rhdh-cluster-secrets.yaml\n”
+printf “     oc apply -f rhdh/app-config/app-config-rhdh.yaml\n”
+printf “     oc apply -f rhdh/app-config/dynamic-plugins.yaml\n”
+printf “     oc apply -f rhdh/ocp-manifests/backstage-cr.yaml\n”
+printf “\n”
+printf “  3. Package custom actions as dynamic plugins (see scaffolder-registration.ts)\n”
+printf “     Reference them in dynamic-plugins.yaml under plugins:\n”
+printf “\n”
+printf “  4. Commit and push all generated files to GitHub\n”
+printf “     git add rhdh/ scripts/render_rir.py .github/workflows/provision-resource.yml\n”
+printf “     git commit -m ‘feat(rhdh): RHDH integration + catalog-info generation’\n”
+printf “\n”
+printf “  5. In RHDH UI: verify catalog-info.yaml discovers both templates\n”
+printf “     Go to Create > check Namespace Onboarding and MachineSet Onboarding appear\n”
+printf “\n”
+printf “  6. Test: run Namespace Onboarding template for a test namespace\n”
+printf “     Verify PR opened, provision-resource.yml triggers, catalog-info.yaml committed\n”
+printf “     Verify namespace appears in RHDH catalog with Kubernetes tab showing quota/RBAC\n”
+printf “\n”
+printf “  PENDING STEPS (unchanged from previous plan):\n”
+printf “  Step 2: validate-pr.yml 7-stage pipeline\n”
+printf “  Step 3: Argo CD AppSet + AppProject (LOB scoping, SyncWindows)\n”
+printf “  Step 4: Decommission workflow\n”
+printf “\n”
+printf “  TOKEN CHECKLIST:\n”
+printf “  GITOPS_BOT_TOKEN  contents:write + pull-requests:write  (GHA + RHDH scaffolder)\n”
+printf “  OCP_NONPROD_SA_TOKEN  from: oc create token rhdh-k8s-reader -n rhdh-system\n”
+printf “  OCP_PROD_SA_TOKEN     from: oc create token rhdh-k8s-reader -n rhdh-system\n”
+printf “  ARGOCD_TOKEN      from: oc get secret openshift-gitops-cluster -n openshift-gitops\n”
+printf “\n”
