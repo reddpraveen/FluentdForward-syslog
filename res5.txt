@@ -1,0 +1,233 @@
+# =============================================================================
+# dynamic-plugins.yaml
+# ConfigMap: dynamic-plugins-rhdh  Namespace: rhdh
+#
+# Verified against:
+#   - Red Hat RHDH 1.9 documentation
+#   - redhat-developer/rhdh-operator repository
+#   - janus-idp/backstage-showcase reference implementation
+#
+# Deploy: oc apply -f dynamic-plugins.yaml -n rhdh
+# Note: Pod restarts on every change to this ConfigMap (operator behavior)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamic-plugins-rhdh
+  namespace: rhdh
+  labels:
+    app.kubernetes.io/managed-by: gitops
+    app.kubernetes.io/component: rhdh-config
+data:
+  dynamic-plugins.yaml: |
+    # Include default RHDH plugins as base
+    includes:
+    - dynamic-plugins.default.yaml
+    
+    plugins:
+    # =========================================================================
+    # ArgoCD Plugin - Shows GitOps sync status on catalog component pages
+    # =========================================================================
+    # Backend: Connects to ArgoCD API, exposes data to frontend
+    - package: ./dynamic-plugins/dist/roadiehq-backstage-plugin-argo-cd-backend-dynamic
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            roadiehq.backstage-plugin-argo-cd-backend:
+              proxyPath: /argocd/api
+              appLocatorMethods:
+              - type: config
+                instances:
+                - name: hub-argocd
+                  url: ${ARGOCD_URL}
+                  token: ${ARGOCD_TOKEN}
+    
+    # Frontend: Shows ArgoCD sync/health on component overview page
+    - package: ./dynamic-plugins/dist/backstage-community-plugin-redhat-argocd
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          frontend:
+            janus-idp.backstage-plugin-argocd:
+              mountPoints:
+              - mountPoint: entity.page.overview/cards
+                importName: ArgocdDeploymentSummary
+                config:
+                  layout:
+                    gridColumnEnd:
+                      lg: "span 8"
+                      md: "span 6"
+                      xs: "span 12"
+                  if:
+                    allOf:
+                    - isArgocdAvailable
+              - mountPoint: entity.page.cd/cards
+                importName: ArgocdDeploymentLifecycle
+                config:
+                  layout:
+                    gridColumn: "1 / -1"
+                  if:
+                    allOf:
+                    - isArgocdAvailable
+    
+    # =========================================================================
+    # Kubernetes Plugin - Shows live cluster resources on catalog pages
+    # =========================================================================
+    # Backend: Queries target clusters via SA tokens
+    - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes-backend-dynamic
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            backstage.plugin-kubernetes-backend:
+              clusterLocatorMethods:
+              - type: config
+                clusters:
+                - name: ocp-nonprod-eastus-01
+                  url: ${OCP_NONPROD_API_URL}
+                  authProvider: serviceAccount
+                  serviceAccountToken: ${OCP_NONPROD_SA_TOKEN}
+                  skipTLSVerify: false
+                - name: ocp-prod-eastus-01
+                  url: ${OCP_PROD_API_URL}
+                  authProvider: serviceAccount
+                  serviceAccountToken: ${OCP_PROD_SA_TOKEN}
+                  skipTLSVerify: false
+    
+    # Frontend: Shows Kubernetes resources (NS, quota, RBAC, pods) on component page
+    - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          frontend:
+            backstage.plugin-kubernetes:
+              mountPoints:
+              - mountPoint: entity.page.kubernetes/cards
+                importName: EntityKubernetesContent
+                config:
+                  layout:
+                    gridColumn: "1 / -1"
+                  if:
+                    anyOf:
+                    - hasAnnotation: backstage.io/kubernetes-id
+    
+    # =========================================================================
+    # GitHub Integration - Catalog discovery + PR creation
+    # =========================================================================
+    # GitHub catalog backend module (discovers repos, teams, users)
+    - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-dynamic
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            backstage.plugin-catalog-backend-module-github:
+              github:
+                host: github.com
+                token: ${GITOPS_BOT_TOKEN}
+    
+    # GitHub org data provider (syncs teams as Groups for RBAC)
+    - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-org-dynamic
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            backstage.plugin-catalog-backend-module-github-org:
+              github:
+                host: github.com
+                token: ${GITOPS_BOT_TOKEN}
+                orgs:
+                - org-xxx
+    
+    # GitHub Pull Requests plugin (shows open PRs on component page)
+    - package: ./dynamic-plugins/dist/roadiehq-backstage-plugin-github-pull-requests
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          frontend:
+            roadiehq.backstage-plugin-github-pull-requests:
+              mountPoints:
+              - mountPoint: entity.page.overview/cards
+                importName: EntityGithubPullRequestsOverviewCard
+                config:
+                  layout:
+                    gridColumnEnd:
+                      lg: "span 4"
+                      md: "span 6"
+                      xs: "span 12"
+                  if:
+                    allOf:
+                    - isGithubPullRequestsAvailable
+    
+    # =========================================================================
+    # Scaffolder - Software Templates + Custom Actions
+    # =========================================================================
+    # GitHub scaffolder action (creates PRs from templates)
+    - package: ./dynamic-plugins/dist/backstage-plugin-scaffolder-backend-module-github-dynamic
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            backstage.plugin-scaffolder-backend-module-github:
+              github:
+                host: github.com
+                token: ${GITOPS_BOT_TOKEN}
+    
+    # =========================================================================
+    # RBAC Plugin - Permission policies for templates and actions
+    # =========================================================================
+    - package: ./dynamic-plugins/dist/janus-idp-backstage-plugin-rbac
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            janus-idp.backstage-plugin-rbac:
+              permission:
+                enabled: true
+              rbac:
+                admin:
+                  users:
+                  - name: group:default/platform-leads
+                policies-csv-file: /opt/app-root/src/rbac-policy.csv
+                policyFileReload: true
+    
+    # =========================================================================
+    # Custom Platform Actions (patch-lob-input + validate-onboarding)
+    # =========================================================================
+    # Package as dynamic plugins (avoid image rebuild)
+    # Build: npx @backstage/cli package export-dynamic-plugin
+    # Host: OCI registry or internal npm registry
+    - package: 'oci://quay.io/org-xxx/rhdh-platform-actions:latest!patch-lob-input'
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            internal.scaffolder-action-patch-lob-input:
+              enabled: true
+    
+    - package: 'oci://quay.io/org-xxx/rhdh-platform-actions:latest!validate-onboarding'
+      disabled: false
+      pluginConfig:
+        dynamicPlugins:
+          backend:
+            internal.scaffolder-action-validate-onboarding:
+              enabled: true
+
+
+# === Step 1: Build patch-lob-input as dynamic plugin ===
+cd rhdh/actions/patch-lob-input
+npx @backstage/cli package export-dynamic-plugin --no-embed-package-json
+
+# === Step 2: Build validate-onboarding as dynamic plugin ===
+cd rhdh/actions/validate-onboarding
+npx @backstage/cli package export-dynamic-plugin --no-embed-package-json
+
+# === Step 3: Build OCI image ===
+cd rhdh/actions
+podman build -t quay.io/org-xxx/rhdh-platform-actions:latest -f Containerfile .
+
+# === Step 4: Push to registry ===
+podman push quay.io/org-xxx/rhdh-platform-actions:latest
+
+# === Step 5: Update dynamic-plugins.yaml with OCI reference ===
+# (See corrected config above)
