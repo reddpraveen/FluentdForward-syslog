@@ -1,0 +1,6 @@
+
+# Check what other numbered ConfigMaps exist in openshift-apiserver
+oc get cm -n openshift-apiserver -o json | \
+jq -r '.items[] | .metadata.name' | \
+grep -E "-[0-9]+$" | \
+sed 's/-[0-9]*$//' | sort | uniq -c | sort -rn | head -10
