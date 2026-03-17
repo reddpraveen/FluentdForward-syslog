@@ -1,3 +1,12 @@
+
+# Check what ConfigMap patterns exist in openshift-apiserver
+oc get cm -n openshift-apiserver -o json | \
+jq -r '.items[] | .metadata.name' | \
+grep -E "^(revision-status|audit|config)-[0-9]+$" | \
+sed 's/-[0-9]*$//' | sort | uniq -c | sort -rn
+
+
+
 # Check actual secret types
 oc get secrets -n openshift-kube-apiserver -o json | \
   jq -r '.items[] | select(.metadata.name | test("localhost-recovery-client")) | 
