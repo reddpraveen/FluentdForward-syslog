@@ -1,3 +1,20 @@
+# Check actual secret types
+oc get secrets -n openshift-kube-apiserver -o json | \
+  jq -r '.items[] | select(.metadata.name | test("localhost-recovery-client")) | 
+         "\(.metadata.name) | type=\(.type) | created=\(.metadata.creationTimestamp)"' | head -10
+
+oc get secrets -n openshift-etcd -o json | \
+  jq -r '.items[] | select(.metadata.name | test("etcd-client")) | 
+         "\(.metadata.name) | type=\(.type) | created=\(.metadata.creationTimestamp)"' | head -10
+
+# Count how many exist (to understand rotation volume)
+oc get secrets -n openshift-kube-apiserver --no-headers | grep "localhost-recovery-client" | wc -l
+oc get secrets -n openshift-etcd --no-headers | grep "etcd-client" | wc -l
+
+
+--------
+
+
 
 bash# Find last Completed revision in openshift-oauth-apiserver
 oc get cm -n openshift-oauth-apiserver -o json | \
