@@ -1,5 +1,3 @@
-
-
 # Check what other numbered ConfigMaps exist in openshift-apiserver
 oc get cm -n openshift-apiserver -o json | \
 jq -r '.items[] | .metadata.name' | \
