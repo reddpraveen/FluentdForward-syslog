@@ -1,3 +1,682 @@
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+    app.kubernetes.io/component: cleanup
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secret-pruner-config
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+data:
+  # --- CORE SETTINGS ---
+  # Global Dry Run: Set to "false" to enable actual deletions
+  # NOTE: Even if false, review-only namespaces below will remain safe
+  dryRun: "true"
+
+  # Retention: Delete secrets older than this many days
+  minAgeDays: "30"
+
+  # --- NAMESPACE FILTERING (INCLUDE MODE) ---
+  # Only namespaces matching these regex patterns will be processed.
+  # Patterns use bash extended regex (ERE).
+  includedNamespaces: |
+    ^openshift-kube-apiserver$
+    ^kube-system$
+    ^openshift-etcd$
+    ^openshift-config$
+
+  # --- REVIEW-ONLY MODE ---
+  # Namespaces matching these patterns are FORCED to DRY_RUN=true
+  # regardless of the global 'dryRun' setting above.
+  dryRunReviewNamespaces: |
+    ^kube-system$
+    ^openshift-etcd$
+    ^openshift-config$
+
+  # --- INCLUDE-BASED NAME TARGETING ---
+  # ONLY secrets matching these name patterns are CANDIDATES for deletion.
+  # Everything not listed here is automatically safe - never touched.
+  # Patterns use bash extended regex (ERE).
+  includedSecretNames: |
+    ^encryption-config-.*
+    ^webhook-authenticator-.*
+    ^localhost-recovery-client-token-[0-9]+$
+
+  # --- SAFETY NET: TYPE EXCLUSIONS ---
+  # Even if a secret matches includedSecretNames above,
+  # it is STILL protected if its type is listed here.
+  # Belt-and-suspenders layer - do not remove.
+  excludedSecretTypes: |
+    kubernetes.io/service-account-token
+    kubernetes.io/dockercfg
+    kubernetes.io/dockerconfigjson
+    kubernetes.io/basic-auth
+    kubernetes.io/ssh-auth
+    bootstrap.kubernetes.io/token
+    istio.io/ca-root
+    kubernetes.io/tls
+
+  # --- SAFETY NET: LABEL PROTECTIONS ---
+  # Even if a secret matches includedSecretNames above,
+  # it is STILL protected if it carries any of these labels.
+  # Supports three formats:
+  #   key=value   -> exact match (label key has this exact value)
+  #   key/        -> prefix match (any label starting with this prefix)
+  #   key         -> existence match (label key exists, any value)
+  protectedLabels: |
+    app.kubernetes.io/managed-by=argocd
+    app.kubernetes.io/managed-by=Helm
+    meta.helm.sh/release-name
+    prune.protected=true
+    auth.openshift.io/managed=true
+    operators.coreos.com/
+    olm.operatorgroup.name
+
+  # --- RETENTION POLICY FOR ROTATED SECRETS ---
+  # Keeps N most recent rotations by creationTimestamp for any prefix.
+  # Format: prefix:count (count must be a positive integer)
+  # The prefix is matched with a trailing dash (prefix-) using jq startswith().
+  # Active encryption keys (referenced by APIServer CRD) are ALWAYS kept
+  # regardless of this setting.
+  # Add new entries here when adding new rotation patterns to includedSecretNames.
+  retainRecentRotations: |
+    encryption-config:3
+    webhook-authenticator:10
+    localhost-recovery-client-token:5
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: secret-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+rules:
+# Core Secret Operations
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "delete"]
+# Workload References
+- apiGroups: [""]
+  resources: ["pods", "services", "serviceaccounts", "configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+  verbs: ["get", "list"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list"]
+# OpenShift Specifics
+- apiGroups: ["route.openshift.io"]
+  resources: ["routes"]
+  verbs: ["get", "list"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list"]
+- apiGroups: ["config.openshift.io"]
+  resources: ["apiservers", "oauths", "authentications", "infrastructures"]
+  verbs: ["get", "list"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["list"]
+# Namespace Listing
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: secret-pruner
+subjects:
+- kind: ServiceAccount
+  name: secret-pruner
+  namespace: configmap-secret-pruner
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: secret-pruner
+  namespace: configmap-secret-pruner
+  labels:
+    app.kubernetes.io/name: secret-pruner
+    app.kubernetes.io/version: "2.5-generalized-retention"
+spec:
+  schedule: "0 4 * * 0"
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 28800
+      ttlSecondsAfterFinished: 604800
+      template:
+        spec:
+          serviceAccountName: secret-pruner
+          restartPolicy: Never
+          tolerations:
+          - key: "node-role.kubernetes.io/infra"
+            operator: "Exists"
+            effect: "NoSchedule"
+          containers:
+          - name: pruner
+            image: registry.redhat.io/openshift4/ose-cli:v4.16
+            resources:
+              requests:
+                memory: "512Mi"
+                cpu: "50m"
+              limits:
+                memory: "4Gi"
+                cpu: "500m"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              #!/bin/bash
+              # CRITICAL: Do NOT use 'set -e'. Use 'set -uo pipefail' only.
+              # NOTE: Requires GNU date (present in RHEL/openshift4 images)
+              set -uo pipefail
+
+              NS="configmap-secret-pruner"
+              CM="secret-pruner-config"
+
+              # --- Load Configuration ---
+              DRY_RUN=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRun}' 2>/dev/null || echo "true")
+              [[ -z "$DRY_RUN" ]] && DRY_RUN="true"
+
+              MIN_AGE_DAYS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.minAgeDays}' 2>/dev/null || echo "30")
+              [[ -z "$MIN_AGE_DAYS" ]] && MIN_AGE_DAYS="30"
+
+              INCLUDED_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.includedNamespaces}' 2>/dev/null || echo "")
+              if [[ -z "$INCLUDED_NS" ]]; then
+                INCLUDED_NS=$(printf '%s\n' '^openshift-kube-apiserver$' '^kube-system$' '^openshift-etcd$' '^openshift-config$')
+              fi
+
+              DRY_RUN_REVIEW_NS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.dryRunReviewNamespaces}' 2>/dev/null || echo "")
+
+              NAME_INCLUDES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.includedSecretNames}' 2>/dev/null || echo "")
+              TYPE_EXCLUDES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.excludedSecretTypes}' 2>/dev/null || echo "")
+              LABEL_EXCLUDES=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.protectedLabels}' 2>/dev/null || echo "")
+              RETAIN_RECENT_ROTATIONS=$(oc -n "$NS" get cm "$CM" -o jsonpath='{.data.retainRecentRotations}' 2>/dev/null || echo "")
+
+              # Clean up empty lines
+              INCLUDED_NS=$(echo "$INCLUDED_NS" | sed '/^[[:space:]]*$/d')
+              DRY_RUN_REVIEW_NS=$(echo "$DRY_RUN_REVIEW_NS" | sed '/^[[:space:]]*$/d')
+              NAME_INCLUDES=$(echo "$NAME_INCLUDES" | sed '/^[[:space:]]*$/d')
+              TYPE_EXCLUDES=$(echo "$TYPE_EXCLUDES" | sed '/^[[:space:]]*$/d')
+              LABEL_EXCLUDES=$(echo "$LABEL_EXCLUDES" | sed '/^[[:space:]]*$/d')
+              RETAIN_RECENT_ROTATIONS=$(echo "$RETAIN_RECENT_ROTATIONS" | sed '/^[[:space:]]*$/d')
+
+              # --- Config Validation ---
+              case "$DRY_RUN" in
+                true|false) ;;
+                *) printf '%s [WARN] Invalid dryRun="%s", defaulting to "true"\n' \
+                     "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$DRY_RUN" >&2
+                   DRY_RUN="true" ;;
+              esac
+
+              if [[ ! "$MIN_AGE_DAYS" =~ ^[0-9]+$ ]]; then
+                printf '%s [WARN] Invalid minAgeDays="%s", defaulting to 30\n' \
+                  "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$MIN_AGE_DAYS" >&2
+                MIN_AGE_DAYS="30"
+              fi
+
+              if [[ -z "$NAME_INCLUDES" ]]; then
+                printf '%s [ERROR] includedSecretNames is EMPTY. Refusing to run - nothing to target. Exiting safely.\n' \
+                  "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" >&2
+                exit 0
+              fi
+
+              # --- Pre-parse and validate retention policies ---
+              VALIDATED_RETENTION=""
+              while IFS= read -r rpolicy; do
+                [[ -z "$rpolicy" ]] && continue
+                rprefix="${rpolicy%%:*}"
+                rcount="${rpolicy##*:}"
+                if [[ ! "$rcount" =~ ^[0-9]+$ ]] || [[ "$rcount" -eq 0 ]]; then
+                  printf '%s [WARN] Invalid retention count "%s" for "%s", skipping\n' \
+                    "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$rcount" "$rprefix" >&2
+                  continue
+                fi
+                if [[ -n "$VALIDATED_RETENTION" ]]; then
+                  VALIDATED_RETENTION+=$'\n'
+                fi
+                VALIDATED_RETENTION+="${rprefix}:${rcount}"
+              done <<< "$RETAIN_RECENT_ROTATIONS"
+
+              # --- Counters ---
+              total_deleted=0
+              total_skipped=0
+              total_not_targeted=0
+              total_protected=0
+              total_referenced=0
+              total_too_new=0
+              total_errors=0
+              namespaces_processed=0
+              namespaces_not_included=0
+
+              ns_deleted=0
+              ns_skipped=0
+              CURRENT_NS=""
+
+              declare -a error_list=()
+              declare -a deleted_secrets_list=()
+
+              # --- Logging ---
+              log() {
+                local ns_prefix=""
+                [[ -n "${CURRENT_NS:-}" ]] && ns_prefix="[$CURRENT_NS] "
+                printf '%s [%s] %s%s\n' "$(TZ='America/New_York' date '+%Y-%m-%d %H:%M:%S')" "$1" "$ns_prefix" "${*:2}" >&2
+              }
+
+              error_exit() {
+                log ERROR "$1"
+                exit 1
+              }
+
+              log INFO "Secret Pruner Starting (v2.5 Generalized Retention)"
+              log INFO "Config: DRY_RUN=$DRY_RUN RETENTION=$MIN_AGE_DAYS days"
+
+              log INFO "Included Namespaces:"
+              while IFS= read -r p; do [[ -n "$p" ]] && log INFO "  - $p"; done <<< "$INCLUDED_NS"
+
+              log INFO "Targeted Secret Name Patterns (ONLY these are candidates for deletion):"
+              while IFS= read -r p; do [[ -n "$p" ]] && log INFO "  - $p"; done <<< "$NAME_INCLUDES"
+
+              if [[ -n "$VALIDATED_RETENTION" ]]; then
+                log INFO "Retention Policies (keep N most recent per prefix):"
+                while IFS= read -r p; do [[ -n "$p" ]] && log INFO "  - $p"; done <<< "$VALIDATED_RETENTION"
+              else
+                log INFO "Retention Policies: none configured"
+              fi
+
+              if [[ -n "$DRY_RUN_REVIEW_NS" ]]; then
+                log INFO "Review-Only Namespaces (Forced DRY_RUN):"
+                while IFS= read -r p; do [[ -n "$p" ]] && log INFO "  - $p"; done <<< "$DRY_RUN_REVIEW_NS"
+              fi
+
+              min_age_seconds=$((MIN_AGE_DAYS * 86400))
+              current_epoch=$(date +%s)
+              start_time=$(date +%s)
+
+              # --- Helper: Check Label Protection ---
+              check_label_protected() {
+                local labels_json="$1"
+                local label_keys
+                label_keys=$(echo "$labels_json" | jq -r 'keys[]' 2>/dev/null || echo "")
+                [[ -z "$label_keys" ]] && return 1
+
+                while IFS= read -r rule; do
+                  [[ -z "$rule" ]] && continue
+                  if [[ "$rule" == *"="* ]]; then
+                    local k="${rule%=*}"
+                    local v="${rule#*=}"
+                    local actual
+                    actual=$(echo "$labels_json" | jq -r --arg k "$k" '.[$k] // empty' 2>/dev/null)
+                    if [[ "$actual" == "$v" ]]; then return 0; fi
+                  elif [[ "$rule" == */ ]]; then
+                    local prefix="$rule"
+                    while IFS= read -r lk; do
+                      [[ -z "$lk" ]] && continue
+                      if [[ "$lk" == "$prefix"* ]]; then return 0; fi
+                    done <<< "$label_keys"
+                  else
+                    while IFS= read -r lk; do
+                      [[ -z "$lk" ]] && continue
+                      if [[ "$lk" == "$rule" ]]; then return 0; fi
+                    done <<< "$label_keys"
+                  fi
+                done <<< "$LABEL_EXCLUDES"
+                return 1
+              }
+
+              # --- Helper: Get Workload References ---
+              get_workload_references() {
+                local ns="$1"
+                local all_refs=""
+
+                local std_refs
+                std_refs=$(oc get pods,deployments,statefulsets,daemonsets,jobs,cronjobs -n "$ns" -o json 2>/dev/null | \
+                  jq -r '
+                    .items[]? |
+                    (.spec.jobTemplate.spec.template.spec // .spec.template.spec // .spec) |
+                    [
+                      ((.volumes // [])[]?.secret?.secretName // empty),
+                      ((.volumes // [])[]?.projected?.sources[]?.secret?.name // empty),
+                      ((.containers // [])[]?.envFrom[]?.secretRef?.name // empty),
+                      ((.containers // [])[]?.env[]?.valueFrom?.secretKeyRef?.name // empty),
+                      ((.initContainers // [])[]?.envFrom[]?.secretRef?.name // empty),
+                      ((.initContainers // [])[]?.env[]?.valueFrom?.secretKeyRef?.name // empty),
+                      ((.imagePullSecrets // [])[]?.name // empty)
+                    ] | .[] | select(. != null and . != "")
+                  ' 2>/dev/null || echo "")
+                all_refs+="$std_refs"$'\n'
+
+                local route_refs
+                route_refs=$(oc get routes.route.openshift.io -n "$ns" -o json 2>/dev/null | \
+                  jq -r '.items[]? | select(.spec.tls.secretName != null) | .spec.tls.secretName' 2>/dev/null || echo "")
+                all_refs+="$route_refs"$'\n'
+
+                local sa_refs
+                sa_refs=$(oc get serviceaccounts -n "$ns" -o json 2>/dev/null | \
+                  jq -r '.items[]? | ((.imagePullSecrets // [])[]?.name // empty), ((.secrets // [])[]?.name // empty)' 2>/dev/null || echo "")
+                all_refs+="$sa_refs"$'\n'
+
+                local ing_refs
+                ing_refs=$(oc get ingresses.networking.k8s.io -n "$ns" -o json 2>/dev/null | \
+                  jq -r '.items[]? | ((.spec.tls // [])[]?.secretName // empty)' 2>/dev/null || echo "")
+                all_refs+="$ing_refs"$'\n'
+
+                echo "$all_refs" | sort -u | grep -v '^$' || echo ""
+              }
+
+              # --- Helper: Get Active Encryption Keys ---
+              get_active_encryption_keys() {
+                oc get apiserver cluster -o jsonpath='{.spec.encryption.aescbc.keys[*].name}' 2>/dev/null | tr ' ' '\n' || echo ""
+              }
+
+              # --- Main Processing Function ---
+              process_secrets() {
+                local target_ns="$1"
+                local effective_dry_run="$2"
+                local referenced_secrets="$3"
+
+                local deleted_count=0
+                local skipped_count=0
+                local not_targeted_count=0
+
+                # Fetch all secrets once
+                local secret_json
+                if ! secret_json=$(oc get secrets -n "$target_ns" -o json 2>/dev/null); then
+                  log ERROR "Failed to list secrets"
+                  return 1
+                fi
+
+                # --- Pre-compute: Active encryption keys (CRD-based, special case) ---
+                local active_enc_keys=""
+                if [[ "$target_ns" == "openshift-kube-apiserver" ]]; then
+                  active_enc_keys=$(get_active_encryption_keys)
+                  if [[ -n "$active_enc_keys" ]]; then
+                    log INFO "Active encryption keys: $(echo "$active_enc_keys" | tr '\n' ' ')"
+                  fi
+                fi
+
+                # --- Pre-compute: Retention-protected list (generic for all prefixes) ---
+                # Builds a combined newline-separated list of secret names protected
+                # by retention policy. For each prefix:count in VALIDATED_RETENTION,
+                # extracts matching secrets sorted newest-first, keeps top N.
+                # Uses the single secret_json fetch -- no additional API calls.
+                local retention_protected=""
+                if [[ -n "$VALIDATED_RETENTION" ]]; then
+                  while IFS= read -r rpolicy; do
+                    [[ -z "$rpolicy" ]] && continue
+                    local rprefix="${rpolicy%%:*}"
+                    local rcount="${rpolicy##*:}"
+                    local top_names
+                    top_names=$(echo "$secret_json" | \
+                      jq -r --arg prefix "${rprefix}-" '
+                        [.items[] | select(.metadata.name | startswith($prefix))] |
+                        sort_by(.metadata.creationTimestamp) | reverse |
+                        .[].metadata.name
+                      ' 2>/dev/null | head -"$rcount" || echo "")
+                    if [[ -n "$top_names" ]]; then
+                      local total_for_prefix
+                      total_for_prefix=$(echo "$secret_json" | \
+                        jq --arg prefix "${rprefix}-" '
+                          [.items[] | select(.metadata.name | startswith($prefix))] | length
+                        ' 2>/dev/null || echo "0")
+                      log INFO "Retention: ${rprefix} - keeping top $rcount of $total_for_prefix"
+                      retention_protected+="$top_names"$'\n'
+                    fi
+                  done <<< "$VALIDATED_RETENTION"
+                fi
+
+                while IFS= read -r secret_data; do
+                  [[ -z "$secret_data" ]] && continue
+
+                  local name
+                  name=$(echo "$secret_data" | jq -r '.metadata.name' 2>/dev/null)
+                  [[ -z "$name" || "$name" == "null" ]] && continue
+
+                  local stype
+                  stype=$(echo "$secret_data" | jq -r '.type // "Opaque"' 2>/dev/null)
+                  local created
+                  created=$(echo "$secret_data" | jq -r '.metadata.creationTimestamp' 2>/dev/null)
+                  local labels
+                  labels=$(echo "$secret_data" | jq -r '.metadata.labels // {}' 2>/dev/null)
+
+                  # -------------------------------------------------------
+                  # 1. INCLUDE GATE
+                  # -------------------------------------------------------
+                  local name_included=false
+                  while IFS= read -r pattern; do
+                    [[ -z "$pattern" ]] && continue
+                    if [[ "$name" =~ $pattern ]]; then
+                      name_included=true
+                      break
+                    fi
+                  done <<< "$NAME_INCLUDES"
+                  if [[ "$name_included" != "true" ]]; then
+                    ((not_targeted_count++))
+                    continue
+                  fi
+
+                  # -------------------------------------------------------
+                  # 2. SAFETY NET: Type Exclusion
+                  # -------------------------------------------------------
+                  if echo "$TYPE_EXCLUDES" | grep -Fxq "$stype" 2>/dev/null; then
+                    log INFO "SAFETY-NET: $name matches target but type=$stype is excluded"
+                    ((skipped_count++))
+                    continue
+                  fi
+
+                  # -------------------------------------------------------
+                  # 3. SAFETY NET: Label Protection
+                  # -------------------------------------------------------
+                  if check_label_protected "$labels"; then
+                    log INFO "SAFETY-NET: $name has protected label"
+                    ((skipped_count++))
+                    continue
+                  fi
+
+                  # -------------------------------------------------------
+                  # 4. CRITICAL: Active Encryption Key (CRD-referenced)
+                  #    Special case: APIServer CRD directly references the
+                  #    active key. Protected regardless of age or retention.
+                  # -------------------------------------------------------
+                  if [[ "$target_ns" == "openshift-kube-apiserver" && "$name" =~ ^encryption-config- ]]; then
+                    if [[ -n "$active_enc_keys" ]] && echo "$active_enc_keys" | grep -Fxq "$name"; then
+                      log INFO "PROTECTED: $name (active encryption key - CRD referenced)"
+                      ((skipped_count++))
+                      ((total_protected++))
+                      continue
+                    fi
+                  fi
+
+                  # -------------------------------------------------------
+                  # 5. RETENTION POLICY (generic - any prefix from ConfigMap)
+                  #    Protects the top N most recent per prefix.
+                  # -------------------------------------------------------
+                  if [[ -n "$retention_protected" ]] && echo "$retention_protected" | grep -Fxq "$name"; then
+                    log INFO "PROTECTED: $name (recent rotation - retention policy)"
+                    ((skipped_count++))
+                    ((total_protected++))
+                    continue
+                  fi
+
+                  # -------------------------------------------------------
+                  # 6. Age Check
+                  # -------------------------------------------------------
+                  if [[ -n "$created" && "$created" != "null" ]]; then
+                    local c_epoch
+                    c_epoch=$(date -d "$created" +%s 2>/dev/null || echo "0")
+                    if [[ "$c_epoch" -gt 0 ]]; then
+                      local age_sec=$((current_epoch - c_epoch))
+                      if [[ "$age_sec" -lt "$min_age_seconds" ]]; then
+                        ((skipped_count++))
+                        ((total_too_new++))
+                        continue
+                      fi
+                    fi
+                  fi
+
+                  # -------------------------------------------------------
+                  # 7. Reference Check
+                  # -------------------------------------------------------
+                  if echo "$referenced_secrets" | grep -Fxq "$name" >/dev/null 2>&1; then
+                    log INFO "REFERENCED: $name (in-use by workload/SA/route)"
+                    ((skipped_count++))
+                    ((total_referenced++))
+                    continue
+                  fi
+
+                  # -------------------------------------------------------
+                  # 8. Delete or Dry-Run Log
+                  # -------------------------------------------------------
+                  if [[ "$effective_dry_run" == "true" ]]; then
+                    log INFO "DRY-RUN: Would delete $name"
+                    deleted_secrets_list+=("[$target_ns] $name")
+                  else
+                    local delete_output
+                    if delete_output=$(oc delete secret "$name" -n "$target_ns" --wait=false --ignore-not-found 2>&1); then
+                      log INFO "DELETED: $name"
+                      deleted_secrets_list+=("[$target_ns] $name")
+                    else
+                      log ERROR "FAILED TO DELETE: $name - $delete_output"
+                      error_list+=("Failed to delete $name in $target_ns: $delete_output")
+                      ((total_errors++))
+                      continue
+                    fi
+                  fi
+                  ((deleted_count++))
+                  ((total_deleted++))
+
+                done < <(echo "$secret_json" | jq -c '.items[]' 2>/dev/null)
+
+                ns_deleted=$deleted_count
+                ns_skipped=$skipped_count
+                ((total_not_targeted += not_targeted_count))
+              }
+
+              # --- Main Loop ---
+              all_namespaces=$(oc get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | sort)
+              if [[ -z "$all_namespaces" ]]; then
+                error_exit "Failed to fetch namespace list from cluster. Check SA permissions and API connectivity."
+              fi
+
+              while IFS= read -r ns; do
+                [[ -z "$ns" ]] && continue
+                CURRENT_NS="$ns"
+
+                # 1. Namespace Include Filter
+                included=false
+                while IFS= read -r pattern; do
+                  [[ -z "$pattern" ]] && continue
+                  if [[ "$ns" =~ $pattern ]]; then included=true; break; fi
+                done <<< "$INCLUDED_NS"
+
+                if [[ "$included" != "true" ]]; then
+                  ((namespaces_not_included++))
+                  continue
+                fi
+
+                ((namespaces_processed++))
+                log INFO "Processing Namespace [$namespaces_processed]: $ns"
+
+                # 2. Review-Only Mode Check
+                effective_dry_run="$DRY_RUN"
+                if [[ -n "$DRY_RUN_REVIEW_NS" ]]; then
+                  while IFS= read -r pattern; do
+                    [[ -z "$pattern" ]] && continue
+                    if [[ "$ns" =~ $pattern ]]; then
+                      effective_dry_run="true"
+                      log INFO "REVIEW-MODE: Forced DRY_RUN for $ns"
+                      break
+                    fi
+                  done <<< "$DRY_RUN_REVIEW_NS"
+                fi
+
+                # 3. Get References
+                refs=$(get_workload_references "$ns")
+                ref_count=$(echo "$refs" | grep -c . 2>/dev/null || echo "0")
+                log INFO "Extracted $ref_count unique secret references"
+
+                # 4. Count secrets for logging
+                count=$(oc get secrets -n "$ns" --no-headers 2>/dev/null | wc -l || echo "0")
+                log INFO "Found $count Secret(s)"
+
+                # 5. Process Secrets
+                process_secrets "$ns" "$effective_dry_run" "$refs"
+
+                log INFO "Namespace Summary: deleted=$ns_deleted skipped=$ns_skipped"
+                ((total_skipped += ns_skipped))
+
+              done <<< "$all_namespaces"
+
+              # --- Final Report ---
+              duration=$(($(date +%s) - start_time))
+              log INFO "=========================================="
+              log INFO "Secret Pruner v2.5 Generalized Retention"
+              log INFO "Job Completed in ${duration}s"
+              log INFO "=========================================="
+              log INFO "Namespaces Processed: $namespaces_processed"
+              log INFO "Namespaces Not Included: $namespaces_not_included"
+              log INFO "=========================================="
+              log INFO "Secrets Not Targeted (safe - no pattern match): $total_not_targeted"
+              log INFO "Secrets Deleted (or would delete): $total_deleted"
+              log INFO "Secrets Skipped (safety nets): $total_skipped"
+              log INFO "  - Protected (CRD ref + retention): $total_protected"
+              log INFO "  - Referenced (in-use by workloads): $total_referenced"
+              log INFO "  - Too New (< $MIN_AGE_DAYS days): $total_too_new"
+              if [[ ${#error_list[@]} -gt 0 ]]; then
+                log ERROR "Errors: ${#error_list[@]}"
+                for err in "${error_list[@]}"; do
+                  log ERROR "  $err"
+                done
+              fi
+              log INFO "=========================================="
+              if [[ "$DRY_RUN" == "true" ]]; then
+                log INFO "Mode: DRY-RUN (no secrets were actually deleted)"
+              else
+                log INFO "Mode: PRODUCTION (deletions were executed)"
+              fi
+              log INFO "=========================================="
+              exit 0
+
+
+
+
+
+
+==================================
 ---
 apiVersion: v1
 kind: Namespace
