@@ -1,3 +1,502 @@
+# ======================================================
+# 1. Does the gossip ring service exist
+# ======================================================
+oc get svc -n openshift-logging logging-loki-gossip-ring
+
+# ======================================================
+# 2. Gossip ring service endpoints
+# ======================================================
+oc get endpoints -n openshift-logging logging-loki-gossip-ring
+
+# ======================================================
+# 3. Gossip ring service selector
+# ======================================================
+oc get svc -n openshift-logging logging-loki-gossip-ring -o jsonpath="{.spec.selector}" | jq .
+
+# ======================================================
+# 4. Ingester pod labels (compare with selector above)
+# ======================================================
+oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].metadata.labels}" | jq .
+
+# ======================================================
+# 5. Test port 3100 with HTTPS on distributor
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS https://localhost:3100/ready
+
+# ======================================================
+# 6. Test port 3100 with HTTPS on ingester
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].metadata.name}") -- curl -ksS https://localhost:3100/ready
+
+# ======================================================
+# 7. Test port 3100 with HTTPS on querier
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=querier -o jsonpath="{.items[0].metadata.name}") -- curl -ksS https://localhost:3100/ready
+
+# ======================================================
+# 8. Test port 3100 with HTTPS on compactor
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS https://localhost:3100/ready
+
+# ======================================================
+# 9. Cross-pod HTTPS test - distributor to ingester
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS "https://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].status.podIP}"):3100/ready"
+
+# ======================================================
+# 10. Memberlist 7946 test - distributor to ingester
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS --connect-timeout 3 "http://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].status.podIP}"):7946/"
+
+# ======================================================
+# 11. Ring status via HTTPS
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS https://localhost:3100/ring | head -50
+
+# ======================================================
+# 12. Loki Operator version
+# ======================================================
+oc get csv -n openshift-operators-redhat --no-headers | grep -i loki
+
+# ======================================================
+# 13. Loki Operator subscription
+# ======================================================
+oc get subscription -n openshift-operators-redhat --no-headers | grep -i loki
+
+# ======================================================
+# 14. LokiStack full spec (look for httpEncryption, grpcEncryption)
+# ======================================================
+oc get lokistack -n openshift-logging -o jsonpath="{.items[0].spec}" | jq .
+
+# ======================================================
+# 15. Loki ConfigMaps
+# ======================================================
+oc get configmap -n openshift-logging --no-headers | grep -i loki
+
+# ======================================================
+# 16. Loki config TLS lines
+# ======================================================
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "http_tls|grpc_tls|scheme.*https|tls_enabled|cert_file|key_file|ca_file|client_auth"
+
+# ======================================================
+# 17. Loki Operator pod errors
+# ======================================================
+oc logs -n openshift-operators-redhat $(oc get pods -n openshift-operators-redhat -l name=loki-operator-controller-manager -o jsonpath="{.items[0].metadata.name}") --tail=200 | grep -iE "error|fail|reconcil"
+
+# ======================================================
+# 18. Gateway TLS errors
+# ======================================================
+oc logs -n openshift-logging -l app.kubernetes.io/component=lokistack-gateway --tail=300 | grep -iE "tls handshake|x509|certificate|EOF" | sort -u | tail -20
+
+# ======================================================
+# 19. Distributor memberlist errors
+# ======================================================
+oc logs -n openshift-logging -l app.kubernetes.io/component=distributor --tail=300 | grep -iE "failed to join|memberlist|7946|gossip" | tail -20
+
+# ======================================================
+# 20. Compactor errors
+# ======================================================
+oc logs -n openshift-logging -l app.kubernetes.io/component=compactor --tail=300 | grep -iE "level=error|no such host|storage|tls|x509|ring" | sort -u | tail -20
+
+# ======================================================
+# 21. Ingester errors
+# ======================================================
+oc logs -n openshift-logging -l app.kubernetes.io/component=ingester --tail=300 | grep -iE "level=error|ring|memberlist|storage|tls|x509" | sort -u | tail -20
+
+# ======================================================
+# 22. Collector errors
+# ======================================================
+oc logs -n openshift-logging -l app.kubernetes.io/component=collector -c collector --tail=200 | grep -iE "403|forbidden|refused|error|timeout|tls|drop" | tail -20
+
+# ======================================================
+# 23. CLF status
+# ======================================================
+oc get clusterlogforwarder -n openshift-logging -o yaml
+
+# ======================================================
+# 24. All Loki pods wide
+# ======================================================
+oc get pods -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller -o wide
+
+# ======================================================
+# 25. All Loki services
+# ======================================================
+oc get svc -n openshift-logging | grep -i loki
+
+# ======================================================
+# 26. Recent Loki events
+# ======================================================
+oc get events -n openshift-logging --sort-by=.lastTimestamp | grep -i loki | tail -20
+
+
+
+=================
+#!/bin/bash
+# loki-verify.sh - LokiStack verification commands
+# Copy-paste friendly. Read-only. No create/update/delete.
+# Usage: bash loki-verify.sh
+set -uo pipefail
+NS="openshift-logging"
+
+echo ""
+echo "======================================================"
+echo "1. GOSSIP RING SERVICE - does it exist"
+echo "======================================================"
+oc get svc -n $NS logging-loki-gossip-ring 2>&1
+echo ""
+echo "Gossip ring service endpoints:"
+oc get endpoints -n $NS logging-loki-gossip-ring 2>&1
+
+echo ""
+echo "======================================================"
+echo "2. GOSSIP RING SERVICE SELECTOR vs POD LABELS"
+echo "======================================================"
+echo "Service selector:"
+oc get svc -n $NS logging-loki-gossip-ring \
+  -o jsonpath="{.spec.selector}" 2>/dev/null | jq . 2>&1
+echo ""
+echo "Ingester pod labels:"
+oc get pods -n $NS \
+  -l app.kubernetes.io/component=ingester \
+  -o jsonpath="{.items[0].metadata.labels}" 2>/dev/null | jq . 2>&1
+
+echo ""
+echo "======================================================"
+echo "3. ALL LOKI SERVICES"
+echo "======================================================"
+oc get svc -n $NS --no-headers | grep -i loki
+
+echo ""
+echo "======================================================"
+echo "4. ALL LOKI PODS"
+echo "======================================================"
+oc get pods -n $NS \
+  -l app.kubernetes.io/managed-by=lokistack-controller \
+  -o wide --no-headers 2>&1
+
+echo ""
+echo "======================================================"
+echo "5. PODS NOT READY OR RESTARTING"
+echo "======================================================"
+oc get pods -n $NS \
+  -l app.kubernetes.io/managed-by=lokistack-controller \
+  -o json 2>/dev/null \
+  | jq -r ".items[] | .metadata.name + \" ready=\" + (.status.containerStatuses[0].ready | tostring) + \" restarts=\" + (.status.containerStatuses[0].restartCount | tostring) + \" phase=\" + .status.phase"
+
+echo ""
+echo "======================================================"
+echo "6. PORT 3100 - TEST HTTPS (not HTTP)"
+echo "======================================================"
+echo "distributor:"
+oc exec -n $NS \
+  $(oc get pods -n $NS \
+  -l app.kubernetes.io/component=distributor \
+  -o jsonpath="{.items[0].metadata.name}") \
+  -- curl -ksS https://localhost:3100/ready 2>&1
+echo ""
+
+echo "ingester:"
+oc exec -n $NS \
+  $(oc get pods -n $NS \
+  -l app.kubernetes.io/component=ingester \
+  -o jsonpath="{.items[0].metadata.name}") \
+  -- curl -ksS https://localhost:3100/ready 2>&1
+echo ""
+
+echo "querier:"
+oc exec -n $NS \
+  $(oc get pods -n $NS \
+  -l app.kubernetes.io/component=querier \
+  -o jsonpath="{.items[0].metadata.name}") \
+  -- curl -ksS https://localhost:3100/ready 2>&1
+echo ""
+
+echo "compactor:"
+oc exec -n $NS \
+  $(oc get pods -n $NS \
+  -l app.kubernetes.io/component=compactor \
+  -o jsonpath="{.items[0].metadata.name}") \
+  -- curl -ksS https://localhost:3100/ready 2>&1
+echo ""
+
+echo ""
+echo "======================================================"
+echo "7. CROSS-POD HTTPS TEST (distributor to ingester)"
+echo "======================================================"
+DIST=$(oc get pods -n $NS \
+  -l app.kubernetes.io/component=distributor \
+  -o jsonpath="{.items[0].metadata.name}" 2>/dev/null)
+
+ING_IP=$(oc get pods -n $NS \
+  -l app.kubernetes.io/component=ingester \
+  -o jsonpath="{.items[0].status.podIP}" 2>/dev/null)
+
+echo "From $DIST to ingester at $ING_IP"
+oc exec -n $NS $DIST -- \
+  curl -ksS "https://${ING_IP}:3100/ready" 2>&1
+echo ""
+
+echo ""
+echo "======================================================"
+echo "8. MEMBERLIST PORT 7946 TEST"
+echo "======================================================"
+ING_NAME=$(oc get pods -n $NS \
+  -l app.kubernetes.io/component=ingester \
+  -o jsonpath="{.items[0].metadata.name}" 2>/dev/null)
+
+echo "From distributor $DIST to ingester $ING_IP on 7946:"
+oc exec -n $NS $DIST -- \
+  curl -ksS --connect-timeout 3 \
+  "http://${ING_IP}:7946/" 2>&1
+echo ""
+
+echo "From ingester to distributor on 7946:"
+DIST_IP=$(oc get pods -n $NS \
+  -l app.kubernetes.io/component=distributor \
+  -o jsonpath="{.items[0].status.podIP}" 2>/dev/null)
+oc exec -n $NS $ING_NAME -- \
+  curl -ksS --connect-timeout 3 \
+  "http://${DIST_IP}:7946/" 2>&1
+echo ""
+
+echo ""
+echo "======================================================"
+echo "9. RING STATUS VIA HTTPS"
+echo "======================================================"
+oc exec -n $NS $DIST -- \
+  curl -ksS "https://localhost:3100/ring" 2>&1 \
+  | head -50
+
+echo ""
+echo "======================================================"
+echo "10. LOKISTACK SPEC (check httpEncryption, grpcEncryption)"
+echo "======================================================"
+oc get lokistack -n $NS \
+  -o jsonpath="{.items[0].spec}" 2>/dev/null | jq . 2>&1
+
+echo ""
+echo "======================================================"
+echo "11. LOKI CONFIGMAPS"
+echo "======================================================"
+oc get configmap -n $NS --no-headers | grep -i loki
+
+echo ""
+echo "======================================================"
+echo "12. LOKI CONFIG - TLS SETTINGS"
+echo "======================================================"
+CM_NAME=$(oc get configmap -n $NS --no-headers \
+  | grep -i loki | grep -iv gateway \
+  | head -1 | awk "{print \$1}")
+echo "ConfigMap: $CM_NAME"
+echo ""
+echo "TLS related config lines:"
+oc get configmap -n $NS "$CM_NAME" \
+  -o json 2>/dev/null \
+  | jq -r ".data[]" \
+  | grep -iE "http_tls|grpc_tls|scheme.*https|tls_enabled|cert_file|key_file|ca_file|client_auth" \
+  || echo "No TLS config lines found"
+
+echo ""
+echo "======================================================"
+echo "13. GATEWAY TLS ERRORS"
+echo "======================================================"
+for GW in $(oc get pods -n $NS \
+  -l app.kubernetes.io/component=lokistack-gateway \
+  -o jsonpath="{.items[*].metadata.name}" 2>/dev/null); do
+  echo "--- $GW ---"
+  oc logs -n $NS $GW --tail=200 2>/dev/null \
+    | grep -iE "tls handshake|x509|certificate|EOF" \
+    | sort -u | tail -10
+done
+
+echo ""
+echo "======================================================"
+echo "14. GATEWAY CERT DETAILS"
+echo "======================================================"
+GW_SVC=$(oc get svc -n $NS --no-headers \
+  | grep -i gateway | grep -iv headless \
+  | awk "{print \$1}" | head -1)
+GW_FQDN="${GW_SVC}.${NS}.svc.cluster.local"
+GW_PORT=$(oc get svc $GW_SVC -n $NS \
+  -o jsonpath="{.spec.ports[0].port}" 2>/dev/null)
+echo "Gateway: $GW_FQDN:$GW_PORT"
+
+GW_POD=$(oc get pods -n $NS \
+  -l app.kubernetes.io/component=lokistack-gateway \
+  -o jsonpath="{.items[0].metadata.name}" 2>/dev/null)
+echo ""
+echo "Cert from gateway:"
+oc exec -n $NS $GW_POD -- \
+  curl -kvsS "https://${GW_FQDN}:${GW_PORT}/" 2>&1 \
+  | grep -iE "subject:|issuer:|expire|SSL|verify|error" \
+  | head -15
+
+echo ""
+echo "======================================================"
+echo "15. GATEWAY SERVICE ANNOTATIONS (serving cert)"
+echo "======================================================"
+oc get svc $GW_SVC -n $NS \
+  -o json 2>/dev/null \
+  | jq -r ".metadata.annotations"
+
+echo ""
+echo "======================================================"
+echo "16. CA BUNDLE - CLUSTER PROXY"
+echo "======================================================"
+PROXY_CA=$(oc get proxy cluster \
+  -o jsonpath="{.spec.trustedCA.name}" 2>/dev/null)
+echo "Cluster proxy trustedCA: ${PROXY_CA:-not set}"
+if [ -n "$PROXY_CA" ]; then
+  oc get configmap "$PROXY_CA" \
+    -n openshift-config --no-headers 2>&1
+fi
+
+echo ""
+echo "======================================================"
+echo "17. CA INJECTION CONFIGMAPS IN NAMESPACE"
+echo "======================================================"
+oc get configmap -n $NS \
+  -l config.openshift.io/inject-trusted-cabundle=true \
+  --no-headers 2>&1
+
+echo ""
+echo "======================================================"
+echo "18. LOKISTACK TLS CONFIG"
+echo "======================================================"
+oc get lokistack -n $NS -o json 2>/dev/null \
+  | jq -r ".items[0].spec.storage.tls // \"not configured\""
+
+echo ""
+echo "======================================================"
+echo "19. GATEWAY CA AND CERT VOLUMES"
+echo "======================================================"
+echo "Volumes:"
+oc get pod $GW_POD -n $NS -o json 2>/dev/null \
+  | jq -r ".spec.volumes[]? | .name + \" = \" + (.configMap.name // .secret.secretName // .projected.sources[0].secret.name // \"other\")" \
+  | grep -iE "ca|tls|cert|serv"
+
+echo ""
+echo "Volume mounts:"
+oc get pod $GW_POD -n $NS -o json 2>/dev/null \
+  | jq -r ".spec.containers[]?.volumeMounts[]? | .name + \" -> \" + .mountPath" \
+  | grep -iE "ca|tls|cert|serv"
+
+echo ""
+echo "======================================================"
+echo "20. STORAGE SECRET"
+echo "======================================================"
+SNAME=$(oc get lokistack -n $NS \
+  -o jsonpath="{.items[0].spec.storage.secret.name}" 2>/dev/null)
+STYPE=$(oc get lokistack -n $NS \
+  -o jsonpath="{.items[0].spec.storage.secret.type}" 2>/dev/null)
+echo "Secret: $SNAME  Type: $STYPE"
+echo ""
+echo "Keys:"
+oc get secret $SNAME -n $NS \
+  -o json 2>/dev/null | jq -r ".data | keys[]"
+echo ""
+echo "Decoded values (account_key masked):"
+for K in $(oc get secret $SNAME -n $NS \
+  -o json 2>/dev/null | jq -r ".data | keys[]"); do
+  VAL=$(oc get secret $SNAME -n $NS \
+    -o jsonpath="{.data.$K}" | base64 -d 2>/dev/null)
+  if [ "$K" = "account_key" ]; then
+    echo "  $K = (length=${#VAL})"
+  else
+    echo "  $K = $VAL"
+  fi
+done
+
+echo ""
+echo "======================================================"
+echo "21. AZURE BLOB CONNECTIVITY FROM LOKI POD"
+echo "======================================================"
+if [ "$STYPE" = "azure" ] || [ "$STYPE" = "Azure" ]; then
+  ACCT=$(oc get secret $SNAME -n $NS \
+    -o jsonpath="{.data.account_name}" \
+    | base64 -d 2>/dev/null)
+  ESUFFIX=$(oc get secret $SNAME -n $NS \
+    -o jsonpath="{.data.endpoint_suffix}" \
+    | base64 -d 2>/dev/null)
+  if [ -z "$ESUFFIX" ]; then
+    ESUFFIX="blob.core.windows.net"
+  fi
+  BLOB_URL="https://${ACCT}.${ESUFFIX}/"
+  echo "Testing: $BLOB_URL"
+  oc exec -n $NS $GW_POD -- \
+    curl -kvsS --connect-timeout 5 \
+    --max-time 10 "$BLOB_URL" 2>&1 \
+    | grep -iE "Connected|SSL|subject|issuer|verify|x509|error|refused|timed" \
+    | head -15
+else
+  echo "Storage type is $STYPE, skipping Azure test"
+fi
+
+echo ""
+echo "======================================================"
+echo "22. NETWORKPOLICY COUNT"
+echo "======================================================"
+oc get networkpolicy -n $NS --no-headers 2>&1 \
+  | wc -l
+
+echo ""
+echo "======================================================"
+echo "23. CLF STATUS"
+echo "======================================================"
+oc get clusterlogforwarder -n $NS -o json 2>/dev/null \
+  | jq -r ".items[] | \"Name: \" + .metadata.name, (.status.conditions[]? | \"  \" + .type + \": \" + .status + \" -- \" + (.reason // \"\") + \" -- \" + (.message // \"\"))"
+
+echo ""
+echo "======================================================"
+echo "24. COLLECTOR ERRORS"
+echo "======================================================"
+oc logs -n $NS \
+  -l app.kubernetes.io/component=collector \
+  -c collector --tail=200 2>/dev/null \
+  | grep -iE "403|forbidden|refused|error|timeout|tls|drop" \
+  | tail -20
+
+echo ""
+echo "======================================================"
+echo "25. LOKI OPERATOR LOGS (errors only)"
+echo "======================================================"
+oc logs -n openshift-operators-redhat \
+  $(oc get pods -n openshift-operators-redhat \
+  -l name=loki-operator-controller-manager \
+  -o jsonpath="{.items[0].metadata.name}" 2>/dev/null) \
+  --tail=200 2>/dev/null \
+  | grep -iE "error|fail|reconcil" \
+  | tail -20
+
+echo ""
+echo "======================================================"
+echo "26. COMPONENT ERRORS (distributor, ingester, compactor)"
+echo "======================================================"
+for C in distributor ingester compactor; do
+  echo "--- $C ---"
+  oc logs -n $NS \
+    -l "app.kubernetes.io/component=$C" \
+    --tail=200 2>/dev/null \
+    | grep -iE "level=error|panic|fatal|refused|tls|x509|ring|memberlist|storage|no such host" \
+    | sort -u | tail -15
+done
+
+echo ""
+echo "======================================================"
+echo "27. RECENT LOKI EVENTS"
+echo "======================================================"
+oc get events -n $NS --sort-by=.lastTimestamp 2>/dev/null \
+  | grep -i loki | tail -20
+
+echo ""
+echo "======================================================"
+echo "DONE"
+echo "======================================================"
+
+
+
+
+=============
 #!/bin/bash
 ######################################################
 # loki-verify.sh
