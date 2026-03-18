@@ -1,4 +1,150 @@
 # ======================================================
+# 1. List all secrets with cert/tls in name for Loki
+# ======================================================
+oc get secrets -n openshift-logging --no-headers | grep -iE "loki.*tls|loki.*cert|loki.*ca|loki.*signing"
+
+# ======================================================
+# 2. Check the Loki HTTP cert secret (used by components for mTLS)
+# ======================================================
+oc get secret -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller --no-headers | grep -iE "http|grpc|cert|tls|ca|signing"
+
+# ======================================================
+# 3. Distributor pod volumes (find cert mounts)
+# ======================================================
+oc get pod -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -o json | jq -r ".spec.volumes[] | .name + \" = \" + (.secret.secretName // .configMap.name // \"other\")"
+
+# ======================================================
+# 4. Distributor pod volume mounts (find cert paths)
+# ======================================================
+oc get pod -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -o json | jq -r ".spec.containers[0].volumeMounts[] | .name + \" -> \" + .mountPath"
+
+# ======================================================
+# 5. Compactor pod volumes
+# ======================================================
+oc get pod -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -o json | jq -r ".spec.volumes[] | .name + \" = \" + (.secret.secretName // .configMap.name // \"other\")"
+
+# ======================================================
+# 6. Compactor pod volume mounts
+# ======================================================
+oc get pod -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -o json | jq -r ".spec.containers[0].volumeMounts[] | .name + \" -> \" + .mountPath"
+
+# ======================================================
+# 7. Check client cert expiry on distributor pod
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- find / -name "tls.crt" -o -name "*.crt" -o -name "*.pem" 2>/dev/null | head -20
+
+# ======================================================
+# 8. Decode the client cert on distributor (adjust path from step 7)
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/tls/http/tls.crt 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1
+
+# ======================================================
+# 9. If path above fails try common alternatives
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- ls -la /var/run/tls/ 2>/dev/null
+
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- ls -laR /var/run/tls/ 2>/dev/null
+
+# ======================================================
+# 10. Check CA cert on distributor
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- ls -la /var/run/ca/ 2>/dev/null
+
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/ca/service-ca.crt 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1
+
+# ======================================================
+# 11. Check compactor client cert
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/tls/http/tls.crt 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1
+
+# ======================================================
+# 12. Check compactor CA cert
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/ca/service-ca.crt 2>/dev/null | openssl x509 -noout -subject -issuer -dates 2>&1
+
+# ======================================================
+# 13. Test mTLS curl from distributor to compactor
+#     (presenting client cert and CA)
+# ======================================================
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -vsS --cert /var/run/tls/http/tls.crt --key /var/run/tls/http/tls.key --cacert /var/run/ca/service-ca.crt "https://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].status.podIP}"):3100/ready" 2>&1
+
+# ======================================================
+# 14. Check the signing CA secret used by Loki Operator
+# ======================================================
+oc get secret -n openshift-logging --no-headers | grep -iE "signing|ca"
+
+# ======================================================
+# 15. Decode the signing CA cert
+# ======================================================
+oc get secret -n openshift-logging $(oc get secret -n openshift-logging --no-headers | grep -i "signing-ca" | head -1 | awk "{print \$1}") -o jsonpath="{.data.ca\.crt}" 2>/dev/null | base64 -d | openssl x509 -noout -subject -issuer -dates 2>&1
+
+# ======================================================
+# 16. Compare signing CA start date with pod cert issuer
+#     If dates differ, CA was rotated but pods have stale certs
+# ======================================================
+echo "--- Signing CA ---"
+oc get secret -n openshift-logging $(oc get secret -n openshift-logging --no-headers | grep -i "signing-ca" | head -1 | awk "{print \$1}") -o jsonpath="{.data.ca\.crt}" 2>/dev/null | base64 -d | openssl x509 -noout -dates 2>&1
+
+echo "--- Distributor cert ---"
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/tls/http/tls.crt 2>/dev/null | openssl x509 -noout -dates 2>&1
+
+echo "--- Compactor cert ---"
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/tls/http/tls.crt 2>/dev/null | openssl x509 -noout -dates 2>&1
+
+echo "--- Ingester cert ---"
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].metadata.name}") -- cat /var/run/tls/http/tls.crt 2>/dev/null | openssl x509 -noout -dates 2>&1
+
+# ======================================================
+# 17. Check if the service-ca operator is healthy
+# ======================================================
+oc get pods -n openshift-service-ca --no-headers
+
+# ======================================================
+# 18. Check service-ca-bundle configmap age and content
+# ======================================================
+oc get configmap -n openshift-logging --no-headers | grep -i "ca-bundle\|service-ca"
+
+# ======================================================
+# 19. LokiStack spec httpEncryption and grpcEncryption
+# ======================================================
+oc get lokistack -n openshift-logging -o jsonpath="{.items[0].spec}" | jq .
+
+# ======================================================
+# 20. Loki config TLS section from ConfigMap
+# ======================================================
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "http_tls|grpc_tls|tls_enabled|cert_file|key_file|ca_file|client_auth|require"
+
+# ======================================================
+# 21. Loki Operator errors
+# ======================================================
+oc logs -n openshift-operators-redhat $(oc get pods -n openshift-operators-redhat -l name=loki-operator-controller-manager -o jsonpath="{.items[0].metadata.name}") --tail=200 | grep -iE "error|fail|cert|tls|reconcil"
+
+# ======================================================
+# 22. All Loki pods with restarts and age
+# ======================================================
+oc get pods -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller -o wide
+
+# ======================================================
+# 23. Check when Loki secrets were last updated
+# ======================================================
+oc get secrets -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller -o custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp" | grep -iE "tls|cert|ca|sign"
+
+# ======================================================
+# 24. Check if pods are older than secrets
+#     (stale pod = stale cert mount)
+# ======================================================
+echo "--- Secret ages ---"
+oc get secrets -n openshift-logging --no-headers -o custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp" | grep -iE "loki.*tls|loki.*cert|loki.*ca|loki.*sign"
+
+echo "--- Pod ages ---"
+oc get pods -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller --no-headers -o custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp"
+
+++++++++++++++++++
+
+
+
+
+# ======================================================
 # 1. Does the gossip ring service exist
 # ======================================================
 oc get svc -n openshift-logging logging-loki-gossip-ring
