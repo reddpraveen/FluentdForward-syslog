@@ -1,3 +1,1059 @@
+# Check events for liveness/readiness failures
+oc get events -n openshift-logging --sort-by=.lastTimestamp | grep -iE 'loki.*unhealthy|loki.*probe|loki.*back-off' | tail -20
+
+# Check if the container is actually listening
+oc exec -n openshift-logging $(oc get pod -n openshift-logging -l app.kubernetes.io/component=distributor -o name | head -1) -- \
+  wget -qO- http://localhost:3100/ready 2>&1 || echo "NOT READY"
+
+
+# Check the storage secret
+oc get secret -n openshift-logging logging-loki-azure -o yaml 2>/dev/null || \
+oc get secret -n openshift-logging -l app.kubernetes.io/component=lokistack | head -5
+
+# Verify the secret has the expected keys
+oc get secret -n openshift-logging logging-loki-azure -o json | jq '.data | keys'
+
+# Look for storage errors in any loki pod
+oc logs -n openshift-logging -l app.kubernetes.io/managed-by=lokistack-controller --tail=300 | grep -iE 'storage|blob|azure|bucket|403|401|timeout|refused|container'
+
+
+#!/bin/bash
+###############################################################################
+
+# loki-diag.sh — Read-only LokiStack diagnostic for OCP Logging
+
+# Pinpoints root cause of “connection refused on 3100” / 403 from collectors
+
+# Uses ONLY get/describe/exec/logs — no create, update, delete, or patch
+
+###############################################################################
+set -euo pipefail
+
+NS=”${1:-openshift-logging}”
+DIVIDER=”======================================================================”
+
+log_section() {
+printf “\n%s\n[%s] %s\n%s\n” “$DIVIDER” “$(date +%H:%M:%S)” “$1” “$DIVIDER”
+}
+
+log_check() {
+printf “\n— %s —\n” “$1”
+}
+
+warn() {
+printf “[WARN] %s\n” “$1”
+}
+
+ok() {
+printf “[OK]   %s\n” “$1”
+}
+
+fail() {
+printf “[FAIL] %s\n” “$1”
+}
+
+info() {
+printf “[INFO] %s\n” “$1”
+}
+
+##########################################
+
+#!/bin/bash
+######################################################
+
+# loki-diag.sh
+
+# Read-only LokiStack diagnostic for OCP Logging
+
+# Pinpoints: connection refused 3100, 403, no data
+
+# Uses ONLY: get, describe, exec, logs
+
+# NO create, update, delete, patch, apply
+
+######################################################
+set -euo pipefail
+
+NS=”${1:-openshift-logging}”
+SEP=”======================================================”
+RC=0
+
+log_section() {
+printf “\n%s\n[%s] %s\n%s\n”   
+“$SEP” “$(date +%H:%M:%S)” “$1” “$SEP”
+}
+
+chk() { printf “\n– %s –\n” “$1”; }
+ok()   { printf “[OK]   %s\n” “$1”; }
+warn() { printf “[WARN] %s\n” “$1”; }
+fail() { printf “[FAIL] %s\n” “$1”; RC=1; }
+info() { printf “[INFO] %s\n” “$1”; }
+
+######################################################
+
+# 1. OPERATOR HEALTH
+
+######################################################
+log_section “1. Loki Operator Health”
+
+chk “Loki Operator pod”
+oc get pods -n openshift-operators-redhat   
+-l name=loki-operator-controller-manager   
+–no-headers 2>/dev/null ||   
+oc get pods -A   
+-l app.kubernetes.io/name=loki-operator   
+–no-headers 2>/dev/null ||   
+warn “Loki Operator pod not found”
+
+chk “Loki Operator CSV”
+oc get csv -n openshift-operators-redhat   
+-o custom-columns=  
+‘NAME:.metadata.name,PHASE:.status.phase’   
+–no-headers 2>/dev/null |   
+grep -i loki ||   
+warn “No Loki Operator CSV found”
+
+######################################################
+
+# 2. LOKISTACK RESOURCE
+
+######################################################
+log_section “2. LokiStack Resource”
+
+LOKI_NAME=$(oc get lokistack -n “$NS”   
+-o jsonpath=’{.items[0].metadata.name}’   
+2>/dev/null || true)
+
+if [[ -z “$LOKI_NAME” ]]; then
+fail “No LokiStack found in $NS”
+exit 1
+fi
+ok “LokiStack: $LOKI_NAME”
+
+chk “LokiStack conditions”
+oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o json | jq -r ’
+.status.conditions[]? |
+“(.type): (.status) | (.reason // “n/a”) | (.message // “n/a”)”
+’ 2>/dev/null ||   
+warn “Cannot read conditions”
+
+chk “LokiStack size and storage”
+SIZE=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.size}’ 2>/dev/null)
+STYPE=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.storage.secret.type}’   
+2>/dev/null)
+SNAME=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.storage.secret.name}’   
+2>/dev/null)
+SCLASS=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.storageClassName}’   
+2>/dev/null)
+TMODE=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.tenants.mode}’   
+2>/dev/null)
+info “Size: $SIZE”
+info “Storage type: $STYPE”
+info “Secret name: $SNAME”
+info “StorageClass: ${SCLASS:-not set}”
+info “Tenant mode: $TMODE”
+
+chk “LokiStack storage schemas”
+oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o json | jq -r ’
+.spec.storage.schemas[]? |
+“effectiveDate=(.effectiveDate) version=(.version)”
+’ 2>/dev/null || info “No schemas found”
+
+######################################################
+
+# 3. STORAGE SECRET VALIDATION
+
+######################################################
+log_section “3. Storage Secret Validation”
+
+if ! oc get secret “$SNAME” -n “$NS”   
+>/dev/null 2>&1; then
+fail “Secret ‘$SNAME’ MISSING in $NS”
+else
+ok “Secret ‘$SNAME’ exists”
+
+```
+SKEYS=$(oc get secret "$SNAME" -n "$NS" \
+	-o json | jq -r '.data | keys[]')
+
+chk "Secret keys present"
+printf "%s\n" "$SKEYS"
+
+# Azure validation
+if [[ "$STYPE" == "azure" \
+	|| "$STYPE" == "Azure" ]]; then
+	chk "Azure-specific key validation"
+	AZURE_REQ="container account_name account_key"
+	AZURE_OPT="environment endpoint_suffix"
+	for K in $AZURE_REQ; do
+		if ! echo "$SKEYS" | grep -qw "$K"; then
+			fail "MISSING required key: $K"
+			continue
+		fi
+		VAL=$(oc get secret "$SNAME" -n "$NS" \
+			-o jsonpath="{.data.$K}" | \
+			base64 -d 2>/dev/null)
+		if [[ -z "$VAL" ]]; then
+			fail "Key '$K' EMPTY after decode"
+		else
+			if [[ "$K" == "account_key" ]]; then
+				LEN=${#VAL}
+				ok "$K (length=${LEN})"
+			else
+				ok "$K = ${VAL:0:30}..."
+			fi
+		fi
+	done
+	for K in $AZURE_OPT; do
+		if echo "$SKEYS" | grep -qw "$K"; then
+			VAL=$(oc get secret "$SNAME" -n "$NS" \
+				-o jsonpath="{.data.$K}" | \
+				base64 -d 2>/dev/null)
+			info "Optional: $K = $VAL"
+		fi
+	done
+fi
+
+# S3 validation
+if [[ "$STYPE" == "s3" \
+	|| "$STYPE" == "S3" ]]; then
+	chk "S3-specific key validation"
+	S3_REQ="bucketnames endpoint"
+	S3_REQ="$S3_REQ access_key_id"
+	S3_REQ="$S3_REQ access_key_secret"
+	for K in $S3_REQ; do
+		if ! echo "$SKEYS" | grep -qw "$K"; then
+			fail "MISSING required key: $K"
+		else
+			ok "Key '$K' present"
+		fi
+	done
+fi
+
+chk "Trailing whitespace/newline check"
+DIRTY=0
+for K in $SKEYS; do
+	RAW=$(oc get secret "$SNAME" -n "$NS" \
+		-o jsonpath="{.data.$K}" | \
+		base64 -d 2>/dev/null)
+	TRIMMED=$(printf '%s' "$RAW" | \
+		sed 's/[[:space:]]*$//')
+	if [[ "$RAW" != "$TRIMMED" ]]; then
+		fail "$K has trailing whitespace"
+		DIRTY=1
+	fi
+done
+if [[ "$DIRTY" -eq 0 ]]; then
+	ok "No trailing whitespace in keys"
+fi
+```
+
+fi
+
+######################################################
+
+# 4. POD STATUS
+
+######################################################
+log_section “4. Loki Component Pods”
+
+chk “All Loki pods”
+oc get pods -n “$NS”   
+-l app.kubernetes.io/managed-by=lokistack-controller   
+-o wide 2>/dev/null ||   
+oc get pods -n “$NS” | grep -i loki
+
+COMPS=“distributor ingester querier”
+COMPS=”$COMPS query-frontend compactor”
+COMPS=”$COMPS gateway index-gateway”
+
+for C in $COMPS; do
+if [[ “$C” == “gateway” ]]; then
+LBL=“app.kubernetes.io/component=lokistack-gateway”
+else
+LBL=“app.kubernetes.io/component=$C”
+fi
+
+```
+PODS=$(oc get pods -n "$NS" -l "$LBL" \
+	-o jsonpath='{.items[*].metadata.name}' \
+	2>/dev/null)
+
+if [[ -z "$PODS" ]]; then
+	warn "No pods: $C"
+	continue
+fi
+
+for P in $PODS; do
+	PH=$(oc get pod "$P" -n "$NS" \
+		-o jsonpath='{.status.phase}')
+	RDY=$(oc get pod "$P" -n "$NS" \
+		-o jsonpath='{.status.containerStatuses[0].ready}')
+	RST=$(oc get pod "$P" -n "$NS" \
+		-o jsonpath='{.status.containerStatuses[0].restartCount}')
+	LRSN=$(oc get pod "$P" -n "$NS" \
+		-o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}' \
+		2>/dev/null || echo "")
+
+	LINE="$P phase=$PH ready=$RDY"
+	LINE="$LINE restarts=$RST"
+	if [[ -n "$LRSN" ]]; then
+		LINE="$LINE lastReason=$LRSN"
+	fi
+
+	if [[ "$LRSN" == "OOMKilled" ]]; then
+		fail "$LINE"
+	elif [[ "$PH" != "Running" \
+		|| "$RDY" != "true" ]]; then
+		fail "$LINE"
+	elif [[ "$RST" -gt 3 ]]; then
+		warn "$LINE"
+	else
+		ok "$LINE"
+	fi
+done
+```
+
+done
+
+######################################################
+
+# 5. PORT 3100 READINESS
+
+######################################################
+log_section “5. Port 3100 Readiness”
+
+for C in distributor ingester querier; do
+POD=$(oc get pods -n “$NS”   
+-l “app.kubernetes.io/component=$C”   
+-o jsonpath=’{.items[0].metadata.name}’   
+2>/dev/null)
+if [[ -z “$POD” ]]; then
+fail “No $C pod to probe”
+continue
+fi
+RES=$(oc exec -n “$NS” “$POD” –   
+wget -qO- –timeout=5   
+http://localhost:3100/ready   
+2>&1 || true)
+if echo “$RES” | grep -qi “ready”; then
+ok “$C ($POD) READY on 3100”
+else
+fail “$C ($POD) NOT READY: $RES”
+fi
+done
+
+######################################################
+
+# 6. SERVICE ENDPOINTS
+
+######################################################
+log_section “6. Services and Endpoints”
+
+chk “Loki services”
+oc get svc -n “$NS” | grep -i loki
+
+SVC_COMPS=“distributor ingester”
+SVC_COMPS=”$SVC_COMPS lokistack-gateway”
+for C in $SVC_COMPS; do
+SVC=$(oc get svc -n “$NS”   
+-l “app.kubernetes.io/component=$C”   
+-o jsonpath=’{.items[0].metadata.name}’   
+2>/dev/null || true)
+if [[ -z “$SVC” ]]; then
+warn “No service for $C”
+continue
+fi
+EP=$(oc get endpoints “$SVC” -n “$NS”   
+-o json 2>/dev/null | jq -r ’
+.subsets[0].addresses // [] | length
+’)
+if [[ “$EP” == “0” || -z “$EP” ]]; then
+fail “$SVC has 0 ready endpoints”
+else
+ok “$SVC has $EP endpoint(s)”
+fi
+done
+
+######################################################
+
+# 7. PVC HEALTH
+
+######################################################
+log_section “7. PVC Health”
+
+chk “Loki PVCs”
+oc get pvc -n “$NS” | grep -i loki ||   
+warn “No Loki PVCs”
+
+UNBND=$(oc get pvc -n “$NS” -o json | jq -r ’
+.items[] |
+select(.metadata.name | test(“loki”)) |
+select(.status.phase != “Bound”) |
+“(.metadata.name): (.status.phase)”
+’)
+if [[ -n “$UNBND” ]]; then
+fail “PVCs not Bound:”
+printf “%s\n” “$UNBND”
+else
+ok “All Loki PVCs Bound”
+fi
+
+chk “Ingester WAL disk usage”
+IPODS=$(oc get pods -n “$NS”   
+-l “app.kubernetes.io/component=ingester”   
+-o jsonpath=’{.items[*].metadata.name}’   
+2>/dev/null)
+for P in $IPODS; do
+DF=$(oc exec -n “$NS” “$P” –   
+df -h /tmp/loki 2>/dev/null ||   
+oc exec -n “$NS” “$P” –   
+df -h /data 2>/dev/null ||   
+echo “SKIP”)
+if [[ “$DF” == “SKIP” ]]; then
+warn “$P disk check unavailable”
+continue
+fi
+PCT=$(echo “$DF” | tail -1 |   
+awk ‘{print $5}’ | tr -d ‘%’)
+if [[ “$PCT” -gt 90 ]]; then
+fail “$P WAL disk ${PCT}%”
+elif [[ “$PCT” -gt 80 ]]; then
+warn “$P WAL disk ${PCT}%”
+else
+ok “$P WAL disk ${PCT}%”
+fi
+done
+
+######################################################
+
+# 8. WAL DIRECTORY CHECK
+
+######################################################
+log_section “8. Ingester WAL Check”
+
+for P in $IPODS; do
+chk “WAL on $P”
+WCNT=$(oc exec -n “$NS” “$P” –   
+find /tmp/wal -type f   
+2>/dev/null | wc -l || echo “0”)
+CPCNT=$(oc exec -n “$NS” “$P” –   
+find /tmp/wal -name ‘checkpoint.*’   
+-type d 2>/dev/null |   
+wc -l || echo “0”)
+info “WAL files: $WCNT”
+info “Checkpoints: $CPCNT”
+if [[ “$WCNT” -gt 500 ]]; then
+warn “Large WAL ($WCNT) may block startup”
+info “Known fix: rm /tmp/wal contents”
+info “Ref: grafana/loki#10988”
+fi
+done
+
+######################################################
+
+# 9. RING HEALTH
+
+######################################################
+log_section “9. Hash Ring Health”
+
+DIST_POD=$(oc get pods -n “$NS”   
+-l “app.kubernetes.io/component=distributor”   
+-o jsonpath=’{.items[0].metadata.name}’   
+2>/dev/null)
+if [[ -n “$DIST_POD” ]]; then
+chk “Ring via $DIST_POD”
+RING=$(oc exec -n “$NS” “$DIST_POD” –   
+wget -qO- –timeout=5   
+http://localhost:3100/ring   
+2>&1 || true)
+if echo “$RING” | grep -qi “UNHEALTHY”; then
+fail “Unhealthy ring members found”
+echo “$RING” | grep -i “UNHEALTHY” |   
+head -10
+info “Ref: Red Hat Solution #7028049”
+elif echo “$RING” | grep -qi “Heartbeat”; then
+ok “Ring is responding”
+ACTIVE=$(echo “$RING” |   
+grep -ci “ACTIVE” || echo “0”)
+info “Active ring members: $ACTIVE”
+else
+warn “Ring query unexpected result”
+fi
+else
+warn “No distributor pod for ring check”
+fi
+
+######################################################
+
+# 10. MEMBERLIST
+
+######################################################
+log_section “10. Memberlist Cluster”
+
+chk “LokiStack hashRing config”
+HR=$(oc get lokistack “$LOKI_NAME” -n “$NS”   
+-o jsonpath=’{.spec.hashRing}’   
+2>/dev/null)
+if [[ -n “$HR” && “$HR” != “{}” ]]; then
+info “hashRing: $HR”
+else
+info “hashRing: default (memberlist)”
+fi
+
+chk “Memberlist in ingester logs”
+if [[ -n “$IPODS” ]]; then
+FIRST_I=$(echo “$IPODS” | awk ‘{print $1}’)
+oc logs -n “$NS” “$FIRST_I” –tail=200   
+2>/dev/null |   
+grep -iE ‘memberlist|gossip|join|ring’ |   
+tail -10 ||   
+info “No memberlist log lines”
+fi
+
+######################################################
+
+# 11. TLS / CERTIFICATE ERRORS
+
+######################################################
+log_section “11. TLS and Certificate Checks”
+
+chk “x509/TLS errors across Loki pods”
+TLS_ERR=$(oc logs -n “$NS”   
+-l app.kubernetes.io/managed-by=lokistack-controller   
+–tail=500 2>/dev/null |   
+grep -iE   
+‘x509|certificate|tls.*error|tls.*fail’ |   
+sort -u | head -10 || true)
+if [[ -n “$TLS_ERR” ]]; then
+fail “TLS/cert errors found:”
+printf “%s\n” “$TLS_ERR”
+info “Ref: Red Hat Solution #7062864”
+else
+ok “No TLS/cert errors”
+fi
+
+######################################################
+
+# 12. OBJECT STORAGE ERRORS
+
+######################################################
+log_section “12. Object Storage Errors”
+
+chk “Storage auth/access errors”
+STORE_PATTERN=‘AuthenticationFailed’
+STORE_PATTERN=”$STORE_PATTERN|AuthorizationFailure”
+STORE_PATTERN=”$STORE_PATTERN|InvalidBucketState”
+STORE_PATTERN=”$STORE_PATTERN|MissingEndpoint”
+STORE_PATTERN=”$STORE_PATTERN|BlobNotFound”
+STORE_PATTERN=”$STORE_PATTERN|NoSuchBucket”
+STORE_PATTERN=”$STORE_PATTERN|AccessDenied”
+STORE_PATTERN=”$STORE_PATTERN|storage.*error”
+STORE_PATTERN=”$STORE_PATTERN|failed to flush”
+STORE_PATTERN=”$STORE_PATTERN|failed to init”
+STORE_PATTERN=”$STORE_PATTERN|blob.*error”
+STORE_PATTERN=”$STORE_PATTERN|no such host”
+STORE_PATTERN=”$STORE_PATTERN|403.*azure”
+STORE_PATTERN=”$STORE_PATTERN|403.*s3”
+
+SERR=$(oc logs -n “$NS”   
+-l app.kubernetes.io/managed-by=lokistack-controller   
+–tail=1000 2>/dev/null |   
+grep -iE “$STORE_PATTERN” |   
+sort -u | head -20 || true)
+if [[ -n “$SERR” ]]; then
+fail “Storage errors found:”
+printf “%s\n” “$SERR”
+else
+ok “No storage auth/access errors”
+fi
+
+######################################################
+
+# 13. KEY ERRORS PER COMPONENT
+
+######################################################
+log_section “13. Errors per Component (last 50)”
+
+ERR_COMPS=“distributor ingester compactor”
+ERR_COMPS=”$ERR_COMPS lokistack-gateway”
+ERR_COMPS=”$ERR_COMPS query-frontend querier”
+for C in $ERR_COMPS; do
+chk “$C”
+oc logs -n “$NS”   
+-l “app.kubernetes.io/component=$C”   
+–tail=500 2>/dev/null |   
+grep -iE   
+‘level=error|level=warn|panic|fatal|refused|timeout|OOM|denied’ |   
+tail -50 ||   
+info “No errors for $C”
+done
+
+######################################################
+
+# 14. NETWORKPOLICY
+
+######################################################
+log_section “14. NetworkPolicies”
+
+NP=$(oc get networkpolicy -n “$NS”   
+-o json 2>/dev/null |   
+jq ‘.items | length’)
+info “NetworkPolicies in $NS: $NP”
+
+if [[ “$NP” -gt 0 ]]; then
+oc get networkpolicy -n “$NS”   
+-o custom-columns=  
+‘NAME:.metadata.name,POD-SEL:.spec.podSelector.matchLabels’   
+2>/dev/null
+
+```
+chk "Policies allowing port 3100"
+oc get networkpolicy -n "$NS" -o json | \
+	jq -r '
+	.items[] |
+	select(
+		.spec.ingress[]?.ports[]? |
+		(.port == 3100 or .port == "http")
+	) | .metadata.name
+' 2>/dev/null || \
+	warn "Review 3100 ingress manually"
+```
+
+fi
+
+######################################################
+
+# 15. CLF STATUS
+
+######################################################
+log_section “15. ClusterLogForwarder Status”
+
+oc get clusterlogforwarder -n “$NS”   
+-o json 2>/dev/null | jq -r ’
+.items[] |
+“Name: (.metadata.name)”,
+“Conditions:”,
+(.status.conditions[]? |
+“  (.type): (.status) | (.reason // “”) | (.message // “”)”),
+“Pipelines:”,
+(.status.pipelines[]? |
+“  (.name): (.conditions[]? | “(.type)=(.status)”)”),
+“”
+’ || warn “No CLF found”
+
+chk “Collector pod status”
+oc get pods -n “$NS”   
+-l app.kubernetes.io/component=collector   
+–no-headers 2>/dev/null | head -5 ||   
+warn “No collector pods”
+
+chk “Collector errors (last 20)”
+oc logs -n “$NS”   
+-l app.kubernetes.io/component=collector   
+-c collector –tail=300 2>/dev/null |   
+grep -iE   
+‘403|forbidden|refused|error|timeout’ |   
+tail -20 ||   
+info “No collector errors”
+
+######################################################
+
+# 16. EVENTS
+
+######################################################
+log_section “16. Recent Events (Loki)”
+
+oc get events -n “$NS”   
+–sort-by=.lastTimestamp -o json | jq -r ’
+.items[] |
+select(
+.involvedObject.name | test(“loki”;“i”)
+) |
+“(.lastTimestamp) (.type) (.reason) (.involvedObject.name): (.message)”
+’ 2>/dev/null | tail -30
+
+######################################################
+
+# DIAGNOSIS
+
+######################################################
+log_section “DIAGNOSIS”
+
+printf ’
+Connection refused :3100 root cause tree:
+
+Gateway -> dial tcp <ip>:3100: connection refused
+= distributor/ingester NOT listening
+
+WHY pods not listening:
+
++– Storage creds invalid/expired
+|   Sections 3 + 12: look for FAIL
+|   Fix: recreate secret with valid creds
+
++– PVC full or not bound
+|   Section 7: look for FAIL
+|   Fix: expand PVC or reduce retention
+
++– WAL corruption (ingester stuck)
+|   Section 8: large WAL file count
+|   Fix: rm /tmp/wal/* in ingester pod
+|   Ref: grafana/loki#10988
+
++– Ring unhealthy / stale members
+|   Section 9: UNHEALTHY in ring
+|   Fix: restart ingester pods
+|   Ref: access.redhat.com/solutions/7028049
+
++– OOMKilled
+|   Section 4: lastReason=OOMKilled
+|   Fix: increase memory in LokiStack spec
+
++– TLS / x509 cert error
+|   Section 11: certificate verify failed
+|   Fix: check trustedCA bundle
+|   Ref: access.redhat.com/solutions/7062864
+
++– NetworkPolicy blocking 3100
+|   Section 14: no ingress rule for 3100
+|   Fix: add netpol allowing Loki pods
+
++– Memberlist / hashRing misconfigured
+Section 10: join failures
+Fix: patch hashRing to use podIP
+(needed for non-private IP ranges)
+
+Priority order:
+
+1. Sections 3, 12 (storage)
+1. Sections 4, 5 (pods, readiness)
+1. Section 8 (WAL)
+1. Section 9 (ring)
+1. Sections 11, 14 (TLS, netpol)
+   ’
+
+printf “\n%s\nDone: %s | Exit: %d\n%s\n”   
+“$SEP” “$(date)” “$RC” “$SEP”
+
+exit $RC
+
+
+
+
+
+|||~~~~~~~<<<<<<<<<
+#####################################
+
+
+# 1. LOKISTACK RESOURCE STATUS
+
+###############################################################################
+log_section “1. LokiStack Resource Status”
+
+LOKISTACK_NAME=$(oc get lokistack -n “$NS” -o jsonpath=’{.items[0].metadata.name}’ 2>/dev/null || true)
+if [[ -z “$LOKISTACK_NAME” ]]; then
+fail “No LokiStack resource found in namespace $NS”
+exit 1
+fi
+ok “LokiStack found: $LOKISTACK_NAME”
+
+log_check “LokiStack conditions”
+oc get lokistack “$LOKISTACK_NAME” -n “$NS” -o json |   
+jq -r ‘.status.conditions[] | “(.type): (.status) — (.reason // “n/a”) — (.message // “n/a”)”’ 2>/dev/null ||   
+warn “Could not read LokiStack conditions”
+
+log_check “LokiStack storage config”
+STORAGE_TYPE=$(oc get lokistack “$LOKISTACK_NAME” -n “$NS” -o jsonpath=’{.spec.storage.schemas[0].objectStorageType}’ 2>/dev/null || echo “unknown”)
+SECRET_NAME=$(oc get lokistack “$LOKISTACK_NAME” -n “$NS” -o jsonpath=’{.spec.storage.secret.name}’ 2>/dev/null || echo “unknown”)
+SECRET_TYPE=$(oc get lokistack “$LOKISTACK_NAME” -n “$NS” -o jsonpath=’{.spec.storage.secret.type}’ 2>/dev/null || echo “unknown”)
+info “Storage type: $STORAGE_TYPE”
+info “Secret name:  $SECRET_NAME”
+info “Secret type:  $SECRET_TYPE”
+
+###############################################################################
+
+# 2. STORAGE SECRET VALIDATION
+
+###############################################################################
+log_section “2. Storage Secret Validation”
+
+if ! oc get secret “$SECRET_NAME” -n “$NS” > /dev/null 2>&1; then
+fail “Storage secret ‘$SECRET_NAME’ does NOT exist in namespace $NS”
+else
+ok “Storage secret ‘$SECRET_NAME’ exists”
+
+log_check “Secret keys present”
+SECRET_KEYS=$(oc get secret “$SECRET_NAME” -n “$NS” -o json | jq -r ‘.data | keys[]’)
+printf “%s\n” “$SECRET_KEYS”
+
+# Validate expected keys based on storage type
+
+case “$SECRET_TYPE” in
+azure|Azure)
+for KEY in container account_name account_key; do
+if echo “$SECRET_KEYS” | grep -qw “$KEY”; then
+VALUE=$(oc get secret “$SECRET_NAME” -n “$NS” -o jsonpath=”{.data.$KEY}” | base64 -d 2>/dev/null)
+if [[ -z “$VALUE” ]]; then
+fail “Key ‘$KEY’ is present but EMPTY after decode”
+else
+DISPLAY_VAL=”${VALUE:0:8}…”
+ok “Key ‘$KEY’ has value (preview: $DISPLAY_VAL)”
+fi
+else
+fail “Expected key ‘$KEY’ is MISSING for Azure storage”
+fi
+done
+# Check optional endpoint key
+if echo “$SECRET_KEYS” | grep -qw “endpoint_suffix”; then
+EP=$(oc get secret “$SECRET_NAME” -n “$NS” -o jsonpath=’{.data.endpoint_suffix}’ | base64 -d 2>/dev/null)
+info “Custom endpoint_suffix: $EP”
+fi
+;;
+s3|S3)
+for KEY in bucketnames endpoint access_key_id access_key_secret; do
+if echo “$SECRET_KEYS” | grep -qw “$KEY”; then
+ok “Key ‘$KEY’ present”
+else
+fail “Expected key ‘$KEY’ is MISSING for S3 storage”
+fi
+done
+;;
+*)
+info “Storage type ‘$SECRET_TYPE’ — listing decoded key names only”
+;;
+esac
+fi
+
+###############################################################################
+
+# 3. POD STATUS CHECK
+
+###############################################################################
+log_section “3. Loki Component Pod Status”
+
+log_check “All Loki-managed pods”
+oc get pods -n “$NS” -l app.kubernetes.io/managed-by=lokistack-controller -o wide 2>/dev/null ||   
+oc get pods -n “$NS” | grep -i loki
+
+COMPONENTS=“distributor ingester querier query-frontend compactor gateway index-gateway”
+for COMP in $COMPONENTS; do
+log_check “Component: $COMP”
+PODS=$(oc get pods -n “$NS” -l “app.kubernetes.io/component=$COMP” -o jsonpath=’{.items[*].metadata.name}’ 2>/dev/null)
+if [[ -z “$PODS” ]]; then
+warn “No pods found for component ‘$COMP’”
+continue
+fi
+for POD in $PODS; do
+PHASE=$(oc get pod “$POD” -n “$NS” -o jsonpath=’{.status.phase}’)
+READY=$(oc get pod “$POD” -n “$NS” -o jsonpath=’{.status.containerStatuses[0].ready}’)
+RESTARTS=$(oc get pod “$POD” -n “$NS” -o jsonpath=’{.status.containerStatuses[0].restartCount}’)
+LAST_REASON=$(oc get pod “$POD” -n “$NS” -o jsonpath=’{.status.containerStatuses[0].lastState.terminated.reason}’ 2>/dev/null || echo “n/a”)
+
+```
+STATUS_LINE="$POD  phase=$PHASE  ready=$READY  restarts=$RESTARTS"
+if [[ "$LAST_REASON" != "n/a" && -n "$LAST_REASON" ]]; then
+  STATUS_LINE="$STATUS_LINE  lastTermReason=$LAST_REASON"
+fi
+
+if [[ "$PHASE" != "Running" || "$READY" != "true" ]]; then
+  fail "$STATUS_LINE"
+elif [[ "$RESTARTS" -gt 3 ]]; then
+  warn "$STATUS_LINE (high restarts)"
+else
+  ok "$STATUS_LINE"
+fi
+```
+
+done
+done
+
+###############################################################################
+
+# 4. PORT 3100 READINESS CHECK
+
+###############################################################################
+log_section “4. Port 3100 Readiness (Distributor + Ingester)”
+
+for COMP in distributor ingester; do
+POD=$(oc get pods -n “$NS” -l “app.kubernetes.io/component=$COMP” -o jsonpath=’{.items[0].metadata.name}’ 2>/dev/null)
+if [[ -z “$POD” ]]; then
+fail “No $COMP pod found to test port 3100”
+continue
+fi
+log_check “Readiness probe on $POD”
+RESULT=$(oc exec -n “$NS” “$POD” – wget -qO- –timeout=5 http://localhost:3100/ready 2>&1 || true)
+if echo “$RESULT” | grep -qi “ready”; then
+ok “$COMP ($POD) is READY on port 3100”
+else
+fail “$COMP ($POD) NOT READY on port 3100: $RESULT”
+fi
+done
+
+###############################################################################
+
+# 5. SERVICE AND ENDPOINT CHECK
+
+###############################################################################
+log_section “5. Services and Endpoints”
+
+log_check “Loki services”
+oc get svc -n “$NS” | grep -i loki
+
+log_check “Distributor service endpoints”
+DIST_SVC=$(oc get svc -n “$NS” -l “app.kubernetes.io/component=distributor” -o jsonpath=’{.items[0].metadata.name}’ 2>/dev/null || true)
+if [[ -n “$DIST_SVC” ]]; then
+EP_COUNT=$(oc get endpoints “$DIST_SVC” -n “$NS” -o json 2>/dev/null | jq -r ‘.subsets[0].addresses // [] | length’)
+if [[ “$EP_COUNT” == “0” || -z “$EP_COUNT” ]]; then
+fail “Distributor service ‘$DIST_SVC’ has 0 ready endpoints — this causes connection refused”
+else
+ok “Distributor service ‘$DIST_SVC’ has $EP_COUNT ready endpoint(s)”
+fi
+else
+warn “Could not find distributor service”
+fi
+
+log_check “Gateway service endpoints”
+GW_SVC=$(oc get svc -n “$NS” -l “app.kubernetes.io/component=lokistack-gateway” -o jsonpath=’{.items[0].metadata.name}’ 2>/dev/null || true)
+if [[ -n “$GW_SVC” ]]; then
+EP_COUNT=$(oc get endpoints “$GW_SVC” -n “$NS” -o json 2>/dev/null | jq -r ‘.subsets[0].addresses // [] | length’)
+if [[ “$EP_COUNT” == “0” || -z “$EP_COUNT” ]]; then
+fail “Gateway service ‘$GW_SVC’ has 0 ready endpoints”
+else
+ok “Gateway service ‘$GW_SVC’ has $EP_COUNT ready endpoint(s)”
+fi
+fi
+
+###############################################################################
+
+# 6. PVC STATUS AND CAPACITY
+
+###############################################################################
+log_section “6. PVC Health”
+
+log_check “All Loki PVCs”
+oc get pvc -n “$NS” | grep -i loki || warn “No Loki PVCs found”
+
+NOT_BOUND=$(oc get pvc -n “$NS” -o json | jq -r ‘.items[] | select(.metadata.name | test(“loki”)) | select(.status.phase != “Bound”) | “(.metadata.name): (.status.phase)”’)
+if [[ -n “$NOT_BOUND” ]]; then
+fail “PVCs not in Bound state:”
+printf “%s\n” “$NOT_BOUND”
+else
+ok “All Loki PVCs are Bound”
+fi
+
+log_check “Ingester WAL disk usage”
+for POD in $(oc get pods -n “$NS” -l “app.kubernetes.io/component=ingester” -o jsonpath=’{.items[*].metadata.name}’ 2>/dev/null); do
+DF_OUT=$(oc exec -n “$NS” “$POD” – df -h /tmp/loki 2>/dev/null ||   
+oc exec -n “$NS” “$POD” – df -h /data 2>/dev/null ||   
+echo “UNAVAILABLE”)
+if [[ “$DF_OUT” == “UNAVAILABLE” ]]; then
+warn “$POD — could not check disk usage”
+else
+USE_PCT=$(echo “$DF_OUT” | tail -1 | awk ‘{print $5}’ | tr -d ‘%’)
+if [[ “$USE_PCT” -gt 85 ]]; then
+fail “$POD WAL disk at ${USE_PCT}%”
+else
+ok “$POD WAL disk at ${USE_PCT}%”
+fi
+echo “$DF_OUT” | tail -1
+fi
+done
+
+###############################################################################
+
+# 7. RECENT EVENTS
+
+###############################################################################
+log_section “7. Recent Events (last 50 Loki-related)”
+
+oc get events -n “$NS” –sort-by=.lastTimestamp -o json |   
+jq -r ‘.items[] | select(.involvedObject.name | test(“loki”;“i”)) | “(.lastTimestamp) (.type) (.reason) (.involvedObject.name): (.message)”’ |   
+tail -50
+
+###############################################################################
+
+# 8. KEY LOG ERRORS
+
+###############################################################################
+log_section “8. Key Errors from Component Logs (last 50 per component)”
+
+for COMP in distributor ingester compactor gateway; do
+log_check “Errors in $COMP”
+oc logs -n “$NS” -l “app.kubernetes.io/component=$COMP” –tail=500 2>/dev/null |   
+grep -iE ‘err|fail|panic|fatal|refused|timeout|403|401|denied|storage|blob|unreachable’ |   
+tail -50 || info “No error lines found for $COMP”
+done
+
+###############################################################################
+
+# 9. NETWORKPOLICY CHECK
+
+###############################################################################
+log_section “9. NetworkPolicies in $NS”
+
+NP_COUNT=$(oc get networkpolicy -n “$NS” -o json 2>/dev/null | jq ‘.items | length’)
+info “Found $NP_COUNT NetworkPolicies in $NS”
+
+if [[ “$NP_COUNT” -gt 0 ]]; then
+oc get networkpolicy -n “$NS” -o custom-columns=‘NAME:.metadata.name,POD-SELECTOR:.spec.podSelector.matchLabels’ 2>/dev/null
+log_check “Checking if gateway can reach distributor (port 3100)”
+oc get networkpolicy -n “$NS” -o json |   
+jq -r ‘.items[] | select(.spec.ingress[]?.ports[]?.port == 3100 or .spec.ingress == null) | .metadata.name’ 2>/dev/null ||   
+warn “Could not parse netpol ingress rules — review manually”
+fi
+
+###############################################################################
+
+# 10. CLF STATUS
+
+###############################################################################
+log_section “10. ClusterLogForwarder Status”
+
+oc get clusterlogforwarder -n “$NS” -o json 2>/dev/null |   
+jq -r ‘.items[] | “Name: (.metadata.name)\nConditions:”, (.status.conditions[]? | “  (.type): (.status) — (.reason // “n/a”) — (.message // “n/a”)”), “Pipelines:”, (.status.pipelines[]? | “  (.name): (.conditions[]? | “(.type)=(.status)”)”), “”’ ||   
+warn “No CLF found or could not parse status”
+
+###############################################################################
+
+# SUMMARY
+
+###############################################################################
+log_section “DIAGNOSTIC SUMMARY”
+
+printf “
+Root cause checklist (most likely first):
+
+1. Distributor/ingester pods not running or not ready on port 3100
+   -> Check section 3 and 4 for FAIL lines
+1. Storage secret missing, empty keys, or expired credentials
+   -> Check section 2 for FAIL lines
+1. PVCs full or not bound (ingester WAL)
+   -> Check section 6
+1. Object storage unreachable (Azure Blob network/firewall)
+   -> Check section 8 for storage/blob/timeout errors
+1. Service endpoints empty (no ready backends)
+   -> Check section 5 for 0 endpoints
+1. NetworkPolicy blocking gateway -> distributor on 3100
+   -> Check section 9
+1. OOMKilled or CrashLoop on Loki components
+   -> Check section 3 for high restarts / lastTermReason=OOMKilled
+
+If distributor/ingester logs show storage errors, the fix is
+to correct the storage secret and restart the pods.
+If pods are OOMKilled, increase memory limits in the LokiStack spec.
+If PVCs are full, reduce retention or expand PVC size.
+“
+
+printf “\n%s\nDiagnostic complete at %s\n%s\n” “$DIVIDER” “$(date)” “$DIVIDER”
+
 
 # Check what other numbered ConfigMaps exist in openshift-apiserver
 oc get cm -n openshift-apiserver -o json | \
