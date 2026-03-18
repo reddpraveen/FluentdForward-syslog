@@ -1,4 +1,84 @@
 
+oc get svc -n openshift-logging | grep -i compactor
+
+oc get lokistack -n openshift-logging \
+  -o jsonpath="{.items[0].metadata.name}"
+
+oc get svc -n openshift-logging \
+  -o custom-columns="NAME:.metadata.name" \
+  --no-headers | grep -i loki
+
+# Get the IPs of all Loki pods
+oc get pods -n openshift-logging \
+  -l app.kubernetes.io/managed-by=lokistack-controller \
+  -o wide --no-headers
+
+# From a distributor pod, test 7946 to an ingester IP
+DIST=$(oc get pods -n openshift-logging \
+  -l app.kubernetes.io/component=distributor \
+  -o jsonpath="{.items[0].metadata.name}")
+
+ING_IP=$(oc get pods -n openshift-logging \
+  -l app.kubernetes.io/component=ingester \
+  -o jsonpath="{.items[0].status.podIP}")
+
+oc exec -n openshift-logging "$DIST" -- \
+  wget -qO- --timeout=3 \
+  "http://${ING_IP}:7946" 2>&1 || true
+
+
+oc get networkpolicy -n openshift-logging
+
+# Check if any policy restricts inter-pod traffic on 7946
+oc get networkpolicy -n openshift-logging -o json \
+  | jq -r ".items[].metadata.name"
+
+
+# Get the exact error
+oc logs -n openshift-logging \
+  -l app.kubernetes.io/component=lokistack-gateway \
+  --tail=200 \
+  | grep -iE "x509|certificate|tls"
+
+
+oc get lokistack -n openshift-logging \
+  -o json \
+  | jq -r ".items[0].spec.storage.tls"
+
+oc get proxy cluster \
+  -o jsonpath="{.spec.trustedCA.name}"
+
+# Check if the injection label is present
+oc get configmap -n openshift-logging \
+  -l config.openshift.io/inject-trusted-cabundle=true \
+  --no-headers
+
+
+# Decode your storage endpoint
+oc get secret -n openshift-logging \
+  $(oc get lokistack -n openshift-logging \
+  -o jsonpath="{.items[0].spec.storage.secret.name}") \
+  -o jsonpath="{.data.endpoint_suffix}" \
+  | base64 -d 2>/dev/null
+
+ACCT=$(oc get secret -n openshift-logging \
+  $(oc get lokistack -n openshift-logging \
+  -o jsonpath="{.items[0].spec.storage.secret.name}") \
+  -o jsonpath="{.data.account_name}" \
+  | base64 -d 2>/dev/null)
+
+# Test connectivity from a Loki pod
+oc exec -n openshift-logging \
+  $(oc get pods -n openshift-logging \
+  -l app.kubernetes.io/component=compactor \
+  -o jsonpath="{.items[0].metadata.name}" \
+  2>/dev/null) -- \
+  wget -qO- --timeout=5 \
+  "https://${ACCT}.blob.core.windows.net/" \
+  2>&1 | head -5
+
+
+
 #!/bin/bash
 ######################################################
 
