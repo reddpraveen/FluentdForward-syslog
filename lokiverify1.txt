@@ -1,4 +1,94 @@
 
+# See what buffer config the Operator actually generated:
+COLLECTOR_POD=$(oc get pods -n openshift-logging -l component=collector -o jsonpath='{.items[0].metadata.name}')
+oc exec -n openshift-logging $COLLECTOR_POD -c collector -- cat /etc/vector/vector.toml | grep -A 10 '\[sinks\..*\.buffer\]'
+
+Delivery Mode
+Buffer Type
+Default max_size
+when_full Behavior
+AtMostOnce
+Memory
+~100MB
+drop_newest
+AtLeastOnce
+Disk
+256MB (fixed)
+block (source pauses)
+
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: instance
+  namespace: openshift-logging
+spec:
+  outputs:
+  - name: syslog-output
+    type: syslog
+    syslog:
+      url: tcp://syslog.example.com:514
+      # ✅ These tuning fields ARE configurable:
+      tuning:
+        deliveryMode: AtLeastOnce        # AtLeastOnce | AtMostOnce
+        compression: gzip                # none | gzip | snappy | zstd
+        maxRetryDuration: 60             # seconds
+        minRetryDuration: 1              # seconds  
+        maxWrite: 10M                    # max batch size (e.g., 1M, 10M, 100M)
+      # ❌ These fields are NOT exposed in CLF API:
+      # buffer:
+      #   max_size: 256M                 # <-- NOT AVAILABLE
+      #   when_full: block               # <-- NOT AVAILABLE
+
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: prod-forwarder
+  namespace: openshift-logging
+spec:
+  serviceAccount:
+    name: log-collector
+  
+  # ✅ Filter logs BEFORE they consume buffer space
+  inputs:
+  - name: prod-apps
+    type: application
+    application:
+      includes:
+      - namespace: "prod-*"
+      excludes:
+      - namespace: "openshift-*"
+  
+  filters:
+  # Keep only warning+ errors from prod namespaces
+  - name: severity-filter
+    type: drop
+    drop:
+    - test:
+      - field: .level
+        notMatches: "^(warn|warning|error|err|fatal|critical)$"
+  
+  outputs:
+  - name: syslog-prod
+    type: syslog
+    syslog:
+      url: tcp://siem.example.com:6514
+      facility: local0
+      # ✅ Tuning: prioritize durability over throughput
+      tuning:
+        deliveryMode: AtLeastOnce    # Disk buffer, blocks on full
+        compression: gzip            # Reduce network/storage
+        maxWrite: 5M                 # Smaller batches = faster retry
+        minRetryDuration: 2
+        maxRetryDuration: 30
+  
+  pipelines:
+  - name: prod-to-siem
+    inputRefs: [prod-apps]
+    filterRefs: [severity-filter]
+    outputRefs: [syslog-prod]
+
+
+
 
 This is an addendum to the CLF syslog configuration examples. Two important optimizations were missing that we strongly recommend: log-level filtering and buffer tuning. These directly impact how much resource the collector uses on each node and how long the buffer can sustain an outage.
 
