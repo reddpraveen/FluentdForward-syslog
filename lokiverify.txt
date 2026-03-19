@@ -1,3 +1,22 @@
+
+
+# Check if proxy env vars are set on Loki pods
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- env | grep -iE "proxy|PROXY"
+
+# Check cluster-wide proxy config
+oc get proxy cluster -o jsonpath="{.spec}" | jq .
+
+# Check the NO_PROXY setting specifically
+oc get proxy cluster -o jsonpath="{.status.noProxy}"
+
+# Check the NO_PROXY setting specifically
+oc get proxy cluster -o jsonpath="{.status.noProxy}"
+
+# Quick test - bypass proxy and curl directly
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt "https://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].status.podIP}"):3100/ready"
+
+------------------------
+
 # ======================================================
 # 1. List all secrets with cert/tls in name for Loki
 # ======================================================
