@@ -1,3 +1,16 @@
+
+# List the keys inside the Loki ConfigMap
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data | keys[]"
+# Get the actual config key (likely config.yaml or loki.yaml)
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[\"config.yaml\"]" | head -80
+# If config.yaml is empty try runtime-config.yaml
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[\"runtime-config.yaml\"]" | head -80
+# Also check if there is a separate config configmap
+oc get configmap -n openshift-logging --no-headers | grep -i loki
+# Check the actual Loki process args to find config path
+oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o json | jq -r ".items[0].spec.containers[0].args[]"
+
+============
 # Get the full Loki config (look for addresses)
 oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | head -100
 
