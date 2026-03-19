@@ -1,3 +1,117 @@
+
+
+
+
+
+THE PROBLEM AS WE UNDERSTAND IT
+
+Your applications currently send syslog messages directly to the xxx syslog server for real-time production support alerts consumed by yyy monitoring. When the syslog server goes down, messages are lost because there is no retry or buffering mechanism in your application code.
+
+
+WHAT THE PLATFORM CAN OFFER (AT NO ADDITIONAL LICENSING COST)
+
+OpenShift Logging 6.x includes a ClusterLogForwarder (CLF) resource that uses Vector as the log collector. Vector already runs as a DaemonSet on every node, collecting container logs. We can configure it to forward your application logs to your syslog server with built-in delivery guarantees.
+
+Two delivery modes are available:
+
+1. AtMostOnce (default) - Logs are sent once. If the collector restarts or the destination is unavailable, logs in flight may be lost. This is similar to what your apps do today, but centralized.
+
+2. AtLeastOnce (recommended for your use case) - Logs are buffered to disk on each node before being sent. If the collector restarts or the syslog server is temporarily down, buffered logs are retried and re-sent once the server recovers. The trade-off is that some logs may be duplicated after a crash (the same alert may arrive twice), which is generally acceptable for alerting use cases.
+
+How AtLeastOnce works in practice:
+- Your app writes a log line to stdout/stderr as it normally does.
+- Vector picks it up from the container log file on the node.
+- Before sending to syslog, Vector writes the event to a disk-based write-ahead log on the node.
+- Vector sends the log to your syslog server over TCP/TLS.
+- If the send fails (server down, network issue), Vector retries with exponential backoff, starting at a configurable minimum interval (e.g. 5 seconds) and capping at a configurable maximum (e.g. 5 minutes).
+- If the Vector pod restarts, it reads unsent events from the disk buffer and retries them.
+- Once the disk buffer reaches its size limit, behavior depends on configuration: it can either block (stop accepting new events until space frees up) or drop the newest events.
+
+Example: If your syslog server goes down for 10 minutes and your app produces 500 log lines during that window, those 500 lines sit in the disk buffer on each node and are delivered once the server comes back.
+
+IMPORTANT CAVEATS:
+- The syslog protocol (TCP) does not provide application-level acknowledgment like HTTP or Kafka. Vector relies on TCP connection status to detect failures. This covers server-down and network-drop scenarios well, but cannot detect scenarios where the syslog server accepts the TCP connection but silently drops the message internally.
+- Disk buffers are per-node and bounded. They do not provide infinite retention. If the syslog server is down for a very long time and the buffer fills up, the oldest or newest events will be dropped depending on configuration.
+- AtLeastOnce adds disk I/O on every node. Under high log volume with a prolonged outage, this can increase disk and memory pressure on the node, which may affect other workloads sharing that node.
+
+
+ALTERNATIVE: AZURE EVENT HUBS AS A DURABLE BUFFER
+
+If zero message loss is a hard requirement even during extended outages (hours, not minutes), we can place Azure Event Hubs between the CLF and your syslog server. The flow would be:
+
+  App pods -> Vector (CLF) -> Azure Event Hubs -> Consumer app -> Syslog/WSS server
+
+Event Hubs provides durable, partitioned storage with up to 7 days retention (Standard tier). Even if both the collector and the syslog server are down simultaneously, events are safely stored in Event Hubs and replayed when the consumer recovers.
+
+This option has a recurring Azure cost. Rough estimates for Standard tier:
+- 1 Throughput Unit (handles up to 1 MB/s ingress, 1000 events/sec): approximately $22-35/month
+- Ingress events: approximately $0.028 per million events
+- A lightweight consumer (Azure Function on consumption plan) to read from Event Hubs and forward to syslog: approximately $0-5/month
+- Total estimate for moderate alerting volume: approximately $35-70/month
+
+This is the most resilient option but adds infrastructure complexity (Event Hubs namespace, consumer application, monitoring of the consumer).
+
+
+COST SUMMARY
+
+Option A - CLF with AtLeastOnce: $0 additional licensing or Azure cost. The Logging Operator and Vector collector are included with the OCP subscription. Incremental resource usage on existing nodes is the only impact.
+
+Option B - CLF + Azure Event Hubs: Approximately $35-70/month for Standard tier, depending on volume. Plus engineering effort to build and maintain the consumer component.
+
+
+QUESTIONS WE NEED ANSWERED BEFORE PROCEEDING
+
+To design the right solution and set the correct tuning parameters, we need the following information from your team:
+
+Outage Profile:
+- How often does your syslog/WSS server go down, and what is the typical duration? (Minutes? Hours? Days?)
+- What is the longest outage you have experienced or anticipate?
+- Is there a planned HA or failover mechanism for the syslog server, or is it a single instance?
+
+Log Volume and Pattern:
+- What is your approximate log volume in messages per second (or per minute) during normal operations?
+- What is your peak log volume during incidents or high-activity periods?
+- What is the average size of a single syslog message from your applications?
+
+Current Syslog Configuration:
+- What protocol are you currently using to send to syslog: UDP, TCP, or TLS?
+- What syslog RFC format does your WSS server expect: RFC3164 or RFC5424?
+- What facility and severity values do you use today?
+- Do you send structured data (key-value pairs) in your syslog messages, or plain text?
+
+Forwarding Destinations:
+- Is syslog the only destination for these logs, or do they also go to Splunk, Dynatrace, or other systems?
+- If multiple destinations, should the CLF forward to all of them, or only to syslog? (This matters because each additional output adds load to the Vector collector on every node.)
+- Are there existing CLF pipelines on the cluster that forward to Splunk or Dynatrace today?
+
+Node and Namespace Context:
+- Which namespaces (projects) do your applications run in? (We need this to scope the CLF pipeline so we only forward your logs, not all application logs on the cluster.)
+- Are your namespaces running on shared worker nodes with other teams' workloads, or on dedicated node pools?
+- What are the current resource utilization levels on those nodes? (We can pull this from monitoring, but good to know if you are already running near capacity.)
+
+Retry and Retention Requirements:
+- What is the maximum amount of time you need logs to be buffered during an outage? (e.g. 15 minutes, 1 hour, 4 hours)
+- What is an acceptable disk buffer size per node? (e.g. 256 MB, 512 MB, 1 GB)
+- When the buffer is full, what is the preferred behavior: block new logs (protects against loss but may slow other log forwarding) or drop newest logs (protects pipeline health but loses the most recent messages)?
+- Is receiving duplicate messages acceptable? (AtLeastOnce can produce duplicates after a collector restart.)
+
+Acceptable Message Loss:
+- Is this a best-effort alerting mechanism (some loss during extended outages is tolerable), or is zero message loss a hard compliance/audit requirement?
+- If some loss is acceptable, what is the tolerable threshold? (e.g. up to 5 minutes of logs can be lost)
+
+
+NEXT STEPS
+
+Once we have your answers, we will:
+1. Design the CLF configuration with appropriate tuning parameters.
+2. Test in nonprod with a simulated syslog outage to validate retry behavior and measure resource impact.
+3. Provide a detailed resource impact assessment (CPU, memory, disk) based on your actual log volume.
+4. If Event Hubs is needed, provide a detailed architecture and cost estimate.
+
+Please review and let us know if you have any questions. We would be happy to set up a call to walk through the options.
+
+
+
 # Check the Vector config to see the actual URL it sends to
 oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- cat /etc/vector/vector.toml 2>/dev/null | grep -iE "endpoint|uri|url|loki" | head -10
 # If not toml try yaml
