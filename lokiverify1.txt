@@ -1,3 +1,15 @@
+# Check the Vector config to see the actual URL it sends to
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- cat /etc/vector/vector.toml 2>/dev/null | grep -iE "endpoint|uri|url|loki" | head -10
+# If not toml try yaml
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- cat /etc/vector/vector.yaml 2>/dev/null | grep -iE "endpoint|uri|url|loki" | head -10
+# Also check for any generated config
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- find /etc/vector -type f 2>/dev/null
+# Test from the collector pod itself with noproxy
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- curl -ksS --noproxy "*" "https://logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080/api/logs/v1/infrastructure/loki/api/v1/labels" 2>&1 | head -10
+# Same test WITHOUT noproxy to see if Squid intercepts
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=collector -o jsonpath="{.items[0].metadata.name}") -c collector -- curl -ksS "https://logging-loki-gateway-http.openshift-logging.svc.cluster.local:8080/api/logs/v1/infrastructure/loki/api/v1/labels" 2>&1 | head -10
+
+
 
 # Collector errors specifically
 oc logs -n openshift-logging -l app.kubernetes.io/component=collector -c collector --tail=50 | grep -iE "403|error|drop|loki"
