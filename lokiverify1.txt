@@ -1,4 +1,131 @@
+This is the simplest configuration. Logs are forwarded to syslog with no disk persistence. If the syslog server is down or Vector restarts, any logs that were in flight are lost.
 
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: collector
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: logcollector
+  outputs:
+    - name: wss-syslog
+      type: syslog
+      syslog:
+        facility: local0               # <-- QUESTION: What facility do you use today?
+        rfc: RFC5424                    # <-- QUESTION: RFC3164 or RFC5424?
+        severity: informational         # <-- QUESTION: What severity level?
+        enrichment: KubernetesMinimal   # Adds namespace, pod, container to message
+        tuning:
+          deliveryMode: AtMostOnce      # No disk buffer, logs can be lost
+      url: tls://wss-syslog.example.com:6514   # <-- QUESTION: What is your syslog URL and port?
+      tls:
+        ca:
+          key: ca-bundle.crt
+          secretName: wss-syslog-tls    # <-- QUESTION: Do you use TLS? If yes, provide CA cert
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application                   # Collects all application container logs
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-your-namespaces          # <-- QUESTION: Which namespaces are yours?
+  filters:
+    - name: only-your-namespaces
+      type: drop
+      drop:
+        - test:
+            - field: .kubernetes.namespace_name
+              notMatches: "project-cc|project-cc-staging"   # <-- Your namespace(s) go here
+
+Behavior when syslog server is down:
+- Vector attempts to send, TCP connection fails
+- Logs are dropped immediately, no retry
+- Other outputs (Splunk, Dynatrace) are NOT affected
+- Node resource impact: minimal (no extra disk I/O)
+
+
+=========================================================
+OPTION B: AtLeastOnce (Recommended - Retry with Disk Buffer)
+=========================================================
+
+Logs are written to a disk-based write-ahead log on each node before being sent. If syslog is down, Vector retries. If Vector restarts, it picks up from where it left off.
+
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: collector
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: logcollector
+  outputs:
+    - name: wss-syslog
+      type: syslog
+      syslog:
+        facility: local0
+        rfc: RFC5424
+        severity: informational
+        enrichment: KubernetesMinimal
+        tuning:
+          deliveryMode: AtLeastOnce     # Enables disk buffer + retry
+          minRetryDuration: 5s          # <-- QUESTION: How quickly should we retry? (first retry after 5 seconds)
+          maxRetryDuration: 5m          # <-- QUESTION: Maximum wait between retries? (caps at 5 minutes)
+      url: tls://wss-syslog.example.com:6514
+      tls:
+        ca:
+          key: ca-bundle.crt
+          secretName: wss-syslog-tls
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-your-namespaces
+  filters:
+    - name: only-your-namespaces
+      type: drop
+      drop:
+        - test:
+            - field: .kubernetes.namespace_name
+              notMatches: "project-cc|project-cc-staging"
+
+Behavior when syslog server is down:
+- Vector writes logs to disk buffer on the node (write-ahead log)
+- Retries sending with exponential backoff: 5s, 10s, 20s, 40s, ... up to 5m max
+- When syslog comes back, all buffered logs are delivered
+- If Vector pod restarts, it reads from disk buffer and continues
+- TRADE-OFF: Some logs may be sent twice after a crash (duplicates)
+
+When the disk buffer fills up (this is a CRITICAL question for your team):
+
+  Behavior 1 - BLOCK (default with AtLeastOnce):
+  - Vector stops accepting new log events for the syslog output
+  - Backpressure propagates upstream, which can slow down ALL sinks
+  - This means your Splunk and Dynatrace forwarding could also be affected
+  - Pro: zero log loss as long as buffer has space
+  - Con: impacts other log destinations during prolonged outage
+
+  Behavior 2 - DROP NEWEST:
+  - Vector drops the newest incoming syslog-destined events
+  - Other sinks (Splunk, Dynatrace) continue operating normally
+  - Pro: isolates the problem to syslog only
+  - Con: you lose the most recent logs during extended outage
+
+  NOTE: The CLF API currently maps AtLeastOnce to block behavior. If you
+  need drop-newest isolation, we may need to evaluate whether the CLF tuning
+  spec exposes that knob, or whether we need a custom Vector config override.
+
+Node resource impact:
+- Disk I/O: each log event is written to disk before sending (write-ahead log)
+- Memory: bounded by the collector pod memory limit (recommend 1-2 Gi)
+- CPU: minimal incremental overhead (Red Hat best practice: do NOT set CPU limits on Vector)
+- Disk space: bounded by buffer max_size (we need your input on acceptable size)
 
 
 
