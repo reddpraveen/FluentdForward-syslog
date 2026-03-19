@@ -1,4 +1,13 @@
+# Check how Loki resolves other components in its config
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "memberlist|join_members|ring|compactor_address|query_frontend|distributor|ingester"
 
+# Check the memberlist join address specifically
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -A2 -iE "join_members|memberlist"
+
+# Check curl version in the pod
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl --version | head -1
+
+-----------------------
 # Test curl WITHOUT --noproxy to a pod IP on 3100
 oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS "https://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].status.podIP}"):3100/ready" 2>&1
 
