@@ -1,3 +1,18 @@
+# Get the full Loki config (look for addresses)
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | head -100
+
+# Get more of the config
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "address|host|url|endpoint|server" | head -30
+
+# Check the compactor and ingester logs for the actual proxy error
+oc logs -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].metadata.name}") --tail=50 | grep -iE "proxy|squid|403|CONNECT" | head -10
+
+# Check if Loki components are actually hitting the proxy
+oc logs -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") --tail=100 | grep -iE "proxy|squid|403|CONNECT|ERR_ACCESS" | head -10
+
+
+
+===============
 # Check how Loki resolves other components in its config
 oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "memberlist|join_members|ring|compactor_address|query_frontend|distributor|ingester"
 
