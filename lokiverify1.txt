@@ -1,3 +1,18 @@
+
+# Collector errors specifically
+oc logs -n openshift-logging -l app.kubernetes.io/component=collector -c collector --tail=50 | grep -iE "403|error|drop|loki"
+# Check the CLF output configuration
+oc get clusterlogforwarder -n openshift-logging -o yaml
+# Check the collector SA token
+oc get sa -n openshift-logging | grep collector
+# Check if the collector SA has the required cluster role
+oc get clusterrolebinding | grep -i "logging\|collector\|loki"
+# Check the gateway logs for auth rejections from collectors
+oc logs -n openshift-logging -l app.kubernetes.io/component=lokistack-gateway --tail=100 | grep -iE "401|403|auth|denied|forbid"
+
+
+
+
 # Are components actually talking to each other right now
 oc logs -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") --tail=30
 # Same for ingester
