@@ -1,0 +1,768 @@
+#!/bin/bash
+######################################################
+# loki-diag.sh v2
+# OCP LokiStack Logging 6.0+ Diagnostic Script
+# Based on real production troubleshooting findings
+# and Red Hat official documentation coverage
+# Read-only: uses only get, describe, exec, logs
+# Usage: bash loki-diag.sh [namespace]
+######################################################
+set -uo pipefail
+
+# Help
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+	printf "Usage: %s [namespace]\n" "$0"
+	printf "  namespace: OCP namespace with LokiStack "
+	printf "(default: openshift-logging)\n"
+	exit 0
+fi
+
+readonly NS="${1:-openshift-logging}"
+readonly SEP="======================================================"
+readonly TIMEOUT="--request-timeout=30s"
+ISSUES=""
+ISSUE_COUNT=0
+PROTO="unknown"
+
+log_section() {
+	printf "\n%s\n[SECTION %s] %s\n%s\n" \
+		"$SEP" "$1" "$2" "$SEP"
+}
+
+chk()  { printf "\n-- %s --\n" "$1"; }
+ok()   { printf "  [OK]   %s\n" "$1"; }
+warn() { printf "  [WARN] %s\n" "$1"; }
+fail() {
+	printf "  [FAIL] %s\n" "$1"
+	ISSUE_COUNT=$((ISSUE_COUNT + 1))
+	ISSUES="${ISSUES}ISSUE ${ISSUE_COUNT}: $1\n"
+}
+info() { printf "  [INFO] %s\n" "$1"; }
+
+######################################################
+# PRE-FLIGHT
+######################################################
+log_section "0" "PRE-FLIGHT"
+
+chk "Cluster access"
+if ! oc whoami $TIMEOUT 1>/dev/null 2>&1; then
+	fail "Cannot reach cluster -- run oc login first"
+	exit 1
+fi
+CLUSTER_USER=$(oc whoami 2>/dev/null)
+ok "Logged in as $CLUSTER_USER"
+
+chk "Namespace exists"
+if ! oc get namespace "$NS" $TIMEOUT 1>/dev/null 2>&1; then
+	fail "Namespace $NS not found"
+	exit 1
+fi
+ok "Namespace $NS exists"
+
+######################################################
+# 1. COLLECTOR RBAC
+######################################################
+log_section "1" "COLLECTOR RBAC (most common after upgrades)"
+
+chk "Collector ServiceAccount"
+COLLECTOR_SA=$(oc get sa -n "$NS" $TIMEOUT \
+	--no-headers 2>/dev/null \
+	| grep -i collector \
+	| awk '{print $1}' | head -1)
+if [ -z "$COLLECTOR_SA" ]; then
+	fail "No collector ServiceAccount found in $NS"
+else
+	ok "Collector SA: $COLLECTOR_SA"
+fi
+
+chk "Collector ClusterRoleBindings"
+CRB_COUNT=0
+oc get clusterrolebinding $TIMEOUT --no-headers \
+	2>/dev/null \
+	| grep -iE "logging|collector|loki" \
+	| awk '{print $1}' \
+	| while IFS= read -r CRB; do
+	ROLE=$(oc get clusterrolebinding "$CRB" \
+		-o jsonpath="{.roleRef.name}" 2>/dev/null)
+	SA=$(oc get clusterrolebinding "$CRB" -o json \
+		2>/dev/null \
+		| jq -r ".subjects[]? | select(.namespace == \"$NS\") | .name" \
+		| head -1)
+	if [ -n "$SA" ]; then
+		ok "$CRB -> role=$ROLE sa=$SA"
+	fi
+done
+
+chk "Logging 6.x required roles"
+for ROLE in cluster-logging-application-view \
+	cluster-logging-infrastructure-view; do
+	if oc get clusterrole "$ROLE" $TIMEOUT \
+		1>/dev/null 2>&1; then
+		BOUND=$(oc get clusterrolebinding $TIMEOUT \
+			--no-headers 2>/dev/null \
+			| grep "$ROLE" || true)
+		if [ -n "$BOUND" ]; then
+			ok "$ROLE exists and is bound"
+		else
+			fail "$ROLE exists but NOT bound"
+		fi
+	else
+		info "$ROLE not found (may use different naming)"
+	fi
+done
+
+######################################################
+# 2. LOKISTACK AND OPERATOR
+######################################################
+log_section "2" "LOKISTACK AND OPERATOR"
+
+chk "Loki Operator"
+oc get csv -n openshift-operators-redhat $TIMEOUT \
+	--no-headers 2>/dev/null \
+	| grep -i loki \
+	|| fail "Loki Operator CSV not found"
+
+LOKI_NAME=""
+LOKI_NAME=$(oc get lokistack -n "$NS" $TIMEOUT \
+	-o jsonpath="{.items[0].metadata.name}" \
+	2>/dev/null) || true
+if [ -z "$LOKI_NAME" ]; then
+	fail "No LokiStack in $NS"
+	exit 1
+fi
+ok "LokiStack: $LOKI_NAME"
+
+# Cache LokiStack JSON for reuse
+LOKI_JSON=$(oc get lokistack "$LOKI_NAME" -n "$NS" \
+	$TIMEOUT -o json 2>/dev/null)
+
+chk "LokiStack conditions"
+DEGRADED=$(echo "$LOKI_JSON" \
+	| jq -r '.status.conditions[]? | select(.type == "Degraded") | .status')
+READY=$(echo "$LOKI_JSON" \
+	| jq -r '.status.conditions[]? | select(.type == "Ready") | .status')
+PENDING=$(echo "$LOKI_JSON" \
+	| jq -r '.status.conditions[]? | select(.type == "Pending") | .status')
+if [ "$READY" = "True" ]; then
+	ok "LokiStack is Ready"
+elif [ "$DEGRADED" = "True" ]; then
+	fail "LokiStack is Degraded"
+elif [ "$PENDING" = "True" ]; then
+	warn "LokiStack is Pending"
+else
+	warn "LokiStack condition unclear"
+fi
+echo "$LOKI_JSON" | jq -r '.status.conditions[]? | "  " + .type + ": " + .status + " -- " + (.reason // "") + " " + (.message // "")' || true
+
+chk "LokiStack config summary"
+SIZE=$(echo "$LOKI_JSON" | jq -r '.spec.size // "unknown"')
+STYPE=$(echo "$LOKI_JSON" | jq -r '.spec.storage.secret.type // "unknown"')
+SNAME=$(echo "$LOKI_JSON" | jq -r '.spec.storage.secret.name // "unknown"')
+TMODE=$(echo "$LOKI_JSON" | jq -r '.spec.tenants.mode // "unknown"')
+info "Size=$SIZE Storage=$STYPE Secret=$SNAME Tenants=$TMODE"
+
+chk "Schema version"
+SCHEMA_VER=$(echo "$LOKI_JSON" \
+	| jq -r '.spec.storage.schemas[-1].version // "unknown"')
+if [ "$SCHEMA_VER" = "v13" ]; then
+	ok "Using recommended schema v13"
+elif [ "$SCHEMA_VER" = "unknown" ]; then
+	warn "Schema version not set (using default)"
+else
+	info "Schema: $SCHEMA_VER (v13 recommended for retention)"
+fi
+
+chk "Replication factor and zone awareness"
+REPL=$(echo "$LOKI_JSON" \
+	| jq -r '.spec.replicationFactor // .spec.replication.factor // "1"')
+if [ "$REPL" -ge 2 ] 2>/dev/null; then
+	ok "Replication factor $REPL (zone-failure resilient)"
+else
+	warn "Replication factor ${REPL:-1} (single zone failure risk)"
+fi
+
+######################################################
+# 3. POD HEALTH
+######################################################
+log_section "3" "POD HEALTH"
+
+chk "All Loki pods"
+oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/managed-by=lokistack-controller \
+	-o wide --no-headers 2>/dev/null
+
+chk "Unhealthy pods"
+UNHEALTHY=$(oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/managed-by=lokistack-controller \
+	-o json 2>/dev/null \
+	| jq -r '.items[] | select(.status.containerStatuses[]? | (.ready == false) or (.restartCount > 5) or (.lastState.terminated.reason == "OOMKilled")) | .metadata.name + " ready=" + (.status.containerStatuses[0].ready | tostring) + " restarts=" + (.status.containerStatuses[0].restartCount | tostring) + " reason=" + (.status.containerStatuses[0].lastState.terminated.reason // "none")')
+if [ -n "$UNHEALTHY" ]; then
+	fail "Unhealthy pods found:"
+	printf "%s\n" "$UNHEALTHY"
+else
+	ok "All Loki pods healthy"
+fi
+
+chk "Collector pods"
+COLL_COUNT=$(oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/component=collector \
+	--no-headers 2>/dev/null | wc -l)
+COLL_READY=$(oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/component=collector \
+	--no-headers 2>/dev/null \
+	| awk '/Running/ {c++} END {print c+0}')
+if [ "$COLL_COUNT" -eq 0 ]; then
+	fail "No collector pods found"
+else
+	info "Collector pods: $COLL_READY/$COLL_COUNT running"
+fi
+
+chk "PodDisruptionBudgets"
+PDB_COUNT=$(oc get pdb -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/managed-by=lokistack-controller \
+	--no-headers 2>/dev/null | wc -l)
+if [ "$PDB_COUNT" -gt 0 ]; then
+	ok "Found $PDB_COUNT Loki PDB(s)"
+else
+	warn "No Loki PodDisruptionBudgets found"
+fi
+
+######################################################
+# 4. SERVICES AND ENDPOINTS
+######################################################
+log_section "4" "SERVICES AND ENDPOINTS"
+
+chk "Loki services"
+oc get svc -n "$NS" $TIMEOUT --no-headers \
+	| grep -i loki
+
+chk "Services with no endpoints"
+SVC_ISSUES=0
+oc get svc -n "$NS" $TIMEOUT --no-headers \
+	| grep -i loki | awk '{print $1}' \
+	| while IFS= read -r SVC; do
+	EP=$(oc get endpoints "$SVC" -n "$NS" $TIMEOUT \
+		-o json 2>/dev/null \
+		| jq -r "[.subsets[]?.addresses[]?] | length")
+	if [ "$EP" = "0" ] || [ -z "$EP" ]; then
+		fail "Service $SVC has 0 endpoints"
+	fi
+done
+
+chk "Gossip ring service"
+GOSSIP_SVC=$(oc get svc -n "$NS" $TIMEOUT \
+	--no-headers 2>/dev/null \
+	| grep gossip-ring | awk '{print $1}')
+if [ -z "$GOSSIP_SVC" ]; then
+	fail "Gossip ring service missing"
+else
+	GOSSIP_EP=$(oc get endpoints "$GOSSIP_SVC" \
+		-n "$NS" $TIMEOUT -o json 2>/dev/null \
+		| jq -r "[.subsets[]?.addresses[]?] | length")
+	if [ "$GOSSIP_EP" = "0" ] || [ -z "$GOSSIP_EP" ]; then
+		fail "Gossip ring: 0 endpoints"
+	else
+		ok "Gossip ring: $GOSSIP_EP endpoint(s)"
+	fi
+fi
+
+######################################################
+# 5. COLLECTOR ERRORS
+######################################################
+log_section "5" "COLLECTOR ERRORS"
+
+chk "Collector log errors"
+COLL_ERRS=$(oc logs -n "$NS" \
+	-l app.kubernetes.io/component=collector \
+	-c collector --tail=200 2>/dev/null \
+	| grep -iE "403|forbidden|error|drop|timeout|refused" \
+	| sort -u | tail -15 || true)
+if [ -n "$COLL_ERRS" ]; then
+	HAS_403=$(echo "$COLL_ERRS" | grep -c "403" || true)
+	HAS_403=${HAS_403:-0}
+	HAS_DROP=$(echo "$COLL_ERRS" \
+		| grep -ci "drop\|exhausted" || true)
+	HAS_DROP=${HAS_DROP:-0}
+	if [ "$HAS_403" -gt 0 ]; then
+		fail "Collector getting 403 from LokiStack"
+		info "Most likely: missing RBAC (Section 1)"
+		info "Also check: proxy interception (Section 8)"
+	fi
+	if [ "$HAS_DROP" -gt 0 ]; then
+		fail "Collector dropping events"
+	fi
+	printf "%s\n" "$COLL_ERRS"
+else
+	ok "No collector errors found"
+fi
+
+######################################################
+# 6. mTLS AND PORT 3100
+######################################################
+log_section "6" "mTLS AND PORT 3100 READINESS"
+
+chk "Detecting HTTP vs HTTPS on port 3100"
+DIST_POD=$(oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/component=distributor \
+	-o jsonpath="{.items[0].metadata.name}" 2>/dev/null)
+if [ -z "$DIST_POD" ]; then
+	fail "No distributor pod found"
+else
+	HTTP_TEST=$(oc exec -n "$NS" "$DIST_POD" -- \
+		sh -c 'curl -ksS --noproxy "*" --connect-timeout 3 http://localhost:3100/ready' \
+		2>&1 || true)
+	HTTPS_TEST=$(oc exec -n "$NS" "$DIST_POD" -- \
+		sh -c 'curl -ksS --noproxy "*" --connect-timeout 3 https://localhost:3100/ready' \
+		2>&1 || true)
+
+	if echo "$HTTPS_TEST" | grep -qi "ready"; then
+		ok "Port 3100 serves HTTPS (mTLS enabled)"
+		PROTO="https"
+	elif echo "$HTTP_TEST" | grep -qi "ready"; then
+		ok "Port 3100 serves HTTP (no mTLS)"
+		PROTO="http"
+	elif echo "$HTTP_TEST" | grep -qi "HTTPS server"; then
+		info "Port 3100 requires HTTPS (mTLS)"
+		PROTO="https"
+	else
+		fail "Port 3100 not responding"
+		PROTO="unknown"
+	fi
+fi
+
+if [ "$PROTO" = "https" ]; then
+	chk "mTLS readiness per component"
+	for C in distributor ingester querier compactor; do
+		POD=$(oc get pods -n "$NS" $TIMEOUT \
+			-l "app.kubernetes.io/component=$C" \
+			-o jsonpath="{.items[0].metadata.name}" \
+			2>/dev/null)
+		if [ -z "$POD" ]; then
+			warn "No $C pod"
+			continue
+		fi
+		RES=$(oc exec -n "$NS" "$POD" -- \
+			sh -c 'curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt https://localhost:3100/ready' \
+			2>&1 || true)
+		if echo "$RES" | grep -qi "ready"; then
+			ok "$C READY with mTLS"
+		else
+			fail "$C NOT READY: $(printf "%.100s" "$RES")"
+		fi
+	done
+fi
+
+######################################################
+# 7. RING AND MEMBERLIST
+######################################################
+log_section "7" "RING AND MEMBERLIST"
+
+if [ -n "$DIST_POD" ]; then
+	chk "Ring status"
+	if [ "$PROTO" = "https" ]; then
+		RING_OUT=$(oc exec -n "$NS" "$DIST_POD" -- \
+			sh -c 'curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt https://localhost:3100/ring' \
+			2>&1 || true)
+	else
+		RING_OUT=$(oc exec -n "$NS" "$DIST_POD" -- \
+			sh -c 'curl -ksS --noproxy "*" http://localhost:3100/ring' \
+			2>&1 || true)
+	fi
+
+	if echo "$RING_OUT" | grep -qi "empty"; then
+		fail "Ring is EMPTY"
+	elif echo "$RING_OUT" | grep -qi "UNHEALTHY"; then
+		fail "Ring has UNHEALTHY members"
+		echo "$RING_OUT" | grep -i "UNHEALTHY" | head -5
+	elif echo "$RING_OUT" | grep -qi "ACTIVE"; then
+		ACTIVE_COUNT=$(echo "$RING_OUT" \
+			| grep -ci "ACTIVE" || true)
+		ACTIVE_COUNT=${ACTIVE_COUNT:-0}
+		ok "Ring: $ACTIVE_COUNT ACTIVE member(s)"
+	else
+		warn "Ring returned unexpected output"
+	fi
+
+	chk "Memberlist status"
+	if [ "$PROTO" = "https" ]; then
+		ML_OUT=$(oc exec -n "$NS" "$DIST_POD" -- \
+			sh -c 'curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt https://localhost:3100/memberlist' \
+			2>&1 || true)
+	else
+		ML_OUT=$(oc exec -n "$NS" "$DIST_POD" -- \
+			sh -c 'curl -ksS --noproxy "*" http://localhost:3100/memberlist' \
+			2>&1 || true)
+	fi
+
+	ML_HEALTH=$(echo "$ML_OUT" \
+		| sed -n 's/.*Health Score: \([0-9]*\).*/\1/p' \
+		| head -1)
+	ML_HEALTH=${ML_HEALTH:-unknown}
+	ML_MEMBERS=$(echo "$ML_OUT" \
+		| sed -n 's/.*Members: \([0-9]*\).*/\1/p' \
+		| head -1)
+	ML_MEMBERS=${ML_MEMBERS:-unknown}
+	if [ "$ML_HEALTH" = "0" ]; then
+		ok "Memberlist healthy (score=0, members=$ML_MEMBERS)"
+	elif [ "$ML_HEALTH" = "unknown" ]; then
+		warn "Could not read memberlist health"
+	else
+		fail "Memberlist unhealthy (score=$ML_HEALTH)"
+	fi
+
+	chk "Memberlist join errors"
+	JOIN_ERRS=$(oc logs -n "$NS" "$DIST_POD" \
+		--tail=200 2>/dev/null \
+		| grep -iE "failed to join|memberlist.*err|7946.*refused" \
+		| tail -5 || true)
+	if [ -n "$JOIN_ERRS" ]; then
+		fail "Memberlist join errors:"
+		printf "%s\n" "$JOIN_ERRS"
+	else
+		ok "No memberlist join errors"
+	fi
+fi
+
+######################################################
+# 8. PROXY AND NETWORK
+######################################################
+log_section "8" "PROXY AND NETWORK"
+
+chk "Cluster proxy config"
+HTTP_PROXY_URL=$(oc get proxy cluster $TIMEOUT \
+	-o jsonpath="{.spec.httpProxy}" 2>/dev/null)
+HTTPS_PROXY_URL=$(oc get proxy cluster $TIMEOUT \
+	-o jsonpath="{.spec.httpsProxy}" 2>/dev/null)
+if [ -n "$HTTP_PROXY_URL" ]; then
+	info "httpProxy: $HTTP_PROXY_URL"
+	info "httpsProxy: $HTTPS_PROXY_URL"
+
+	chk "NO_PROXY contents validation"
+	COLL_POD=$(oc get pods -n "$NS" $TIMEOUT \
+		-l app.kubernetes.io/component=collector \
+		-o jsonpath="{.items[0].metadata.name}" 2>/dev/null)
+	if [ -n "$COLL_POD" ]; then
+		NO_PROXY_VAL=$(oc exec -n "$NS" "$COLL_POD" \
+			-c collector -- env 2>/dev/null \
+			| grep "^NO_PROXY=" \
+			| cut -d= -f2- || true)
+		if [ -n "$NO_PROXY_VAL" ]; then
+			HAS_SVC=$(echo "$NO_PROXY_VAL" \
+				| grep -c "\.svc" || true)
+			HAS_SVC=${HAS_SVC:-0}
+			HAS_LOCAL=$(echo "$NO_PROXY_VAL" \
+				| grep -c "\.cluster\.local" || true)
+			HAS_LOCAL=${HAS_LOCAL:-0}
+			if [ "$HAS_SVC" -gt 0 ] \
+				&& [ "$HAS_LOCAL" -gt 0 ]; then
+				ok "NO_PROXY includes .svc and .cluster.local"
+			else
+				fail "NO_PROXY missing .svc or .cluster.local"
+			fi
+			POD_CIDR=$(oc get network cluster $TIMEOUT \
+				-o jsonpath="{.status.clusterNetwork[0].cidr}" \
+				2>/dev/null)
+			if [ -n "$POD_CIDR" ]; then
+				POD_PREFIX=$(echo "$POD_CIDR" | cut -d. -f1-2)
+				HAS_CIDR=$(echo "$NO_PROXY_VAL" \
+					| grep -c "$POD_PREFIX" || true)
+				HAS_CIDR=${HAS_CIDR:-0}
+				if [ "$HAS_CIDR" -gt 0 ]; then
+					ok "NO_PROXY includes pod CIDR prefix ($POD_PREFIX)"
+				else
+					warn "NO_PROXY may not include pod CIDR $POD_CIDR"
+				fi
+			fi
+		else
+			fail "NO_PROXY not set in collector pod"
+		fi
+	fi
+
+	chk "Proxy interception test"
+	if [ -n "$DIST_POD" ]; then
+		GW_SVC="logging-loki-gateway-http.${NS}.svc.cluster.local"
+		PROXY_TEST=$(oc exec -n "$NS" "$DIST_POD" -- \
+			sh -c "curl -ksS --connect-timeout 5 https://${GW_SVC}:8080/" \
+			2>&1 || true)
+		if echo "$PROXY_TEST" | grep -qi "squid\|ERR_ACCESS_DENIED\|proxy"; then
+			fail "Squid proxy intercepting internal traffic"
+			info "Note: curl 7.76.1 does NOT support CIDR in no_proxy"
+			info "Go handles CIDR correctly but Rust/Vector may not"
+		else
+			ok "No proxy interception on gateway"
+		fi
+	fi
+else
+	ok "No cluster proxy configured"
+fi
+
+chk "NetworkPolicies"
+NP_COUNT=$(oc get networkpolicy -n "$NS" $TIMEOUT \
+	--no-headers 2>/dev/null | wc -l)
+info "NetworkPolicies in $NS: $NP_COUNT"
+if [ "$NP_COUNT" -gt 0 ]; then
+	info "Verify policies allow 3100, 7946, 9095"
+fi
+
+######################################################
+# 9. STORAGE
+######################################################
+log_section "9" "STORAGE"
+
+chk "Storage secret"
+if oc get secret "$SNAME" -n "$NS" $TIMEOUT \
+	1>/dev/null 2>&1; then
+	ok "Secret $SNAME exists"
+	SKEYS=$(oc get secret "$SNAME" -n "$NS" $TIMEOUT \
+		-o json 2>/dev/null | jq -r ".data | keys[]")
+	info "Keys: $SKEYS"
+
+	chk "Trailing whitespace in secret values"
+	DIRTY=0
+	echo "$SKEYS" | while IFS= read -r K; do
+		[ -z "$K" ] && continue
+		RAW=$(oc get secret "$SNAME" -n "$NS" $TIMEOUT \
+			-o jsonpath="{.data.$K}" \
+			| base64 -d 2>/dev/null)
+		TRIMMED=$(printf "%s" "$RAW" \
+			| sed "s/[[:space:]]*$//")
+		if [ "$RAW" != "$TRIMMED" ]; then
+			fail "Key $K has trailing whitespace"
+		fi
+	done
+else
+	fail "Storage secret $SNAME not found"
+fi
+
+chk "Storage endpoint connectivity"
+LOKI_CONFIG=$(oc get configmap -n "$NS" $TIMEOUT \
+	logging-loki-config -o json 2>/dev/null \
+	| jq -r '.data["config.yaml"]' 2>/dev/null || true)
+if [ -n "$LOKI_CONFIG" ]; then
+	ENDPOINT=$(echo "$LOKI_CONFIG" \
+		| grep -E '^\s*endpoint:' \
+		| head -1 | sed 's/.*endpoint:\s*//' | tr -d '"')
+fi
+if [ -n "${ENDPOINT:-}" ] && [ -n "$DIST_POD" ]; then
+	info "Storage endpoint: $ENDPOINT"
+	STORE_TEST=$(oc exec -n "$NS" "$DIST_POD" -- \
+		sh -c "curl -ksS --noproxy \"*\" --connect-timeout 5 \"$ENDPOINT\"" \
+		2>&1 || true)
+	if echo "$STORE_TEST" \
+		| grep -qi "xml\|ListBucket\|AccessDenied\|NoSuchKey"; then
+		ok "Storage endpoint reachable"
+	elif echo "$STORE_TEST" | grep -qi "x509\|certificate"; then
+		fail "Storage endpoint TLS error"
+	elif echo "$STORE_TEST" | grep -qi "refused\|timed out"; then
+		fail "Storage endpoint unreachable"
+	else
+		warn "Storage response: $(printf "%.100s" "$STORE_TEST")"
+	fi
+fi
+
+######################################################
+# 10. TLS CERTIFICATES
+######################################################
+log_section "10" "TLS CERTIFICATES"
+
+chk "Signing CA"
+SIGNING_SECRET=$(oc get secret -n "$NS" $TIMEOUT \
+	--no-headers 2>/dev/null \
+	| grep "signing-ca" | awk '{print $1}' | head -1)
+if [ -n "$SIGNING_SECRET" ]; then
+	CA_CREATED=$(oc get secret "$SIGNING_SECRET" \
+		-n "$NS" $TIMEOUT \
+		-o jsonpath="{.metadata.creationTimestamp}" \
+		2>/dev/null)
+	info "Signing CA: $SIGNING_SECRET created=$CA_CREATED"
+else
+	warn "No signing-ca secret found"
+fi
+
+chk "TLS secrets age vs pod age"
+NEWEST_SECRET=$(oc get secrets -n "$NS" $TIMEOUT \
+	--no-headers \
+	-o custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp" \
+	2>/dev/null \
+	| grep -iE "loki.*(http|grpc)" \
+	| sort -k2 | tail -1)
+OLDEST_POD=$(oc get pods -n "$NS" $TIMEOUT \
+	-l app.kubernetes.io/managed-by=lokistack-controller \
+	--no-headers \
+	-o custom-columns="NAME:.metadata.name,CREATED:.metadata.creationTimestamp" \
+	2>/dev/null | sort -k2 | head -1)
+if [ -n "$NEWEST_SECRET" ] && [ -n "$OLDEST_POD" ]; then
+	info "Newest TLS secret: $NEWEST_SECRET"
+	info "Oldest Loki pod:   $OLDEST_POD"
+	info "If secret newer than pod, restart pods for fresh certs"
+fi
+
+chk "Gateway TLS errors"
+GW_TLS=$(oc logs -n "$NS" \
+	-l app.kubernetes.io/component=lokistack-gateway \
+	--tail=300 2>/dev/null \
+	| grep -iE "tls handshake|x509|certificate" \
+	| sort -u | tail -10 || true)
+if [ -n "$GW_TLS" ]; then
+	warn "Gateway TLS errors (cosmetic if from console pod)"
+	printf "%s\n" "$GW_TLS"
+else
+	ok "No gateway TLS errors"
+fi
+
+######################################################
+# 11. CLF AND PIPELINE
+######################################################
+log_section "11" "CLF AND PIPELINE"
+
+chk "ClusterLogForwarder status"
+oc get clusterlogforwarder -n "$NS" $TIMEOUT \
+	-o json 2>/dev/null \
+	| jq -r '.items[] | "Name: " + .metadata.name, (.status.conditions[]? | "  " + .type + ": " + .status + " -- " + (.reason // "") + " " + (.message // ""))' \
+	|| warn "No CLF found"
+
+chk "CLF pipeline health"
+PIPE_FAIL=$(oc get clusterlogforwarder -n "$NS" $TIMEOUT \
+	-o json 2>/dev/null \
+	| jq -r '.items[] | .status.pipelines[]? | select(.conditions[]?.status != "True") | "Pipeline " + .name + ": " + (.conditions[]?.type) + "=" + (.conditions[]?.status) + " -- " + (.conditions[]?.reason // "")' \
+	|| true)
+if [ -n "$PIPE_FAIL" ]; then
+	fail "Unhealthy CLF pipelines:"
+	printf "%s\n" "$PIPE_FAIL"
+else
+	ok "All CLF pipelines healthy"
+fi
+
+chk "Vector tuning parameters"
+oc get clusterlogforwarder -n "$NS" $TIMEOUT \
+	-o json 2>/dev/null \
+	| jq -r '.items[]? | .spec.outputs[]? | select(.type == "lokiStack") | "Output " + .name + ": delivery=" + (.lokiStack.tuning.deliveryMode // "default") + " compression=" + (.lokiStack.tuning.compression // "none")' \
+	2>/dev/null || info "No Loki tuning config found"
+
+######################################################
+# 12. RATE LIMITS AND INGESTION
+######################################################
+log_section "12" "RATE LIMITS AND INGESTION"
+
+PREV_COUNT=$ISSUE_COUNT
+chk "Ingestion rate limit errors"
+for COMP in ingester distributor; do
+	POD=$(oc get pods -n "$NS" $TIMEOUT \
+		-l "app.kubernetes.io/component=$COMP" \
+		-o jsonpath="{.items[0].metadata.name}" \
+		2>/dev/null)
+	[ -z "$POD" ] && continue
+	RATE_ERRS=$(oc logs -n "$NS" "$POD" \
+		--tail=300 2>/dev/null \
+		| grep -cE "429|rate limit exceeded|Per stream rate limit" || true)
+	RATE_ERRS=${RATE_ERRS:-0}
+	if [ "$RATE_ERRS" -gt 0 ]; then
+		fail "$COMP: $RATE_ERRS rate limit errors"
+		info "Increase limits.global.ingestion.ingestionRate"
+		info "and limits.global.ingestion.ingestionBurstSize"
+	fi
+done
+if [ "$ISSUE_COUNT" -eq "$PREV_COUNT" ]; then
+	ok "No rate limit errors"
+fi
+
+chk "Current ingestion limits"
+echo "$LOKI_JSON" \
+	| jq -r '.spec.limits.global.ingestion // "defaults"' \
+	2>/dev/null || info "Using default limits"
+
+######################################################
+# 13. ALERTING RULES
+######################################################
+log_section "13" "ALERTING RULES"
+
+chk "AlertingRule CRs"
+AR_COUNT=$(oc get alertingrule -A $TIMEOUT \
+	--no-headers 2>/dev/null | wc -l)
+if [ "$AR_COUNT" -gt 0 ]; then
+	info "Found $AR_COUNT AlertingRule(s)"
+	oc get alertingrule -A $TIMEOUT \
+		--no-headers 2>/dev/null | head -10
+else
+	info "No AlertingRules configured"
+fi
+
+######################################################
+# 14. COMPONENT ERRORS
+######################################################
+log_section "14" "COMPONENT ERRORS"
+
+for C in distributor ingester compactor \
+	lokistack-gateway querier; do
+	chk "$C"
+	oc logs -n "$NS" \
+		-l "app.kubernetes.io/component=$C" \
+		--tail=200 2>/dev/null \
+		| grep -iE "level=error|panic|fatal|no such host" \
+		| sort -u | tail -10 \
+		|| info "No errors"
+done
+
+######################################################
+# 15. EVENTS
+######################################################
+log_section "15" "EVENTS"
+
+oc get events -n "$NS" $TIMEOUT \
+	--sort-by=.lastTimestamp 2>/dev/null \
+	| grep -i loki | tail -15
+
+######################################################
+# SUMMARY
+######################################################
+log_section "S" "SUMMARY"
+
+if [ "$ISSUE_COUNT" -eq 0 ]; then
+	printf "\nNo issues detected. LokiStack appears healthy.\n"
+	printf "If logs still missing, check:\n"
+	printf "  1. Query time range in console\n"
+	printf "  2. Tenant selection (app/infra/audit)\n"
+	printf "  3. CLF pipeline routing\n"
+else
+	printf "\nFound %d issue(s):\n\n" "$ISSUE_COUNT"
+	printf "%b" "$ISSUES"
+	printf "\nTroubleshooting by symptom:\n"
+	printf "%s\n" "$SEP"
+	printf "
+Collector 403 errors:
+  Section 1 (RBAC) -- Logging 6.x needs new ClusterRoles
+  Section 8 (proxy) -- Squid intercepting internal traffic
+
+No datapoints but pods running:
+  Section 5 (collector errors) -- look for 403 or drops
+  Section 11 (CLF pipeline) -- check pipeline status
+  Section 1 (RBAC) -- most common root cause
+
+Connection refused on port 3100:
+  Section 3 (pods) -- crashlooping or OOMKilled
+  Section 9 (storage) -- creds or connectivity
+  Section 6 (mTLS) -- HTTP vs HTTPS mismatch
+
+Empty ring or code 500:
+  Section 7 (ring/memberlist) -- gossip join failure
+  Section 4 (gossip service) -- missing or no endpoints
+  Section 8 (proxy/network) -- 7946 blocked
+
+TLS handshake errors:
+  Section 10 (certs) -- rotation or stale mounts
+  Gateway TLS from console = cosmetic (not blocking)
+  Client cert required = mTLS normal for 6.x
+
+Events dropping or retries exhausted:
+  Section 5 (collector errors) -- find root cause
+  Section 12 (rate limits) -- ingestion rate exceeded
+  Usually downstream of 403 (RBAC) or connectivity
+"
+fi
+
+printf "\n%s\nDone: %s\n%s\n" "$SEP" "$(date)" "$SEP"
+
+if [ "$ISSUE_COUNT" -gt 0 ]; then
+	exit 1
+fi
+exit 0
