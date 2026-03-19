@@ -1,3 +1,316 @@
+
+
+This is an addendum to the CLF syslog configuration examples. Two important optimizations were missing that we strongly recommend: log-level filtering and buffer tuning. These directly impact how much resource the collector uses on each node and how long the buffer can sustain an outage.
+
+
+===========================================================
+KEY INSIGHT: FILTER BEFORE YOU BUFFER
+===========================================================
+
+If your ITRS monitoring only needs warning and error level logs for production support alerts, there is no reason to send info and debug logs to syslog. Filtering these out BEFORE they hit the disk buffer means:
+
+- 80-95% less volume flowing to the syslog output
+- Smaller disk buffer needed (256 MB covers hours instead of minutes)
+- Less disk I/O and memory pressure on each node
+- Less load on the syslog/WSS server when it comes back after an outage
+
+This is the single biggest optimization we can make.
+
+
+===========================================================
+FULL YAML: AtLeastOnce + Severity Filter + Buffer Tuning
+===========================================================
+
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: collector
+  namespace: openshift-logging
+spec:
+  managementState: Managed
+  serviceAccount:
+    name: logcollector
+
+  #-----------------------------------------
+  # FILTERS (applied BEFORE the buffer)
+  #-----------------------------------------
+  filters:
+
+    # Filter 1: Only forward logs from your namespaces
+    - name: only-project-cc
+      type: drop
+      drop:
+        - test:
+            - field: .kubernetes.namespace_name
+              notMatches: "project-cc"     # <-- QUESTION: List all your namespace(s)
+
+    # Filter 2: Only forward warning and error severity
+    # This dramatically reduces volume (typically 80-95% reduction)
+    - name: severity-warning-and-above
+      type: drop
+      drop:
+        - test:
+            - field: .level
+              matches: "info|debug|trace|notice"   # Drop info, debug, trace, notice
+
+  #-----------------------------------------
+  # OUTPUTS (with buffer tuning)
+  #-----------------------------------------
+  outputs:
+    - name: wss-syslog
+      type: syslog
+      syslog:
+        facility: local0                 # <-- QUESTION: Your facility value
+        rfc: RFC5424                     # <-- QUESTION: RFC3164 or RFC5424
+        severity: informational          # <-- QUESTION: Syslog header severity
+        enrichment: KubernetesMinimal    # Adds namespace_name, pod_name, container_name
+        payloadKey: message              # Sends the log message body as the syslog payload
+
+        tuning:
+          #-- Delivery mode --
+          deliveryMode: AtLeastOnce      # Enables disk buffer + retry
+
+          #-- Retry intervals --
+          # When syslog is down, Vector retries with exponential backoff:
+          #   attempt 1: wait 5s
+          #   attempt 2: wait 10s
+          #   attempt 3: wait 20s
+          #   ... doubles each time ...
+          #   capped at maxRetryDuration
+          minRetryDuration: 5s           # <-- First retry after 5 seconds
+          maxRetryDuration: 5m           # <-- Never wait more than 5 minutes between retries
+
+          #-- Payload size --
+          maxWrite: 2M                   # Max 2 MB per write operation to syslog
+                                         # Prevents large bursts from overwhelming the receiver
+                                         # <-- QUESTION: Does your syslog server have a max message size?
+
+          #-- Compression (optional, reduces network bandwidth) --
+          # compression: gzip            # Uncomment if your syslog server supports gzip
+                                         # NOTE: Most syslog servers do NOT support compression
+                                         #       Only enable if you have confirmed support
+
+      url: tls://wss-syslog.example.com:6514    # <-- QUESTION: Your syslog URL and port
+      tls:                                       # Remove this block if using tcp:// without TLS
+        ca:
+          key: ca-bundle.crt
+          secretName: wss-syslog-tls             # <-- QUESTION: TLS CA certificate secret
+
+  #-----------------------------------------
+  # PIPELINES (connects filters to outputs)
+  #-----------------------------------------
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application                    # Collects application container logs
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-project-cc               # Applied first: scope to your namespaces
+        - severity-warning-and-above    # Applied second: keep only warning + error
+                                         # Order matters: namespace filter runs before severity filter
+
+
+===========================================================
+ALTERNATIVE FILTER EXAMPLES
+===========================================================
+
+Depending on your requirements, you might want different filtering strategies.
+Here are some variations:
+
+
+--- Variation 1: Forward everything (no severity filter) ---
+
+Use this if your ITRS monitoring needs info-level logs too.
+Higher volume = larger buffer needed = more disk pressure.
+
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-project-cc              # Only namespace filter, no severity filter
+
+
+--- Variation 2: Error only (most aggressive filter) ---
+
+Use this if ITRS alerts are triggered only by error-level events.
+Lowest volume, smallest buffer, least node impact.
+
+  filters:
+    - name: errors-only
+      type: drop
+      drop:
+        - test:
+            - field: .level
+              notMatches: "error|critical|fatal|err|crit"
+
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-project-cc
+        - errors-only
+
+
+--- Variation 3: Filter by specific log content (regex match) ---
+
+Use this if only logs containing specific keywords trigger ITRS alerts.
+Most targeted, but fragile (breaks if log format changes).
+
+  filters:
+    - name: itrs-alert-keywords
+      type: drop
+      drop:
+        - test:
+            - field: .message
+              notMatches: "ALERT|CRITICAL|OUTAGE|SLA_BREACH"   # <-- Your ITRS keywords
+
+  pipelines:
+    - name: app-alerts-to-syslog
+      inputRefs:
+        - application
+      outputRefs:
+        - wss-syslog
+      filterRefs:
+        - only-project-cc
+        - itrs-alert-keywords
+
+
+===========================================================
+BUFFER SIZING GUIDE
+===========================================================
+
+The disk buffer size determines how long Vector can hold logs during a syslog
+outage. Here is the math:
+
+  Buffer duration = buffer max size / (log rate x avg log size)
+
+Examples (assuming 1 KB average log size, per node):
+
+  Log rate        Buffer size    Outage coverage
+  --------        -----------    ---------------
+  10 logs/sec     256 MB         ~7 hours
+  50 logs/sec     256 MB         ~1.4 hours
+  100 logs/sec    256 MB         ~42 minutes
+  100 logs/sec    512 MB         ~85 minutes
+  500 logs/sec    512 MB         ~17 minutes
+  500 logs/sec    1 GB           ~33 minutes
+
+IMPORTANT: These rates are AFTER filtering. If you filter to warning+error
+only and that reduces your volume from 500 logs/sec to 50 logs/sec, then
+a 256 MB buffer covers ~1.4 hours instead of 17 minutes.
+
+The buffer uses node disk space (emptyDir or hostPath depending on how
+the Logging Operator configures Vector). Every worker node running the
+Vector DaemonSet will use up to this much disk.
+
+
+===========================================================
+COLLECTOR POD RESOURCE LIMITS
+===========================================================
+
+Red Hat best practice for Vector collector resource configuration:
+
+  spec.collector.resources:
+    requests:
+      memory: 256Mi          # Scheduling reservation
+    limits:
+      memory: 1Gi            # Hard ceiling - OOM killed if exceeded
+      # cpu: DO NOT SET      # Red Hat best practice: omit CPU limits
+                              # Setting CPU limits causes severe Vector
+                              # performance degradation (up to 10x slower)
+
+Why no CPU limit:
+- Vector is a Rust-based single-binary collector that uses async I/O
+- CPU limits trigger Linux CFS throttling which starves Vector's event loop
+- Red Hat documented this: Vector drops to 1/10 throughput with CPU limits set
+- Instead, rely on memory limits as the safety valve
+- If Vector exceeds memory limit, the OOM killer restarts it (the disk
+  buffer survives the restart because it is on disk, not in memory)
+
+Why set memory limit:
+- Prevents Vector from consuming unbounded node memory during backpressure
+- The limit acts as a safety valve: if the syslog server is down for a long
+  time and the in-memory portion of the buffer grows, Vector gets OOM killed
+  and restarts cleanly, picking up from the disk buffer
+- 1 Gi is a good starting point for moderate volume with 2-3 output sinks
+- If you have high volume or many outputs, consider 2 Gi
+
+NOTE: The collector resource configuration may be set at the CLF level or
+at the ClusterLogging CR level depending on your Logging Operator version.
+We will confirm the exact path for your cluster.
+
+
+===========================================================
+MONITORING: PROMQL QUERIES FOR VECTOR HEALTH
+===========================================================
+
+Once deployed, we recommend setting up these Prometheus alerts:
+
+1. Buffer utilization (approaching full):
+   vector_buffer_byte_size{component_kind="sink",component_name="wss_syslog"}
+   Alert when > 80% of configured max_size
+
+2. Events dropped (buffer full or send failure):
+   rate(vector_component_discarded_events_total{component_name="wss_syslog"}[5m]) > 0
+
+3. Send errors (syslog server unreachable):
+   rate(vector_component_errors_total{component_name="wss_syslog"}[5m]) > 0
+
+4. Collector memory usage (approaching limit):
+   container_memory_working_set_bytes{container="collector",namespace="openshift-logging"}
+   Alert when > 80% of memory limit
+
+We can configure these as PrometheusRule resources in the cluster.
+
+
+===========================================================
+UPDATED QUESTIONS 
+===========================================================
+
+In addition to the questions from the previous email, we need:
+
+8. LOG LEVEL FILTERING
+   a. What log levels does your ITRS monitoring actually consume?
+      (error only? warning+error? info+warning+error? all levels?)
+   b. Do you use structured logging with a .level field, or is severity
+      embedded in the message text? (e.g. "[ERROR] connection failed")
+   c. Would you like to filter by specific keywords or patterns in the
+      log message? If so, what are the keywords?
+   d. Are there specific container names within your pods that produce
+      the alert-worthy logs, or do all containers matter?
+
+9. BUFFER SIZING INPUT
+   a. Based on the sizing table above, what outage duration do you need
+      to cover? (This determines the buffer size we configure.)
+   b. Is there a disk space constraint on your worker nodes that limits
+      how large the buffer can be?
+
+
+SUMMARY OF RECOMMENDATIONS
+
+1. Filter aggressively: Forward only warning+error from only your namespaces.
+   This is the single most effective way to reduce node impact.
+
+2. Size the buffer to match filtered volume and expected outage duration.
+   256 MB covers hours at low filtered volume.
+
+3. Set memory limits on collector (1-2 Gi), no CPU limits.
+
+4. Monitor buffer utilization and send errors via Prometheus alerts.
+
+5. Test in nonprod with a simulated outage before going to prod.
+
+
+
+
+
 This is the simplest configuration. Logs are forwarded to syslog with no disk persistence. If the syslog server is down or Vector restarts, any logs that were in flight are lost.
 
 apiVersion: observability.openshift.io/v1
