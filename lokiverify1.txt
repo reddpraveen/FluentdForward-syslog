@@ -1,3 +1,17 @@
+# Are components actually talking to each other right now
+oc logs -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") --tail=30
+# Same for ingester
+oc logs -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=ingester -o jsonpath="{.items[0].metadata.name}") --tail=30
+# Check the ring status properly with mTLS
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt https://localhost:3100/ring 2>&1 | head -50
+# Check memberlist status
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS --noproxy "*" --cert /var/run/tls/http/server/tls.crt --key /var/run/tls/http/server/tls.key --cacert /var/run/ca/service-ca.crt https://localhost:3100/memberlist 2>&1 | head -50
+# Test if the RGW storage endpoint is reachable from a Loki pod
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS --noproxy "*" "https://rook-ceph-rgw-ocs-storagecluster-cephobjectstore.openshift-storage.svc:443/" 2>&1 | head -10
+
+
+
+------------
 
 # Get the Loki config from the correct ConfigMap
 oc get configmap -n openshift-logging logging-loki-config -o json | jq -r ".data[\"config.yaml\"]" | head -120
