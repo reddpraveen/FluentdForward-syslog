@@ -1,4 +1,17 @@
 
+# Show the exact pod CIDR from cluster network config
+oc get network cluster -o jsonpath="{.status.clusterNetwork[0].cidr}"
+
+# Show one actual Loki pod IP (not masked)
+oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].status.podIP}"
+
+# Confirm that pod IP falls within the clusterNetwork CIDR above
+# Then check if that exact CIDR is in NO_PROXY
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- env | grep -i no_proxy | tr "," "\n"
+
+oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | grep -iE "proxy|http_proxy|https_proxy"
+
+-----
 
 # Check if proxy env vars are set on Loki pods
 oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- env | grep -iE "proxy|PROXY"
