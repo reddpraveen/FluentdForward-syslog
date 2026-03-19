@@ -1,4 +1,4 @@
-# Get the full Loki config (look for addresses)
+1# Get the full Loki config (look for addresses)
 oc get configmap -n openshift-logging $(oc get configmap -n openshift-logging --no-headers | grep -i loki | grep -iv gateway | head -1 | awk "{print \$1}") -o json | jq -r ".data[]" | head -100
 
 # Get more of the config
