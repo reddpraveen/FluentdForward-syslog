@@ -1,4 +1,15 @@
 
+# Test curl WITHOUT --noproxy to a pod IP on 3100
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS "https://$(oc get pods -n openshift-logging -l app.kubernetes.io/component=compactor -o jsonpath="{.items[0].status.podIP}"):3100/ready" 2>&1
+
+# Test curl WITHOUT --noproxy to the service DNS name on 3100
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS "https://logging-loki-compactor-http.openshift-logging.svc.cluster.local:3100/ready" 2>&1
+
+# Test curl WITHOUT --noproxy using localhost
+oc exec -n openshift-logging $(oc get pods -n openshift-logging -l app.kubernetes.io/component=distributor -o jsonpath="{.items[0].metadata.name}") -- curl -ksS "https://localhost:3100/ready" 2>&1
+
+
+------
 # Show the exact pod CIDR from cluster network config
 oc get network cluster -o jsonpath="{.status.clusterNetwork[0].cidr}"
 
