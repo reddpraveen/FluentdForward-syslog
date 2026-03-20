@@ -1,3 +1,24 @@
+# From bastion - extract what's in the catalog index
+mkdir /tmp/ci && cd /tmp/ci
+
+HTTPS_PROXY=http://proxy.company-xxx.com:8080 \
+skopeo copy \
+  docker://registry.access.redhat.com/rhdh/plugin-catalog-index:1.9 \
+  dir:/tmp/ci
+
+# Find the layer and extract it
+for f in /tmp/ci/*; do
+  if file $f | grep -q "gzip\|tar"; then
+    tar xzf $f -C /tmp/ci 2>/dev/null || true
+  fi
+done
+
+# List every ghcr.io plugin that is enabled by default
+grep -A2 "ghcr.io" /tmp/ci/dynamic-plugins.default.yaml | \
+  grep -v "disabled: true" | grep "package:"
+
+
+
 #!/bin/bash
 ######################################################
 
