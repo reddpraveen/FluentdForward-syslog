@@ -1,3 +1,492 @@
+#!/bin/bash
+# =============================================================================
+# incorporate-plugins-into-catalog-index.sh
+#
+# Purpose:
+#   1. Push manually downloaded ghcr.io plugin OCI images to Artifactory
+#   2. Pull the existing catalog index from Artifactory
+#   3. Rewrite the ghcr.io references in dynamic-plugins.default.yaml
+#      and index.json to point to Artifactory
+#   4. Rebuild and push the updated catalog index back to Artifactory
+#
+# Result: Single catalog index in Artifactory that covers BOTH Red Hat
+#         plugins (already there) AND the ghcr.io plugins you added.
+#         The init container only talks to Artifactory.
+#
+# Prerequisites:
+#   - skopeo, jq, podman, sed
+#   - Authenticated to Artifactory (skopeo login)
+#   - 4 ArgoCD plugin images already downloaded to PLUGIN_DIR
+#     (using skopeo copy on any internet-connected machine)
+#
+# How to download the 4 plugins (on any machine with ghcr.io access):
+#
+#   mkdir -p /tmp/ghcr-plugins/argocd-backend
+#   mkdir -p /tmp/ghcr-plugins/argocd-frontend
+#   mkdir -p /tmp/ghcr-plugins/roadie-argocd-backend
+#   mkdir -p /tmp/ghcr-plugins/roadie-scaffolder-argocd
+#
+#   skopeo copy --all --src-no-creds \
+#     docker://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-argocd-backend:bs_1.45.3__1.0.2 \
+#     dir:/tmp/ghcr-plugins/argocd-backend
+#
+#   skopeo copy --all --src-no-creds \
+#     docker://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-argocd:bs_1.45.3__2.4.3 \
+#     dir:/tmp/ghcr-plugins/argocd-frontend
+#
+#   skopeo copy --all --src-no-creds \
+#     docker://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-argo-cd-backend:bs_1.45.3__4.6.0 \
+#     dir:/tmp/ghcr-plugins/roadie-argocd-backend
+#
+#   skopeo copy --all --src-no-creds \
+#     docker://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-scaffolder-backend-argocd:bs_1.45.3__1.8.1 \
+#     dir:/tmp/ghcr-plugins/roadie-scaffolder-argocd
+#
+#   Then scp /tmp/ghcr-plugins to bastion and run this script.
+# =============================================================================
+set -euo pipefail
+
+# ---- VARIABLES -- EDIT THESE ------------------------------------------------
+ARTIFACTORY="artifactory.company-xxx.com"
+ARTIFACTORY_REPO="rhdh"
+
+# Where the catalog index lives in Artifactory (already mirrored)
+CATALOG_INDEX="${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh/plugin-catalog-index:1.9"
+
+# Where the downloaded ghcr.io plugin dirs are
+PLUGIN_DIR="/tmp/ghcr-plugins"
+
+# Temp working directory
+WORKDIR="/tmp/catalog-index-rebuild"
+# ---- END VARIABLES ----------------------------------------------------------
+
+# Plugin mapping: local_dir -> artifactory_path:tag
+# Format: DIR_NAME|ARTIFACTORY_IMAGE_PATH
+PLUGINS=(
+  "argocd-backend|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/backstage-community-plugin-argocd-backend:bs_1.45.3__1.0.2"
+  "argocd-frontend|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/backstage-community-plugin-argocd:bs_1.45.3__2.4.3"
+  "roadie-argocd-backend|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-argo-cd-backend:bs_1.45.3__4.6.0"
+  "roadie-scaffolder-argocd|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/roadiehq-scaffolder-backend-argocd:bs_1.45.3__1.8.1"
+)
+
+rm -rf "${WORKDIR}"
+mkdir -p "${WORKDIR}"
+
+# =============================================================================
+# STEP 1: Push plugin images from local dirs to Artifactory
+# =============================================================================
+printf "=== Step 1: Pushing plugin images to Artifactory ===\n\n"
+
+PUSH_FAILED=0
+for entry in "${PLUGINS[@]}"; do
+  dir_name="${entry%%|*}"
+  target_image="${entry##*|}"
+  src_dir="${PLUGIN_DIR}/${dir_name}"
+
+  if [ ! -d "${src_dir}" ]; then
+    printf "  [ERROR] Directory not found: %s\n" "${src_dir}"
+    printf "          Download it first (see script header for commands)\n\n"
+    PUSH_FAILED=1
+    continue
+  fi
+
+  if [ ! -f "${src_dir}/manifest.json" ]; then
+    printf "  [ERROR] No manifest.json in %s -- incomplete download\n\n" "${src_dir}"
+    PUSH_FAILED=1
+    continue
+  fi
+
+  printf "  Pushing: %s\n" "${dir_name}"
+  printf "      To:  %s\n" "${target_image}"
+
+  if skopeo copy --all --dest-tls-verify=false \
+    "dir:${src_dir}" "docker://${target_image}" 2>&1; then
+    printf "  [OK]\n\n"
+  else
+    printf "  [FAIL]\n\n"
+    PUSH_FAILED=1
+  fi
+done
+
+if [ "${PUSH_FAILED}" -eq 1 ]; then
+  printf "*** Some pushes failed. Fix errors above before continuing. ***\n"
+  exit 1
+fi
+
+# =============================================================================
+# STEP 2: Pull catalog index from Artifactory and extract contents
+# =============================================================================
+printf "=== Step 2: Extracting catalog index from Artifactory ===\n\n"
+
+mkdir -p "${WORKDIR}/catalog-raw"
+mkdir -p "${WORKDIR}/catalog-content"
+
+printf "  Pulling: %s\n" "${CATALOG_INDEX}"
+skopeo copy --src-tls-verify=false \
+  "docker://${CATALOG_INDEX}" \
+  "dir:${WORKDIR}/catalog-raw"
+
+# Extract layers to find dynamic-plugins.default.yaml and index.json
+FOUND_CONTENT=0
+for layer in "${WORKDIR}/catalog-raw"/*; do
+  if [ -f "${layer}" ] && ! echo "${layer}" | grep -qE "(manifest\.json|version)$"; then
+    if tar -xf "${layer}" -C "${WORKDIR}/catalog-content" 2>/dev/null; then
+      if [ -f "${WORKDIR}/catalog-content/dynamic-plugins.default.yaml" ]; then
+        FOUND_CONTENT=1
+        printf "  [OK] Extracted catalog content from layer: %s\n\n" "$(basename "${layer}")"
+        break
+      fi
+    fi
+  fi
+done
+
+if [ "${FOUND_CONTENT}" -eq 0 ]; then
+  printf "  [ERROR] Could not find dynamic-plugins.default.yaml in catalog index\n"
+  exit 1
+fi
+
+# =============================================================================
+# STEP 3: Rewrite ghcr.io references to Artifactory in both files
+# =============================================================================
+printf "=== Step 3: Rewriting OCI references ===\n\n"
+
+DPDY="${WORKDIR}/catalog-content/dynamic-plugins.default.yaml"
+INDEXJ="${WORKDIR}/catalog-content/index.json"
+
+# Count ghcr.io references before
+BEFORE_COUNT=$(grep -c "ghcr.io" "${DPDY}" 2>/dev/null || printf "0")
+printf "  ghcr.io references in dynamic-plugins.default.yaml before: %s\n" "${BEFORE_COUNT}"
+
+# Replace ghcr.io/redhat-developer/rhdh-plugin-export-overlays/ with Artifactory path
+# This covers the OCI package paths in dynamic-plugins.default.yaml
+sed -i "s|ghcr.io/redhat-developer/rhdh-plugin-export-overlays/|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/|g" "${DPDY}"
+
+AFTER_COUNT=$(grep -c "ghcr.io" "${DPDY}" 2>/dev/null || printf "0")
+printf "  ghcr.io references in dynamic-plugins.default.yaml after:  %s\n" "${AFTER_COUNT}"
+
+# Also update index.json if it exists
+if [ -f "${INDEXJ}" ]; then
+  BEFORE_INDEX=$(grep -c "ghcr.io" "${INDEXJ}" 2>/dev/null || printf "0")
+  printf "  ghcr.io references in index.json before: %s\n" "${BEFORE_INDEX}"
+
+  # Use jq to update registryReference values
+  if jq --arg target "${ARTIFACTORY}/${ARTIFACTORY_REPO}" '
+    . | with_entries(
+      .value.registryReference |= (
+        if . and (. | test("ghcr.io")) then
+          . | sub("ghcr.io/redhat-developer/rhdh-plugin-export-overlays/"; $target + "/rhdh-plugin-export-overlays/")
+        else
+          .
+        end
+      )
+    )
+  ' "${INDEXJ}" > "${INDEXJ}.tmp" 2>/dev/null; then
+    mv "${INDEXJ}.tmp" "${INDEXJ}"
+    AFTER_INDEX=$(grep -c "ghcr.io" "${INDEXJ}" 2>/dev/null || printf "0")
+    printf "  ghcr.io references in index.json after:  %s\n" "${AFTER_INDEX}"
+  else
+    printf "  [WARN] jq update of index.json failed, continuing with sed\n"
+    sed -i "s|ghcr.io/redhat-developer/rhdh-plugin-export-overlays/|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/|g" "${INDEXJ}"
+  fi
+fi
+
+# Also update catalog-entities YAML files if present
+YAML_COUNT=0
+if [ -d "${WORKDIR}/catalog-content/catalog-entities" ]; then
+  while IFS= read -r yaml_file; do
+    if [ -n "${yaml_file}" ] && [ -f "${yaml_file}" ]; then
+      sed -i "s|ghcr.io/redhat-developer/rhdh-plugin-export-overlays/|${ARTIFACTORY}/${ARTIFACTORY_REPO}/rhdh-plugin-export-overlays/|g" "${yaml_file}"
+      YAML_COUNT=$((YAML_COUNT + 1))
+    fi
+  done < <(find "${WORKDIR}/catalog-content/catalog-entities" -name "*.yaml" -type f 2>/dev/null)
+  printf "  Updated %s catalog-entity YAML files\n" "${YAML_COUNT}"
+fi
+
+printf "\n"
+
+# =============================================================================
+# STEP 4: Rebuild the catalog index image and push to Artifactory
+# =============================================================================
+printf "=== Step 4: Rebuilding and pushing catalog index ===\n\n"
+
+BUILD_DIR="${WORKDIR}/build"
+mkdir -p "${BUILD_DIR}/content"
+
+# Copy all catalog content into build context
+cp -r "${WORKDIR}/catalog-content"/* "${BUILD_DIR}/content/"
+
+cat > "${BUILD_DIR}/Dockerfile" << 'EOF'
+FROM scratch
+COPY content/ /
+EOF
+
+TEMP_TAG="localhost/rhdh-catalog-index-rebuild:1.9"
+
+printf "  Building image...\n"
+if ! podman build -t "${TEMP_TAG}" "${BUILD_DIR}" 2>/dev/null; then
+  printf "  [ERROR] podman build failed\n"
+  exit 1
+fi
+
+printf "  Pushing to: %s\n" "${CATALOG_INDEX}"
+if ! skopeo copy --all --dest-tls-verify=false \
+  "containers-storage:${TEMP_TAG}" "docker://${CATALOG_INDEX}" 2>&1; then
+  printf "  [ERROR] Failed to push rebuilt catalog index\n"
+  podman rmi "${TEMP_TAG}" 2>/dev/null || true
+  exit 1
+fi
+
+podman rmi "${TEMP_TAG}" 2>/dev/null || true
+printf "  [OK] Catalog index rebuilt and pushed\n\n"
+
+# =============================================================================
+# STEP 5: Verify
+# =============================================================================
+printf "=== Step 5: Verification ===\n\n"
+
+printf "  Catalog index in Artifactory:\n"
+printf "    %s\n\n" "${CATALOG_INDEX}"
+
+printf "  ArgoCD plugins in Artifactory:\n"
+for entry in "${PLUGINS[@]}"; do
+  target_image="${entry##*|}"
+  name=$(echo "${target_image}" | sed 's|.*/||' | sed 's|:.*||')
+  printf "    %s ... " "${name}"
+  if skopeo inspect --tls-verify=false "docker://${target_image}" >/dev/null 2>&1; then
+    printf "[OK]\n"
+  else
+    printf "[NOT FOUND]\n"
+  fi
+done
+
+printf "\n"
+printf "=== DONE ===\n\n"
+printf "The catalog index at:\n"
+printf "  %s\n" "${CATALOG_INDEX}"
+printf "now has ghcr.io ArgoCD plugin references rewritten to Artifactory.\n\n"
+printf "Your Backstage CR CATALOG_INDEX_IMAGE should point to:\n"
+printf "  %s\n\n" "${CATALOG_INDEX}"
+printf "In your dynamic-plugins-rhdh ConfigMap:\n"
+printf "  - Keep includes: - dynamic-plugins.default.yaml\n"
+printf "  - The 4 ArgoCD plugins are now pullable from Artifactory\n"
+printf "  - You still need to DISABLE the remaining 34 ghcr.io plugins\n"
+printf "    that you did NOT mirror (or mirror them all later)\n"
+printf "  - Enable ArgoCD by adding disabled: false entries\n"
+printf "    (the OCI paths in the catalog index already point to Artifactory)\n\n"
+
+# Cleanup
+rm -rf "${WORKDIR}"
+
+
+
+---
+# =============================================================================
+# dynamic-plugins-rhdh ConfigMap
+# Namespace: rhdh
+#
+# RHDH 1.9 -- Partially Disconnected
+#
+# Catalog index in Artifactory has been rebuilt with ghcr.io ArgoCD plugin
+# paths rewritten to Artifactory (using incorporate-plugins-into-catalog-index.sh).
+#
+# Strategy:
+#   - CATALOG_INDEX_IMAGE -> Artifactory (rebuilt, ArgoCD paths = Artifactory)
+#   - includes: dynamic-plugins.default.yaml (from rebuilt catalog index)
+#   - 34 ghcr.io plugins DISABLED (not mirrored, not needed)
+#   - 4 ArgoCD ghcr.io plugins: no entry needed here -- the rebuilt catalog
+#     index already has them as disabled:true with Artifactory paths.
+#     We ENABLE them in Section 2 below.
+#   - 7 bundled ./dist/ plugins ENABLED
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dynamic-plugins-rhdh
+  namespace: rhdh
+  labels:
+    app.kubernetes.io/managed-by: gitops
+    app.kubernetes.io/component: rhdh-config
+data:
+  dynamic-plugins.yaml: |
+    includes:
+      - dynamic-plugins.default.yaml
+
+    plugins:
+      # =======================================================================
+      # SECTION 1: DISABLE non-mirrored ghcr.io plugins (34 entries)
+      #
+      # These are the ghcr.io plugins you did NOT mirror to Artifactory.
+      # The catalog index still references them (now with Artifactory paths
+      # after rebuild), but the images don't exist in Artifactory.
+      # Disabling prevents the init container from trying to pull them.
+      #
+      # NOTE: After the catalog index rebuild, the package paths in
+      # dynamic-plugins.default.yaml changed from ghcr.io to Artifactory.
+      # But the override match is by plugin name (the part after "!"),
+      # so the original ghcr.io package strings still work as overrides.
+      # =======================================================================
+
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-scaffolder-backend-module-quay:bs_1.45.3__2.14.0!backstage-community-plugin-scaffolder-backend-module-quay'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-3scale-backend:bs_1.45.3__3.10.0!backstage-community-plugin-3scale-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-azure-devops-backend:bs_1.45.3__0.23.0!backstage-community-plugin-azure-devops-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-azure-devops:bs_1.45.3__0.23.0!backstage-community-plugin-azure-devops'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-dynatrace:bs_1.45.3__10.12.1!backstage-community-plugin-dynatrace'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-github-actions:bs_1.45.3__0.18.0!backstage-community-plugin-github-actions'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-github-issues:bs_1.45.3__0.16.0!backstage-community-plugin-github-issues'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-jenkins-backend:bs_1.45.3__0.22.0!backstage-community-plugin-jenkins-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-jenkins:bs_1.45.3__0.26.0!backstage-community-plugin-jenkins'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-jfrog-artifactory:bs_1.45.3__1.24.1!backstage-community-plugin-jfrog-artifactory'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-lighthouse:bs_1.45.3__0.16.0!backstage-community-plugin-lighthouse'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-nexus-repository-manager:bs_1.45.3__1.19.4!backstage-community-plugin-nexus-repository-manager'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-quay-backend:bs_1.45.3__1.10.1!backstage-community-plugin-quay-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-quay:bs_1.45.3__1.28.1!backstage-community-plugin-quay'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-scaffolder-backend-module-servicenow:bs_1.45.3__2.11.0!backstage-community-plugin-scaffolder-backend-module-servicenow'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-scaffolder-backend-module-sonarqube:bs_1.45.3__2.11.0!backstage-community-plugin-scaffolder-backend-module-sonarqube'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-sonarqube-backend:bs_1.45.3__0.15.0!backstage-community-plugin-sonarqube-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-sonarqube:bs_1.45.3__0.21.0!backstage-community-plugin-sonarqube'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-tekton:bs_1.45.3__3.33.3!backstage-community-plugin-tekton'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-plugin-catalog-backend-module-bitbucket-cloud:bs_1.45.3__0.5.5!backstage-plugin-catalog-backend-module-bitbucket-cloud'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-plugin-catalog-backend-module-bitbucket-server:bs_1.45.3__0.5.5!backstage-plugin-catalog-backend-module-bitbucket-server'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-plugin-scaffolder-backend-module-bitbucket-cloud:bs_1.45.3__0.2.15!backstage-plugin-scaffolder-backend-module-bitbucket-cloud'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-plugin-scaffolder-backend-module-bitbucket-server:bs_1.45.3__0.2.15!backstage-plugin-scaffolder-backend-module-bitbucket-server'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/backstage-plugin-scaffolder-backend-module-gerrit:bs_1.45.3__0.2.15!backstage-plugin-scaffolder-backend-module-gerrit'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/immobiliarelabs-backstage-plugin-gitlab-backend:bs_1.45.3__6.13.0!immobiliarelabs-backstage-plugin-gitlab-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/immobiliarelabs-backstage-plugin-gitlab:bs_1.45.3__6.13.0!immobiliarelabs-backstage-plugin-gitlab'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/pagerduty-backstage-plugin-backend:bs_1.45.3__0.10.1!pagerduty-backstage-plugin-backend'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/pagerduty-backstage-plugin:bs_1.45.3__0.16.4!pagerduty-backstage-plugin'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-datadog:bs_1.45.3__2.6.0!roadiehq-backstage-plugin-datadog'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-github-insights:bs_1.45.3__3.4.1!roadiehq-backstage-plugin-github-insights'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-github-pull-requests:bs_1.45.3__3.6.2!roadiehq-backstage-plugin-github-pull-requests'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-jira:bs_1.45.3__2.14.0!roadiehq-backstage-plugin-jira'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-security-insights:bs_1.45.3__3.3.1!roadiehq-backstage-plugin-security-insights'
+        disabled: true
+      - package: 'oci://ghcr.io/redhat-developer/rhdh-plugin-export-overlays/roadiehq-scaffolder-backend-module-utils:bs_1.45.3__4.1.1!roadiehq-scaffolder-backend-module-utils'
+        disabled: true
+
+      # =======================================================================
+      # SECTION 2: ENABLE ArgoCD plugins (mirrored to Artifactory)
+      #
+      # These 4 images were pushed to Artifactory and the catalog index
+      # was rebuilt with Artifactory paths. The package path here uses
+      # the Artifactory OCI URL so the init container pulls from Artifactory.
+      # =======================================================================
+
+      - package: 'oci://artifactory.company-xxx.com/rhdh/rhdh-plugin-export-overlays/backstage-community-plugin-argocd-backend:bs_1.45.3__1.0.2!backstage-community-plugin-argocd-backend'
+        disabled: false
+
+      - package: 'oci://artifactory.company-xxx.com/rhdh/rhdh-plugin-export-overlays/backstage-community-plugin-argocd:bs_1.45.3__2.4.3!backstage-community-plugin-argocd'
+        disabled: false
+        pluginConfig:
+          dynamicPlugins:
+            frontend:
+              backstage-community.plugin-argocd:
+                mountPoints:
+                  - mountPoint: entity.page.overview/cards
+                    importName: ArgocdDeploymentSummary
+                    config:
+                      layout:
+                        gridColumnEnd:
+                          lg: "span 8"
+                          xs: "span 12"
+                      if:
+                        allOf:
+                          - isArgocdConfigured
+                  - mountPoint: entity.page.cd/cards
+                    importName: ArgocdDeploymentLifecycle
+                    config:
+                      layout:
+                        gridColumn: "1 / -1"
+                      if:
+                        allOf:
+                          - isArgocdConfigured
+
+      - package: 'oci://artifactory.company-xxx.com/rhdh/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-argo-cd-backend:bs_1.45.3__4.6.0!roadiehq-backstage-plugin-argo-cd-backend'
+        disabled: false
+
+      - package: 'oci://artifactory.company-xxx.com/rhdh/rhdh-plugin-export-overlays/roadiehq-scaffolder-backend-argocd:bs_1.45.3__1.8.1!roadiehq-scaffolder-backend-argocd'
+        disabled: false
+
+      # =======================================================================
+      # SECTION 3: ENABLE bundled ./dist/ plugins (no network pull)
+      # =======================================================================
+
+      - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes-backend-dynamic
+        disabled: false
+
+      - package: ./dynamic-plugins/dist/backstage-plugin-kubernetes
+        disabled: false
+        pluginConfig:
+          dynamicPlugins:
+            frontend:
+              backstage.plugin-kubernetes:
+                mountPoints:
+                  - mountPoint: entity.page.kubernetes/cards
+                    importName: EntityKubernetesContent
+                    config:
+                      layout:
+                        gridColumn: "1 / -1"
+                      if:
+                        anyOf:
+                          - hasAnnotation: backstage.io/kubernetes-id
+
+      - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-dynamic
+        disabled: false
+
+      - package: ./dynamic-plugins/dist/backstage-plugin-catalog-backend-module-github-org-dynamic
+        disabled: false
+
+      - package: ./dynamic-plugins/dist/backstage-plugin-scaffolder-backend-module-github-dynamic
+        disabled: false
+
+      - package: ./dynamic-plugins/dist/backstage-community-plugin-rbac
+        disabled: false
+
+      - package: ./dynamic-plugins/dist/backstage-community-plugin-rbac-backend-dynamic
+        disabled: false
+
+
+
+
+
+
+
+
+
+
+
+
 ---
 # =============================================================================
 # dynamic-plugins-rhdh ConfigMap
