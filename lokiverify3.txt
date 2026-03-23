@@ -1,3 +1,83 @@
+# Step 1: Pull the ORIGINAL catalog index (from your existing Artifactory mirror
+#         or re-mirror from quay.io if the current one is already corrupted)
+HTTPS_PROXY=http://PROXY_IP:3128 \
+skopeo copy --all \
+  docker://quay.io/rhdh/plugin-catalog-index:1.9 \
+  dir:/tmp/catalog-rebuild/catalog-raw
+
+# Step 2: Extract contents
+mkdir -p /tmp/catalog-rebuild/catalog-content
+for layer in /tmp/catalog-rebuild/catalog-raw/*; do
+  if [ -f "${layer}" ] && ! echo "${layer}" | grep -qE "(manifest\.json|version)$"; then
+    tar -xf "${layer}" -C /tmp/catalog-rebuild/catalog-content 2>/dev/null || true
+    if [ -f "/tmp/catalog-rebuild/catalog-content/dynamic-plugins.default.yaml" ]; then
+      echo "Found catalog content in layer: $(basename ${layer})"
+      break
+    fi
+  fi
+done
+
+# Step 3: Rewrite ONLY ghcr.io paths to correct Artifactory path
+# ghcr.io/redhat-developer/... -> artifactory.company-xxx.com/image/rhdh/redhat-developer/...
+# This preserves the full path including redhat-developer/rhdh-plugin-export-overlays/
+
+sed -i 's|ghcr.io/|artifactory.company-xxx.com/image/rhdh/|g' \
+  /tmp/catalog-rebuild/catalog-content/dynamic-plugins.default.yaml
+
+# Verify the replacement looks right
+grep "artifactory" /tmp/catalog-rebuild/catalog-content/dynamic-plugins.default.yaml | head -5
+
+# Should show:
+# oci://artifactory.company-xxx.com/image/rhdh/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-...
+
+# Also update index.json if present
+if [ -f "/tmp/catalog-rebuild/catalog-content/index.json" ]; then
+  sed -i 's|ghcr.io/|artifactory.company-xxx.com/image/rhdh/|g' \
+    /tmp/catalog-rebuild/catalog-content/index.json
+fi
+
+# Also update catalog-entities YAMLs if present
+find /tmp/catalog-rebuild/catalog-content/catalog-entities -name "*.yaml" -type f 2>/dev/null | \
+  xargs -r sed -i 's|ghcr.io/|artifactory.company-xxx.com/image/rhdh/|g'
+
+# Step 4: Rebuild the catalog index image
+mkdir -p /tmp/catalog-rebuild/build/content
+cp -r /tmp/catalog-rebuild/catalog-content/* /tmp/catalog-rebuild/build/content/
+
+cat > /tmp/catalog-rebuild/build/Dockerfile << 'EOF'
+FROM scratch
+COPY content/ /
+EOF
+
+podman build -t localhost/rhdh-catalog-index-rebuild:1.9 /tmp/catalog-rebuild/build
+
+# Step 5: Push rebuilt catalog index to Artifactory
+skopeo copy --all --dest-tls-verify=false \
+  containers-storage:localhost/rhdh-catalog-index-rebuild:1.9 \
+  docker://artifactory.company-xxx.com/image/rhdh/rhdh/plugin-catalog-index:1.9
+
+# Cleanup
+podman rmi localhost/rhdh-catalog-index-rebuild:1.9 2>/dev/null
+rm -rf /tmp/catalog-rebuild
+```
+
+The key fix is the sed replacement: `ghcr.io/` becomes `artifactory.company-xxx.com/image/rhdh/` — which preserves `redhat-developer/rhdh-plugin-export-overlays/` in the path. So the final OCI paths in the catalog index will be:
+```
+oci://artifactory.company-xxx.com/image/rhdh/redhat-developer/rhdh-plugin-export-overlays/<plugin>:<tag>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 ---
 # =============================================================================
 # Backstage CR - RHDH 1.9 (v1alpha5)
