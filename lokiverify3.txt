@@ -1,0 +1,9 @@
+oc exec -n rhdh $(oc get pod -n rhdh -l app.kubernetes.io/name=backstage -o name | head -1) \
+  -c backstage-backend -- ls /opt/app-root/src/dynamic-plugins/dist/ | grep rbac
+
+# Ground truth 1: what's in the catalog index yaml (ghcr.io plugin names + tags)
+# (extract from your mirrored catalog index as shown above)
+
+# Ground truth 2: what's physically bundled in the container
+oc exec -n rhdh $(oc get pod -n rhdh -l app.kubernetes.io/name=backstage -o name | head -1) \
+  -c backstage-backend -- ls /opt/app-root/src/dynamic-plugins/dist/ | sort
