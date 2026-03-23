@@ -1,3 +1,23 @@
+# From the dirs you already have downloaded
+
+skopeo copy --all --dest-tls-verify=false \
+  dir:/tmp/ghcr-plugins/argocd-backend \
+  docker://artifactory.company-xxx.com/local-docker-ocpcaas-image/rhdh/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-argocd-backend:bs_1.45.3__1.0.2
+
+skopeo copy --all --dest-tls-verify=false \
+  dir:/tmp/ghcr-plugins/argocd-frontend \
+  docker://artifactory.company-xxx.com/local-docker-ocpcaas-image/rhdh/redhat-developer/rhdh-plugin-export-overlays/backstage-community-plugin-argocd:bs_1.45.3__2.4.3
+
+skopeo copy --all --dest-tls-verify=false \
+  dir:/tmp/ghcr-plugins/roadie-argocd-backend \
+  docker://artifactory.company-xxx.com/local-docker-ocpcaas-image/rhdh/redhat-developer/rhdh-plugin-export-overlays/roadiehq-backstage-plugin-argo-cd-backend:bs_1.45.3__4.6.0
+
+skopeo copy --all --dest-tls-verify=false \
+  dir:/tmp/ghcr-plugins/roadie-scaffolder-argocd \
+  docker://artifactory.company-xxx.com/local-docker-ocpcaas-image/rhdh/redhat-developer/rhdh-plugin-export-overlays/roadiehq-scaffolder-backend-argocd:bs_1.45.3__1.8.1
+
+
+
 # Step 1: Pull the ORIGINAL catalog index (from your existing Artifactory mirror
 #         or re-mirror from quay.io if the current one is already corrupted)
 HTTPS_PROXY=http://PROXY_IP:3128 \
