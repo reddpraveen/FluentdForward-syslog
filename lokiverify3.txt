@@ -1,3 +1,60 @@
+---
+# =============================================================================
+# Backstage CR - RHDH 1.9 (v1alpha5)
+#
+# extraEnvs.envs schema (from oc explain backstage.spec.application.extraEnvs.envs):
+#   - containers: list of container names to inject the env var into
+#   - name: env var name
+#   - value: env var value
+#
+# CATALOG_INDEX_IMAGE targets only the install-dynamic-plugins init container.
+# REGISTRY_AUTH_FILE also targets only install-dynamic-plugins.
+#
+# Merge into your existing CR: oc edit backstage developer-hub -n rhdh
+# =============================================================================
+apiVersion: rhdh.redhat.com/v1alpha5
+kind: Backstage
+metadata:
+  name: developer-hub
+  namespace: rhdh
+spec:
+  application:
+    appConfig:
+      mountPath: /opt/app-root/src
+      configMaps:
+        - name: app-config-rhdh
+    dynamicPluginsConfigMapName: dynamic-plugins-rhdh
+    extraEnvs:
+      envs:
+        - name: CATALOG_INDEX_IMAGE
+          value: 'artifactory.company-xxx.com/rhdh/rhdh/plugin-catalog-index:1.9'
+          containers:
+            - install-dynamic-plugins
+        - name: REGISTRY_AUTH_FILE
+          value: '/dynamic-plugins-root/.registry-auth/auth.json'
+          containers:
+            - install-dynamic-plugins
+      secrets:
+        - name: rhdh-secrets
+    extraFiles:
+      mountPath: /opt/app-root/src
+    imagePullSecrets:
+      - rhdh-pull-secret
+    replicas: 1
+    route:
+      enabled: true
+  database:
+    enableLocalDb: true
+
+
+
+
+
+
+
+
+
+
 #!/bin/bash
 # =============================================================================
 # incorporate-plugins-into-catalog-index.sh
