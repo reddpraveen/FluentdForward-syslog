@@ -1,3 +1,53 @@
+#!/bin/bash
+set -euo pipefail
+
+# ———————————————————–
+
+# Label MachineSets, Machines, and Nodes with a desired label
+
+# Update these variables as needed
+
+# ———————————————————–
+
+LABEL_KEY=“cni”
+LABEL_VALUE=“enabled”
+LABEL=”${LABEL_KEY}=${LABEL_VALUE}”
+MACHINE_API_NS=“openshift-machine-api”
+
+printf “=== Labeling all MachineSets with %s ===\n” “$LABEL”
+for ms in $(oc get machinesets -n “$MACHINE_API_NS” -o name); do
+printf “  MachineSet: %s\n” “$ms”
+oc patch “$ms” -n “$MACHINE_API_NS”   
+–type merge   
+-p “{"spec":{"template":{"spec":{"metadata":{"labels":{"${LABEL_KEY}":"${LABEL_VALUE}"}}}}}}”
+done
+
+printf “\n=== Labeling all Machines with %s ===\n” “$LABEL”
+for machine in $(oc get machines -n “$MACHINE_API_NS” -o name); do
+printf “  Machine: %s\n” “$machine”
+oc label “$machine” -n “$MACHINE_API_NS” “$LABEL” –overwrite
+done
+
+printf “\n=== Labeling all Nodes with %s ===\n” “$LABEL”
+for node in $(oc get nodes -o name); do
+printf “  Node: %s\n” “$node”
+oc label “$node” “$LABEL” –overwrite
+done
+
+printf “\n=== Verification ===\n”
+printf “\n– MachineSets –\n”
+oc get machinesets -n “$MACHINE_API_NS” -o custom-columns=NAME:.metadata.name,LABEL:.spec.template.spec.metadata.labels.”${LABEL_KEY}”
+
+printf “\n– Machines –\n”
+oc get machines -n “$MACHINE_API_NS” -o custom-columns=NAME:.metadata.name,LABEL:.metadata.labels.”${LABEL_KEY}”
+
+printf “\n– Nodes –\n”
+oc get nodes -l “${LABEL}” -o custom-columns=NAME:.metadata.name,LABEL:.metadata.labels.”${LABEL_KEY}”
+
+printf “\nDone.\n”
+
+
+
 You have bastion internet access, which Red Hat calls "partially disconnected." Their prescribed approach:
 Step 1 — Download the mirroring script on your bastion:
 bashcurl -sSLO https://raw.githubusercontent.com/redhat-developer/rhdh-operator/refs/heads/release-1.9/.rhdh/scripts/prepare-restricted-environment.sh
