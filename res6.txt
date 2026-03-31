@@ -1,0 +1,302 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns.namespace | quote }}
+  labels:
+    {{- /* Governance labels */ -}}
+    {{- if $ns.map_id }}
+    mapid: {{ $ns.map_id | quote }}
+    {{- end }}
+    {{- if $ns.intake_number }}
+    intake_number: {{ $ns.intake_number | quote }}
+    {{- end }}
+    {{- if $ns.environment }}
+    env: {{ $ns.environment | upper | quote }}
+    {{- end }}
+    {{- if $ns.platform }}
+    hosted_on: {{ $ns.platform | quote }}
+    {{- end }}
+    {{- if $ns.team_name }}
+    team: {{ $ns.team_name | quote }}
+    {{- end }}
+    {{- /* Cluster monitoring */ -}}
+    {{- if eq ($ns.clusterMonitoring | default false | toString) "true" }}
+    openshift.io/cluster-monitoring: "true"
+    {{- end }}
+    {{- /* ArgoCD managed-by */ -}}
+    {{- if eq ($ns.managedByArgocd | default false | toString) "true" }}
+    argocd.argoproj.io/managed-by: {{ $.Values.global.application_gitops_namespace }}
+    {{- end }}
+    {{- /* Custom labels */ -}}
+    {{- range $k, $v := $ns.labels | default dict }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    {{- /* Common chart labels */ -}}
+    {{- include "common.labels" $ | nindent 4 }}
+  annotations:
+    {{- if $ns.description }}
+    openshift.io/description: {{ $ns.description | quote }}
+    {{- end }}
+    openshift.io/display-name: {{ $ns.namespace | quote }}
+    {{- if $ns.nodeselector }}
+    openshift.io/node-selector: lob={{ $ns.nodeselector }}
+    {{- end }}
+{{- end }}
+
+
+
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $role := $ns.roles | default list }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $role.group | lower | replace "_" "-" | trunc 63 }}-{{ $ns.namespace }}
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+subjects:
+  - kind: {{ $role.kind | default "Group" }}
+    name: {{ $role.group }}
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: {{ $role.role }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+
+
+
+
+
+Standardized Input Schema
+Define this clearly before writing any templates. This is the contract between the support team and the chart:
+yaml# Field reference for ocp-proj-onboarding chart
+# Each namespace entry in the list supports these fields:
+
+namespaces:
+  - namespace: string        # REQUIRED. The namespace name. K8s naming rules.
+    
+    # -- Governance (labels applied to namespace) --
+    map_id: string            # 8-digit cost allocation ID
+    intake_number: string     # TO-XXXXXX format
+    environment: string       # dev / sit / uat / prod
+    platform: string          # Azure / On_Prem
+    team_name: string         # owning team name
+    
+    # -- Namespace config --
+    description: string       # openshift.io/description annotation
+    nodeselector: string      # LOB name -> becomes "lob=<value>" annotation
+    clusterMonitoring: bool   # default false. Enables openshift.io/cluster-monitoring label
+    managedByArgocd: bool     # default false. Adds argocd.argoproj.io/managed-by label
+    enabled: bool             # default true. Set false to stop rendering (soft delete)
+    
+    # -- Custom labels (any key-value pairs) --
+    labels: map               # additional namespace labels beyond governance fields
+    
+    # -- RBAC --
+    roles: list               # each entry creates one RoleBinding
+      - group: string         # AD group name (kind: Group)
+        role: string          # ClusterRole to bind (admin/edit/view/custom-admin)
+        kind: string          # optional, default "Group". Can be "User" or "ServiceAccount"
+    
+    # -- Future (Phase 2) --
+    quota_tier: string        # small / medium / large
+    ldap_groups: list         # OCP Group objects to create
+    
+    # -- Audit (chart ignores these, humans read them) --
+    change_ref: string        # CHG-XXXXXXX
+    created: string           # date
+    last_modified: string     # date
+Template Design Principles
+Before you write any template, follow these rules:
+Rule 1: Always check enabled first
+yaml{{- if ne ($ns.enabled | default true | toString) "false" }}
+This lets users soft-delete a namespace by setting enabled: false without removing the entry from the file. The entry stays for audit, but nothing renders.
+Rule 2: Use | default for every optional field
+yaml{{- if $ns.description }}              # field might not exist
+{{- range $ns.roles | default list }}  # list might not exist
+{{- range $k, $v := $ns.labels | default dict }}  # map might not exist
+This ensures the template never fails on a minimal input (just namespace + governance fields).
+Rule 3: Generate deterministic resource names
+RoleBinding names must be deterministic from input so ArgoCD can track them across updates:
+yamlname: {{ $role.role }}-{{ $ns.namespace }}         # BAD: if two groups have same role, collision
+name: {{ $role.group }}-{{ $ns.namespace }}         # BETTER: group name is unique per namespace
+name: {{ $role.group | lower }}-{{ $ns.namespace }} # BEST: lowercase for K8s naming
+But AD group names can be long and have uppercase. So use a truncated hash or sanitized name:
+yamlname: {{ printf "%s-%s" ($role.group | lower | replace "_" "-") $ns.namespace | trunc 253 }}
+Rule 4: Labels must be complete — not additive
+ArgoCD compares the full label set. If your template renders 3 labels but the namespace has 5, ArgoCD will remove the 2 extras (with prune: true or ServerSideApply). So render ALL labels every time:
+yamllabels:
+    # Governance labels (always present if field exists)
+    {{- if $ns.map_id }}
+    mapid: {{ $ns.map_id | quote }}
+    {{- end }}
+    # ... other governance labels ...
+    
+    # Custom labels (whatever the user specified)
+    {{- range $k, $v := $ns.labels | default dict }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    
+    # Standard labels (always present)
+    {{- include "common.labels" $ | nindent 4 }}
+The Two Starter Templates
+1. namespace.yaml
+yaml{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns.namespace | quote }}
+  labels:
+    {{- /* Governance labels */ -}}
+    {{- if $ns.map_id }}
+    mapid: {{ $ns.map_id | quote }}
+    {{- end }}
+    {{- if $ns.intake_number }}
+    intake_number: {{ $ns.intake_number | quote }}
+    {{- end }}
+    {{- if $ns.environment }}
+    env: {{ $ns.environment | upper | quote }}
+    {{- end }}
+    {{- if $ns.platform }}
+    hosted_on: {{ $ns.platform | quote }}
+    {{- end }}
+    {{- if $ns.team_name }}
+    team: {{ $ns.team_name | quote }}
+    {{- end }}
+    {{- /* Cluster monitoring */ -}}
+    {{- if eq ($ns.clusterMonitoring | default false | toString) "true" }}
+    openshift.io/cluster-monitoring: "true"
+    {{- end }}
+    {{- /* ArgoCD managed-by */ -}}
+    {{- if eq ($ns.managedByArgocd | default false | toString) "true" }}
+    argocd.argoproj.io/managed-by: {{ $.Values.global.application_gitops_namespace }}
+    {{- end }}
+    {{- /* Custom labels */ -}}
+    {{- range $k, $v := $ns.labels | default dict }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    {{- /* Common chart labels */ -}}
+    {{- include "common.labels" $ | nindent 4 }}
+  annotations:
+    {{- if $ns.description }}
+    openshift.io/description: {{ $ns.description | quote }}
+    {{- end }}
+    openshift.io/display-name: {{ $ns.namespace | quote }}
+    {{- if $ns.nodeselector }}
+    openshift.io/node-selector: lob={{ $ns.nodeselector }}
+    {{- end }}
+{{- end }}
+{{- end }}
+2. namespace-rbac.yaml
+yaml{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $role := $ns.roles | default list }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $role.group | lower | replace "_" "-" | trunc 63 }}-{{ $ns.namespace }}
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+subjects:
+  - kind: {{ $role.kind | default "Group" }}
+    name: {{ $role.group }}
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: {{ $role.role }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}
+{{- end }}
+Edge Case Scenarios — What Happens
+Scenario 1: Add a role to existing namespace
+Input before:
+yaml  - namespace: lob1-payments-dev
+    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+Input after (added view):
+yaml  - namespace: lob1-payments-dev
+    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+      - group: OCP-LOB1-PAYMENTS-VIEW
+        role: view
+What happens: Chart now renders TWO RoleBindings. ArgoCD sees the second one is new, creates it. First one unchanged, no-op.
+Scenario 2: Change a role
+Input before:
+yaml    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+Input after (changed to custom-admin):
+yaml    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: custom-admin
+What happens: RoleBinding name stays the same (based on group name, not role). ArgoCD sees roleRef.name changed from admin to custom-admin. It updates the RoleBinding.
+Important caveat: Kubernetes does NOT allow updating roleRef on an existing RoleBinding — it's immutable. ArgoCD will detect this and delete + recreate the RoleBinding automatically. This is standard K8s behavior and is handled correctly.
+Scenario 3: Remove a role
+Input before:
+yaml    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+      - group: OCP-LOB1-PAYMENTS-VIEW
+        role: view
+Input after (removed view):
+yaml    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+What happens with prune: false: The VIEW RoleBinding stays on the cluster. ArgoCD shows it as "orphaned" but does not delete it. This is safe for the migration period.
+What happens with prune: true: ArgoCD deletes the VIEW RoleBinding. This is the desired behavior in steady state.
+Scenario 4: Add a label
+Input before:
+yaml  - namespace: lob1-payments-dev
+    map_id: "12345678"
+Input after (added custom label):
+yaml  - namespace: lob1-payments-dev
+    map_id: "12345678"
+    labels:
+      app: payments
+What happens: Namespace template renders with the new label. ArgoCD adds it. Existing governance labels untouched.
+Scenario 5: Change nodeSelector
+Input before:
+yaml    nodeselector: lob1
+Input after:
+yaml    nodeselector: lob1-gpu
+What happens: Namespace annotation openshift.io/node-selector changes from lob=lob1 to lob=lob1-gpu. ArgoCD updates the annotation. Existing pods are NOT affected — nodeSelector only applies to new pod scheduling.
+Scenario 6: Disable a namespace (soft delete)
+Input:
+yaml  - namespace: lob1-old-app-dev
+    enabled: false
+    # ... all other fields preserved for audit
+```
+
+**What happens:** Template skips this entry entirely. No Namespace, no RoleBindings rendered for it. With `prune: true`, ArgoCD removes the resources from the cluster. With `prune: false`, they stay. The input entry remains in the file as an audit record of what used to exist.
+
+## The Chart Structure
+```
+GitOps-HelmCharts/
+  charts/
+    ocp-proj-onboarding/
+      Chart.yaml
+      values.yaml                   # defaults (empty namespaces list)
+      templates/
+        _helpers.tpl                # common.labels helper
+        namespace.yaml              # Namespace resource
+        namespace-rbac.yaml         # RoleBinding per role entry
+        networkpolicy.yaml          # default NetworkPolicy (Phase 1)
+        resourcequota.yaml          # ResourceQuota from quota_tier (Phase 2)
+        group.yaml                  # OCP Group for LDAP sync (Phase 2)
