@@ -1,0 +1,61 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- if $ns.quota_tier }}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ $ns.namespace }}-limits
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      {{- if eq $ns.quota_tier "small" }}
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi
+      max:
+        cpu: "2"
+        memory: 4Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+      {{- else if eq $ns.quota_tier "medium" }}
+      default:
+        cpu: 500m
+        memory: 512Mi
+      defaultRequest:
+        cpu: 200m
+        memory: 256Mi
+      max:
+        cpu: "4"
+        memory: 8Gi
+      min:
+        cpu: 50m
+        memory: 64Mi
+      {{- else if eq $ns.quota_tier "large" }}
+      default:
+        cpu: "1"
+        memory: 1Gi
+      defaultRequest:
+        cpu: 500m
+        memory: 512Mi
+      max:
+        cpu: "8"
+        memory: 16Gi
+      min:
+        cpu: 100m
+        memory: 128Mi
+      {{- else if eq $ns.quota_tier "custom" }}
+      {{- if $ns.limitrange_custom }}
+      {{- toYaml $ns.limitrange_custom | nindent 6 }}
+      {{- end }}
+      {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

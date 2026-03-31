@@ -1,0 +1,94 @@
+lob: lob1
+
+global:
+  application_gitops_namespace: openshift-gitops
+
+namespaces:
+
+  - namespace: lob1-payments-dev
+    environment: dev
+    platform: Azure
+    nodeselector: lob1
+    map_id: "12345678"
+    intake_number: "TO-000123"
+    team_name: payments-team
+    change_ref: CHG-ABC001
+    description: "payments dev namespace"
+    clusterMonitoring: false
+    managedByArgocd: false
+    quota_tier: small
+    labels:
+      app: payments
+      project: SERVICE
+      tier: backend
+    roles:
+      - group: OCP-LOB1-PAYMENTS-ADMIN
+        role: admin
+      - group: OCP-LOB1-PAYMENTS-VIEW
+        role: view
+      - group: svc-deployer
+        role: edit
+        kind: ServiceAccount
+    clusterRoleBindings:
+      - group: OCP-LOB1-PAYMENTS-CLUSTER-READER
+        role: cluster-reader
+    clusterRoles:
+      - name: lob1-custom-admin
+        rules:
+          - apiGroups: [""]
+            resources: ["pods", "services", "configmaps", "secrets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+          - apiGroups: ["apps"]
+            resources: ["deployments", "statefulsets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    ldap_groups:
+      - OCP-LOB1-PAYMENTS
+    serviceAccounts:
+      - name: deployer-sa
+      - name: monitoring-sa
+        annotations:
+          azure.workload.identity/client-id: "xxxx-xxxx-xxxx"
+    networkPolicy:
+      enabled: true
+      allowFromNamespaces:
+        - lob1-gateway-dev
+        - openshift-logging
+    created: "2026-03-15"
+    last_modified: "2026-03-31"
+
+  - namespace: lob1-reporting-dev
+    environment: dev
+    platform: Azure
+    map_id: "87654321"
+    intake_number: "TO-000456"
+    team_name: reporting-team
+    change_ref: CHG-XYZ002
+    description: "reporting dev namespace"
+    created: "2026-03-20"
+    last_modified: "2026-03-31"
+
+  - namespace: lob1-batch-dev
+    environment: dev
+    platform: Azure
+    map_id: "11111111"
+    intake_number: "TO-000789"
+    team_name: batch-team
+    change_ref: CHG-BAT003
+    description: "batch processing dev"
+    roles:
+      - group: OCP-LOB1-BATCH-EDIT
+        role: edit
+    created: "2026-03-25"
+    last_modified: "2026-03-31"
+
+  - namespace: lob1-old-service-dev
+    enabled: false
+    environment: dev
+    platform: Azure
+    map_id: "99999999"
+    intake_number: "TO-000999"
+    team_name: decommissioned-team
+    change_ref: CHG-DEL001
+    description: "decommissioned"
+    created: "2025-01-01"
+    last_modified: "2026-03-31"

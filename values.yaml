@@ -1,0 +1,4 @@
+global:
+  application_gitops_namespace: openshift-gitops
+
+namespaces: []

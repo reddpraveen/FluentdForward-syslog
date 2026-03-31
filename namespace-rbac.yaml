@@ -1,0 +1,56 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $role := $ns.roles | default list }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "rolebinding.name" (dict "group" $role.group "namespace" $ns.namespace) }}
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+    platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+    platform.company-xxx.com/role: {{ $role.role | quote }}
+subjects:
+  - kind: {{ $role.kind | default "Group" }}
+    name: {{ $role.group }}
+    {{- if eq ($role.kind | default "Group") "ServiceAccount" }}
+    namespace: {{ $role.serviceAccountNamespace | default $ns.namespace }}
+    {{- else }}
+    apiGroup: rbac.authorization.k8s.io
+    {{- end }}
+roleRef:
+  kind: ClusterRole
+  name: {{ $role.role }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}
+{{- end }}
+---
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $crb := $ns.clusterRoleBindings | default list }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "clusterrolebinding.name" (dict "group" $crb.group "namespace" $ns.namespace) }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+    platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+    platform.company-xxx.com/role: {{ $crb.role | quote }}
+subjects:
+  - kind: {{ $crb.kind | default "Group" }}
+    name: {{ $crb.group }}
+    {{- if eq ($crb.kind | default "Group") "ServiceAccount" }}
+    namespace: {{ $crb.serviceAccountNamespace | default $ns.namespace }}
+    {{- else }}
+    apiGroup: rbac.authorization.k8s.io
+    {{- end }}
+roleRef:
+  kind: ClusterRole
+  name: {{ $crb.role }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}
+{{- end }}

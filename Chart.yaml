@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ocp-proj-onboarding
+description: OCP namespace onboarding chart with readable input format
+version: 0.1.0
+type: application
+maintainers:
+  - name: Platform Team
+keywords:
+  - namespace
+  - rbac
+  - onboarding
+  - gitops

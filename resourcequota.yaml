@@ -1,0 +1,51 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- if $ns.quota_tier }}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ $ns.namespace }}-quota
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+spec:
+  hard:
+    {{- if eq $ns.quota_tier "small" }}
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    pods: "20"
+    persistentvolumeclaims: "10"
+    services: "10"
+    configmaps: "30"
+    secrets: "20"
+    {{- else if eq $ns.quota_tier "medium" }}
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "40"
+    persistentvolumeclaims: "20"
+    services: "20"
+    configmaps: "50"
+    secrets: "30"
+    {{- else if eq $ns.quota_tier "large" }}
+    requests.cpu: "16"
+    requests.memory: 32Gi
+    limits.cpu: "32"
+    limits.memory: 64Gi
+    pods: "80"
+    persistentvolumeclaims: "40"
+    services: "40"
+    configmaps: "100"
+    secrets: "50"
+    {{- else if eq $ns.quota_tier "custom" }}
+    {{- range $k, $v := $ns.quota_custom | default dict }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

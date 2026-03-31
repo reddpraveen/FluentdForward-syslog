@@ -1,0 +1,21 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $sa := $ns.serviceAccounts | default list }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $sa.name }}
+  namespace: {{ $ns.namespace | quote }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+    platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+  {{- if $sa.annotations }}
+  annotations:
+    {{- range $k, $v := $sa.annotations }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

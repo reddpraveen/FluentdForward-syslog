@@ -1,0 +1,199 @@
+# ============================================================================
+# GitHub Copilot Local Development Guide
+# ============================================================================
+# How to continue building the ocp-gitops-platform solution locally.
+# ============================================================================
+
+
+# STEP 1: SET UP LOCAL WORKSPACE
+# ============================================================================
+
+# Clone the repo
+git clone https://github.xxx.com/org-xxx/ocp-gitops-platform.git
+cd ocp-gitops-platform
+
+# Create the full directory structure
+mkdir -p charts/ocp-proj-onboarding/templates
+mkdir -p onboarding/ocp4ec
+mkdir -p onboarding/ocp4uat
+mkdir -p onboarding/ocp4prod
+mkdir -p schemas
+mkdir -p scripts
+mkdir -p .github/workflows
+mkdir -p .github/ISSUE_TEMPLATE
+mkdir -p argocd
+
+# Copy the delivered chart files into charts/ocp-proj-onboarding/
+# Copy the delivered applicationset into argocd/
+# Copy/create your input files in onboarding/<cluster>/
+
+
+# STEP 2: TEST CHART LOCALLY
+# ============================================================================
+
+cd charts/ocp-proj-onboarding
+
+# Test with full-featured input
+helm template test-release . \
+  -f ../../onboarding/ocp4ec/lob1.input.yaml \
+  --debug 2>&1 | tee /tmp/helm-output.yaml
+
+# Count rendered resources
+helm template test-release . \
+  -f ../../onboarding/ocp4ec/lob1.input.yaml | \
+  grep "^kind:" | sort | uniq -c
+
+# Validate with kubeconform (install from github.com/yannh/kubeconform)
+helm template test-release . \
+  -f ../../onboarding/ocp4ec/lob1.input.yaml | \
+  kubeconform -strict -
+
+
+# STEP 3: COPILOT PROMPTS FOR REMAINING COMPONENTS
+# ============================================================================
+
+# --- For schemas/input-v1-schema.json ---
+# Prompt:
+# "Create a JSON Schema (draft-07) that validates this YAML structure:
+#  Top-level keys: lob (string, required), global (object), namespaces (list).
+#  Each namespace entry has: namespace (required, pattern ^[a-z][a-z0-9-]{2,62}$),
+#  map_id (pattern ^[0-9]{8}$), intake_number (pattern ^TO-[0-9]{6}$),
+#  change_ref (pattern ^CHG-[A-Z0-9]+$), environment (enum dev/sit/uat/prod),
+#  platform (enum Azure/On_Prem), quota_tier (enum small/medium/large/custom),
+#  enabled (boolean, default true), roles (list of {group, role, kind}),
+#  clusterRoleBindings (list), clusterRoles (list), labels (map),
+#  ldap_groups (list of strings), serviceAccounts (list), networkPolicy (object).
+#  All fields optional except namespace."
+
+# --- For scripts/validate_input.py ---
+# Prompt:
+# "Create a Python script that validates onboarding input YAML files.
+#  It should: load YAML, validate against JSON schema at schemas/input-v1-schema.json,
+#  check governance regex (map_id 8 digits, intake_number TO-XXXXXX,
+#  change_ref CHG-XXXXXXX, namespace lowercase hyphens),
+#  detect duplicate namespaces across all input files in onboarding/ directory.
+#  Args: --input (file), --schema (file), --onboarding-dir (directory).
+#  Exit 0 on success, exit 1 with detailed error messages.
+#  Use pyyaml and jsonschema. Use printf style output not print()."
+
+# --- For scripts/patch_input_from_form.py ---
+# Prompt:
+# "Create a Python script that reads GitHub Actions form fields from env vars
+#  and merges into an onboarding input YAML file.
+#  Env vars: CLUSTER (dropdown value like ocp4ec), PROJECT_NAME (namespace name),
+#  CREATE_PROJECT (yes|lob1 OR no), SYNC_LDAP (yes|groupname OR no),
+#  MAP_ID_INTAKE (12345678|TO-000123), QUOTA_TIER (small/medium/large),
+#  PROJECT_GROUP (groupname|role), CHANGE_INFO (CHG-xxx|team), LABELS (k=v,k=v).
+#  File path: onboarding/<CLUSTER>/<lob>.input.yaml where lob comes from
+#  CREATE_PROJECT second part.
+#  For existing namespaces: update in place (roles appended by group key,
+#  labels merged, scalars overwritten).
+#  For new namespaces: append to the list.
+#  The file format is a list under 'namespaces:' key.
+#  Use pyyaml. No special characters in output."
+
+# --- For .github/workflows/validate-pr.yml ---
+# Prompt:
+# "Create a GitHub Actions workflow triggered on pull_request for paths
+#  onboarding/**. Jobs: install yamllint pyyaml jsonschema via pip,
+#  run yamllint on onboarding/ directory,
+#  run scripts/validate_input.py on each changed .input.yaml file.
+#  Runs on ubuntu-latest."
+
+# --- For .github/workflows/provision-resource.yml ---
+# Prompt:
+# "Create a GitHub Actions workflow with workflow_dispatch and 10 inputs:
+#  project_name (string, required), cluster (choice: ocp4ec/ocp4sit/ocp4uat/ocp4prod),
+#  create_project (string: yes|lob OR no), sync_new_ldap_group (string: yes|group OR no),
+#  map_id_intake_number (string), quota_tier (choice: small/medium/large),
+#  project_group (string), change_info (string), labels (string),
+#  project_template (choice: no/yes).
+#  Job: checkout, pip install pyyaml, run patch_input_from_form.py with inputs as env vars,
+#  run validate_input.py, git checkout -b branch, git add onboarding/, git commit,
+#  git push, gh pr create. Uses secrets.GITOPS_BOT_TOKEN."
+
+
+# STEP 4: TROUBLESHOOTING HELM TEMPLATES
+# ============================================================================
+
+# Error: "nil pointer evaluating interface {}.fieldname"
+# Fix: add | default before accessing
+#   $ns.fieldname | default ""
+
+# Error: "can't evaluate field X in type interface {}"
+# Fix: use | default list or | default dict
+#   $ns.roles | default list
+#   $ns.labels | default dict
+
+# Error: "invalid value; expected string"
+# Fix: add | quote or | toString
+#   mapid: $ns.map_id | quote
+
+# Error: template renders nothing (empty output)
+# Fix: check enabled field
+#   if ne ($ns.enabled | default true | toString) "false"
+
+# Error: resource name invalid (uppercase, too long)
+# Fix: use the sanitize.name helper and trunc
+
+
+# STEP 5: TEST SCENARIOS
+# ============================================================================
+
+# Minimal namespace (just required fields)
+# -> should render: 1 Namespace, 3 NetworkPolicies, nothing else
+
+# Add roles to existing namespace
+# -> should render: Namespace + RoleBindings, no quota/limitrange
+
+# Full featured (all fields)
+# -> should render: Namespace, RoleBindings, ClusterRoleBinding,
+#    ClusterRole, ResourceQuota, LimitRange, NetworkPolicies,
+#    ServiceAccounts, Group
+
+# Disabled namespace
+# -> should render: nothing at all for that entry
+
+
+# STEP 6: END-TO-END TEST SEQUENCE
+# ============================================================================
+
+# 1. helm template test . -f ../../onboarding/ocp4ec/lob1.input.yaml --debug
+# 2. Push chart + input to main
+# 3. Register repo in ArgoCD if not done
+# 4. Label test cluster secret with platform.company-xxx.com/onboarding=true
+# 5. Apply applicationset: oc apply -f argocd/applicationset-onboarding.yaml -n openshift-gitops
+# 6. Verify: oc get applications -n openshift-gitops -l app.kubernetes.io/managed-by=gitops-platform
+# 7. Verify on target: oc get namespace <name>, oc get rolebinding -n <name>
+# 8. Test iteration: add namespace to input, push, verify sync
+# 9. Test form: run provision-resource.yml from Actions tab
+# 10. Test validation: create PR with invalid input, verify validate-pr blocks it
+
+
+# STEP 7: COPILOT CONTEXT PROMPT
+# ============================================================================
+# Paste this at the start of any Copilot session for full context:
+#
+# "I am building a GitOps namespace onboarding platform for OpenShift.
+#  Architecture:
+#  - Single repo (ocp-gitops-platform) contains a Helm chart AND input files
+#  - Input files at onboarding/<cluster>/<lob>.input.yaml are human-readable
+#  - The Helm chart at charts/ocp-proj-onboarding/ reads these as values
+#  - ArgoCD ApplicationSet on hub cluster auto-generates Applications
+#  - Matrix generator: clusters (labeled) x git file generator (input files)
+#  - goTemplate mode. FastTemplate did not work for .path.path
+#  - The chart iterates over .Values.namespaces (a LIST, not a map)
+#  - Each namespace entry has flat fields: namespace, map_id, environment,
+#    roles[], clusterRoleBindings[], clusterRoles[], labels{}, quota_tier,
+#    ldap_groups[], serviceAccounts[], networkPolicy{}, etc.
+#  - Templates render: Namespace, RoleBinding, ClusterRoleBinding, ClusterRole,
+#    NetworkPolicy, ResourceQuota, LimitRange, ServiceAccount, Group
+#  - enabled: false skips rendering (soft delete)
+#  - Audit fields (change_ref, created, last_modified) are ignored by templates
+#  - No render step, no cross-repo PRs, ArgoCD reads input files directly
+#  - GitHub Actions form (10 fields) patches input files via Python script
+#  - GHES 3.18.4 with 10-field workflow_dispatch limit
+#  - OCP 4.18 on Azure, banking environment
+#  - Single source ApplicationSet: chart and values in same repo,
+#    valueFiles uses relative path ../../onboarding/<cluster>/<lob>.input.yaml
+#  - lob field at top level of input file for ApplicationSet extraction"

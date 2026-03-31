@@ -1,0 +1,44 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ocp-namespace-onboarding
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - matrix:
+        generators:
+          - clusters:
+              selector:
+                matchLabels:
+                  platform.company-xxx.com/onboarding: "true"
+          - git:
+              repoURL: https://github.xxx.com/org-xxx/ocp-gitops-platform.git
+              revision: main
+              files:
+                - path: "onboarding/{{ .name }}/*.input.yaml"
+  template:
+    metadata:
+      name: "{{ .name | lower }}-{{ .lob | lower }}-onboarding"
+      labels:
+        app.kubernetes.io/managed-by: gitops-platform
+        platform.company-xxx.com/lob: "{{ .lob }}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.xxx.com/org-xxx/ocp-gitops-platform.git
+        targetRevision: main
+        path: charts/ocp-proj-onboarding
+        helm:
+          valueFiles:
+            - "../../onboarding/{{ .name }}/{{ .lob }}.input.yaml"
+      destination:
+        server: "{{ .server }}"
+      syncPolicy:
+        automated:
+          selfHeal: true
+          prune: false
+        syncOptions:
+          - CreateNamespace=true
+          - RespectIgnoreDifferences=true

@@ -1,0 +1,16 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+{{- range $group := $ns.ldap_groups | default list }}
+---
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata:
+  name: {{ $group }}
+  labels:
+    {{- include "common.labels" $ | nindent 4 }}
+    platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+    platform.company-xxx.com/ldap-sync: "true"
+users: []
+{{- end }}
+{{- end }}
+{{- end }}

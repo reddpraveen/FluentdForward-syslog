@@ -1,0 +1,43 @@
+{{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | default true | toString) "false" }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns.namespace | quote }}
+  labels:
+    {{- if $ns.map_id }}
+    mapid: {{ $ns.map_id | quote }}
+    {{- end }}
+    {{- if $ns.intake_number }}
+    intake_number: {{ $ns.intake_number | quote }}
+    {{- end }}
+    {{- if $ns.environment }}
+    env: {{ $ns.environment | upper | quote }}
+    {{- end }}
+    {{- if $ns.platform }}
+    hosted_on: {{ $ns.platform | quote }}
+    {{- end }}
+    {{- if $ns.team_name }}
+    team: {{ $ns.team_name | quote }}
+    {{- end }}
+    {{- if eq ($ns.clusterMonitoring | default false | toString) "true" }}
+    openshift.io/cluster-monitoring: "true"
+    {{- end }}
+    {{- if eq ($ns.managedByArgocd | default false | toString) "true" }}
+    argocd.argoproj.io/managed-by: {{ $.Values.global.application_gitops_namespace }}
+    {{- end }}
+    {{- range $k, $v := $ns.labels | default dict }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+    {{- include "common.labels" $ | nindent 4 }}
+  annotations:
+    {{- if $ns.description }}
+    openshift.io/description: {{ $ns.description | quote }}
+    {{- end }}
+    openshift.io/display-name: {{ $ns.namespace | quote }}
+    {{- if $ns.nodeselector }}
+    openshift.io/node-selector: lob={{ $ns.nodeselector }}
+    {{- end }}
+{{- end }}
+{{- end }}
