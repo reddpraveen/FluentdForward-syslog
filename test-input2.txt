@@ -1,0 +1,507 @@
+# FILE: charts/ocp-proj-onboarding/Chart.yaml
+
+apiVersion: v2
+name: ocp-proj-onboarding
+description: OCP namespace onboarding chart with readable input format
+version: 0.1.0
+type: application
+maintainers:
+
+- name: Platform Team
+  keywords:
+- namespace
+- rbac
+- onboarding
+- gitops
+
+# FILE: charts/ocp-proj-onboarding/values.yaml
+
+global:
+application_gitops_namespace: openshift-gitops
+
+namespaces: []
+
+# FILE: charts/ocp-proj-onboarding/templates/_helpers.tpl
+
+{{- define “common.labels” -}}
+app.kubernetes.io/managed-by: gitops-platform
+{{- end }}
+
+{{- define “sanitize.name” -}}
+{{- . | lower | replace “_” “-” | replace “ “ “-” | trunc 63 | trimSuffix “-” }}
+{{- end }}
+
+{{- define “rolebinding.name” -}}
+{{- $sanitizedGroup := include “sanitize.name” .group }}
+{{- printf “%s-%s” $sanitizedGroup .namespace | trunc 253 | trimSuffix “-” }}
+{{- end }}
+
+{{- define “clusterrolebinding.name” -}}
+{{- $sanitizedGroup := include “sanitize.name” .group }}
+{{- printf “crb-%s-%s” $sanitizedGroup .namespace | trunc 253 | trimSuffix “-” }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/namespace.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+
+apiVersion: v1
+kind: Namespace
+metadata:
+name: {{ $ns.namespace | quote }}
+labels:
+{{- if $ns.map_id }}
+mapid: {{ $ns.map_id | quote }}
+{{- end }}
+{{- if $ns.intake_number }}
+intake_number: {{ $ns.intake_number | quote }}
+{{- end }}
+{{- if $ns.environment }}
+env: {{ $ns.environment | upper | quote }}
+{{- end }}
+{{- if $ns.platform }}
+hosted_on: {{ $ns.platform | quote }}
+{{- end }}
+{{- if $ns.team_name }}
+team: {{ $ns.team_name | quote }}
+{{- end }}
+{{- if eq ($ns.clusterMonitoring | toString) “true” }}
+openshift.io/cluster-monitoring: “true”
+{{- end }}
+{{- if eq ($ns.managedByArgocd | toString) “true” }}
+argocd.argoproj.io/managed-by: {{ $.Values.global.application_gitops_namespace }}
+{{- end }}
+{{- range $k, $v := $ns.labels | default dict }}
+{{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- include “common.labels” $ | nindent 4 }}
+annotations:
+{{- if $ns.description }}
+openshift.io/description: {{ $ns.description | quote }}
+{{- end }}
+openshift.io/display-name: {{ $ns.namespace | quote }}
+{{- if $ns.nodeselector }}
+openshift.io/node-selector: lob={{ $ns.nodeselector }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/namespace-rbac.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- range $role := $ns.roles | default list }}
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+name: {{ include “rolebinding.name” (dict “group” $role.group “namespace” $ns.namespace) }}
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+platform.company-xxx.com/role: {{ $role.role | quote }}
+subjects:
+
+- kind: {{ $role.kind | default “Group” }}
+  name: {{ $role.group }}
+  {{- if eq ($role.kind | default “Group”) “ServiceAccount” }}
+  namespace: {{ $role.serviceAccountNamespace | default $ns.namespace }}
+  {{- else }}
+  apiGroup: rbac.authorization.k8s.io
+  {{- end }}
+  roleRef:
+  kind: ClusterRole
+  name: {{ $role.role }}
+  apiGroup: rbac.authorization.k8s.io
+  {{- end }}
+  {{- end }}
+  {{- end }}
+  {{- range $ns := .Values.namespaces }}
+  {{- if ne ($ns.enabled | toString) “false” }}
+  {{- range $crb := $ns.clusterRoleBindings | default list }}
+
+-----
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+name: {{ include “clusterrolebinding.name” (dict “group” $crb.group “namespace” $ns.namespace) }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+platform.company-xxx.com/role: {{ $crb.role | quote }}
+subjects:
+
+- kind: {{ $crb.kind | default “Group” }}
+  name: {{ $crb.group }}
+  {{- if eq ($crb.kind | default “Group”) “ServiceAccount” }}
+  namespace: {{ $crb.serviceAccountNamespace | default $ns.namespace }}
+  {{- else }}
+  apiGroup: rbac.authorization.k8s.io
+  {{- end }}
+  roleRef:
+  kind: ClusterRole
+  name: {{ $crb.role }}
+  apiGroup: rbac.authorization.k8s.io
+  {{- end }}
+  {{- end }}
+  {{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/cluster-role.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- range $cr := $ns.clusterRoles | default list }}
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+name: {{ $cr.name }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+rules:
+{{- toYaml $cr.rules | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/networkpolicy.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- $npEnabled := true }}
+{{- if $ns.networkPolicy }}
+{{- if eq ($ns.networkPolicy.enabled | toString) “false” }}
+{{- $npEnabled = false }}
+{{- end }}
+{{- end }}
+{{- if $npEnabled }}
+
+## apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+name: allow-from-openshift-ingress
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+podSelector: {}
+ingress:
+- from:
+- namespaceSelector:
+matchLabels:
+network.openshift.io/policy-group: ingress
+policyTypes:
+- Ingress
+
+## apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+name: allow-from-openshift-monitoring
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+podSelector: {}
+ingress:
+- from:
+- namespaceSelector:
+matchLabels:
+network.openshift.io/policy-group: monitoring
+policyTypes:
+- Ingress
+
+## apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+name: allow-from-same-namespace
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+podSelector: {}
+ingress:
+- from:
+- podSelector: {}
+policyTypes:
+- Ingress
+{{- if $ns.networkPolicy }}
+{{- range $allowNs := $ns.networkPolicy.allowFromNamespaces | default list }}
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+name: allow-from-{{ $allowNs | lower | replace “_” “-” | trunc 50 }}
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+podSelector: {}
+ingress:
+- from:
+- namespaceSelector:
+matchLabels:
+kubernetes.io/metadata.name: {{ $allowNs }}
+policyTypes:
+- Ingress
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/resourcequota.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- if $ns.quota_tier }}
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+name: {{ $ns.namespace }}-quota
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+hard:
+{{- if eq $ns.quota_tier “small” }}
+requests.cpu: “4”
+requests.memory: 8Gi
+limits.cpu: “8”
+limits.memory: 16Gi
+pods: “20”
+persistentvolumeclaims: “10”
+services: “10”
+configmaps: “30”
+secrets: “20”
+{{- else if eq $ns.quota_tier “medium” }}
+requests.cpu: “8”
+requests.memory: 16Gi
+limits.cpu: “16”
+limits.memory: 32Gi
+pods: “40”
+persistentvolumeclaims: “20”
+services: “20”
+configmaps: “50”
+secrets: “30”
+{{- else if eq $ns.quota_tier “large” }}
+requests.cpu: “16”
+requests.memory: 32Gi
+limits.cpu: “32”
+limits.memory: 64Gi
+pods: “80”
+persistentvolumeclaims: “40”
+services: “40”
+configmaps: “100”
+secrets: “50”
+{{- else if eq $ns.quota_tier “custom” }}
+{{- range $k, $v := $ns.quota_custom | default dict }}
+{{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/limitrange.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- if $ns.quota_tier }}
+
+apiVersion: v1
+kind: LimitRange
+metadata:
+name: {{ $ns.namespace }}-limits
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+spec:
+limits:
+- type: Container
+{{- if eq $ns.quota_tier “small” }}
+default:
+cpu: 200m
+memory: 256Mi
+defaultRequest:
+cpu: 100m
+memory: 128Mi
+max:
+cpu: “2”
+memory: 4Gi
+min:
+cpu: 50m
+memory: 64Mi
+{{- else if eq $ns.quota_tier “medium” }}
+default:
+cpu: 500m
+memory: 512Mi
+defaultRequest:
+cpu: 200m
+memory: 256Mi
+max:
+cpu: “4”
+memory: 8Gi
+min:
+cpu: 50m
+memory: 64Mi
+{{- else if eq $ns.quota_tier “large” }}
+default:
+cpu: “1”
+memory: 1Gi
+defaultRequest:
+cpu: 500m
+memory: 512Mi
+max:
+cpu: “8”
+memory: 16Gi
+min:
+cpu: 100m
+memory: 128Mi
+{{- else if eq $ns.quota_tier “custom” }}
+{{- if $ns.limitrange_custom }}
+{{- toYaml $ns.limitrange_custom | nindent 6 }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/namespace-sa.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- range $sa := $ns.serviceAccounts | default list }}
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+name: {{ $sa.name }}
+namespace: {{ $ns.namespace | quote }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+{{- if $sa.annotations }}
+annotations:
+{{- range $k, $v := $sa.annotations }}
+{{ $k }}: {{ $v | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: charts/ocp-proj-onboarding/templates/group.yaml
+
+## {{- range $ns := .Values.namespaces }}
+{{- if ne ($ns.enabled | toString) “false” }}
+{{- range $group := $ns.ldap_groups | default list }}
+
+apiVersion: user.openshift.io/v1
+kind: Group
+metadata:
+name: {{ $group }}
+labels:
+{{- include “common.labels” $ | nindent 4 }}
+platform.company-xxx.com/namespace: {{ $ns.namespace | quote }}
+platform.company-xxx.com/ldap-sync: “true”
+users: []
+{{- end }}
+{{- end }}
+{{- end }}
+
+# FILE: argocd/applicationset-onboarding.yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+name: ocp-namespace-onboarding
+namespace: openshift-gitops
+spec:
+goTemplate: true
+goTemplateOptions: [“missingkey=error”]
+generators:
+- matrix:
+generators:
+- clusters:
+selector:
+matchLabels:
+platform.company-xxx.com/onboarding: “true”
+- git:
+repoURL: https://github.xxx.com/org-xxx/ocp-gitops-platform.git
+revision: main
+files:
+- path: “onboarding/{{ .name }}/*.input.yaml”
+template:
+metadata:
+name: “{{ .name | lower }}-{{ .lob | lower }}-onboarding”
+labels:
+app.kubernetes.io/managed-by: gitops-platform
+platform.company-xxx.com/lob: “{{ .lob }}”
+spec:
+project: default
+source:
+repoURL: https://github.xxx.com/org-xxx/ocp-gitops-platform.git
+targetRevision: main
+path: charts/ocp-proj-onboarding
+helm:
+valueFiles:
+- “../../onboarding/{{ .name }}/{{ .lob }}.input.yaml”
+destination:
+server: “{{ .server }}”
+syncPolicy:
+automated:
+selfHeal: true
+prune: false
+syncOptions:
+- CreateNamespace=true
+- RespectIgnoreDifferences=true
+
+# FILE: onboarding/ocp4ec/lob1.input.yaml (EXAMPLE)
+
+lob: lob1
+
+global:
+application_gitops_namespace: openshift-gitops
+
+namespaces:
+
+- namespace: lob1-payments-dev
+  environment: dev
+  platform: Azure
+  nodeselector: lob1
+  map_id: “12345678”
+  intake_number: “TO-000123”
+  team_name: payments-team
+  change_ref: CHG-ABC001
+  quota_tier: small
+  description: “payments dev namespace”
+  labels:
+  app: payments
+  project: SERVICE
+  roles:
+  - group: OCP-LOB1-PAYMENTS-ADMIN
+    role: admin
+  - group: OCP-LOB1-PAYMENTS-VIEW
+    role: view
+    ldap_groups:
+  - OCP-LOB1-PAYMENTS
+    created: “2026-03-15”
+    last_modified: “2026-03-31”
+- namespace: lob1-reporting-dev
+  environment: dev
+  platform: Azure
+  map_id: “87654321”
+  intake_number: “TO-000456”
+  team_name: reporting-team
+  change_ref: CHG-XYZ002
+  description: “reporting dev namespace”
+  roles:
+  - group: OCP-LOB1-REPORTING-VIEW
+    role: view
+    created: “2026-03-20”
+    last_modified: “2026-03-31”
