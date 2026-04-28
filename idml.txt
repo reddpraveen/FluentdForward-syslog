@@ -1,0 +1,1754 @@
+# Complete Import Guide for Confluence
+
+## 🎯 RECOMMENDED: Confluence Storage Format (XML) - EASIEST!
+
+This gives you **perfect formatting** with one simple import!
+
+### Quick Steps (Takes 2 minutes):
+
+1. **Edit your Confluence page**
+2. **Press `Ctrl+Shift+D`** (or click **...** → **Insert markup**)
+3. **Open `confluence-storage-format.xml` in a text editor**
+4. **Copy ALL content** (Ctrl+A, Ctrl+C)
+5. **Paste into Confluence markup dialog**
+6. **Click "Insert"**
+7. **Save page** ✅
+
+**Result:** Complete documentation with perfect formatting!
+
+---
+
+## All Available Formats:
+
+| File | Format | Best For | Import Method |
+|------|--------|----------|---------------|
+| **confluence-storage-format.xml** | Confluence XML | **★ BEST - Perfect formatting** | Ctrl+Shift+D → Paste |
+| **ibm-license-operator-architecture.html** | HTML | Easy copy-paste | Copy from browser → Paste |
+| **ibm-license-operator-architecture.drawio** | Draw.io | Visual diagrams | Draw.io plugin → Import |
+| **diagrams-visual-text.md** | Text/Markdown | No plugins needed | Code block → Paste |
+
+---
+
+## Format Comparison:
+
+### ✅ Confluence Storage Format XML (RECOMMENDED)
+**Best for:** Complete documentation with all formatting
+
+**Pros:**
+- ✅ Perfect tables, panels, code blocks
+- ✅ Colored info/warning/success boxes
+- ✅ Expandable sections
+- ✅ Proper syntax highlighting
+- ✅ One-click import
+
+**Import:** `Ctrl+Shift+D` → Paste XML
+
+---
+
+### ✅ HTML Format
+**Best for:** Quick import when XML method doesn't work
+
+**Pros:**
+- ✅ Easy copy-paste from browser
+- ✅ Good formatting preservation
+- ✅ Works in all Confluence versions
+
+**Import:** Open HTML → Copy all → Paste in Confluence
+
+---
+
+### ✅ Draw.io Format
+**Best for:** Interactive visual diagrams
+
+**Pros:**
+- ✅ Color-coded diagrams
+- ✅ Editable in Confluence
+- ✅ Professional appearance
+- ✅ Can export as images
+
+**Import:** Draw.io macro → Import file
+
+**Requires:** Draw.io Confluence plugin
+
+---
+
+### ✅ Text/Markdown Format
+**Best for:** When no plugins available
+
+**Pros:**
+- ✅ Works everywhere
+- ✅ No special requirements
+- ✅ Pure ASCII diagrams
+
+**Import:** Code block macro → Paste
+
+---
+
+## Detailed Import Instructions:
+
+### Method 1: Confluence Storage Format (XML) ⭐ RECOMMENDED
+
+**Step-by-step:**
+
+```
+1. Open your Confluence page in EDIT mode
+
+2. Click anywhere on the page
+
+3. Open Insert Markup dialog:
+   • Windows/Linux: Ctrl + Shift + D
+   • Mac: Cmd + Shift + D
+   • OR: Click "..." menu → "Insert markup"
+
+4. Open confluence-storage-format.xml in Notepad/TextEdit
+
+5. Select ALL content:
+   • Windows/Linux: Ctrl + A
+   • Mac: Cmd + A
+
+6. Copy:
+   • Windows/Linux: Ctrl + C
+   • Mac: Cmd + C
+
+7. Go back to Confluence markup dialog
+
+8. Paste:
+   • Windows/Linux: Ctrl + V
+   • Mac: Cmd + V
+
+9. Click "Insert" button
+
+10. Save your Confluence page
+
+11. Done! ✅
+```
+
+**What you get:**
+- ✅ Properly formatted tables
+- ✅ Colored panels (blue info, green success, orange warning)
+- ✅ Code blocks with syntax highlighting
+- ✅ Expandable sections
+- ✅ Table of contents
+- ✅ All headings and structure
+
+---
+
+### Method 2: HTML Import
+
+**Step-by-step:**
+
+```
+1. Open ibm-license-operator-architecture.html in your browser
+   (Chrome, Firefox, Edge, Safari - any browser)
+
+2. Select ALL content on the page:
+   • Windows/Linux: Ctrl + A
+   • Mac: Cmd + A
+
+3. Copy:
+   • Windows/Linux: Ctrl + C
+   • Mac: Cmd + C
+
+4. Go to your Confluence page in EDIT mode
+
+5. Click where you want the content
+
+6. Paste:
+   • Windows/Linux: Ctrl + V
+   • Mac: Cmd + V
+
+7. Review and adjust any formatting if needed
+
+8. Save page
+
+9. Done! ✅
+```
+
+**What you get:**
+- ✅ Good overall formatting
+- ✅ Tables preserved
+- ✅ Code blocks formatted
+- ✅ May need minor adjustments
+
+---
+
+### Method 3: Draw.io Diagram
+
+**Prerequisites:** Draw.io plugin installed in Confluence
+
+**Step-by-step:**
+
+```
+1. Edit your Confluence page
+
+2. Click "+" button (Insert content)
+
+3. Search for "Draw.io" or "Diagrams"
+
+4. Click "Draw.io Diagram" macro
+
+5. In the Draw.io editor that opens:
+   • Click "File" menu
+   • Click "Import from"
+   • Select "Device"
+   • Choose ibm-license-operator-architecture.drawio
+
+6. The complete diagram will load
+
+7. Click "Save" in Draw.io editor
+
+8. Give it a name: "IBM License Operator Architecture"
+
+9. Save your Confluence page
+
+10. Done! ✅
+```
+
+**What you get:**
+- ✅ Interactive diagram
+- ✅ Color-coded components
+- ✅ Editable later
+- ✅ Professional appearance
+
+**Alternative if no Draw.io plugin:**
+```
+1. Go to https://app.diagrams.net/
+2. File → Open → Choose ibm-license-operator-architecture.drawio
+3. File → Export as → PNG (or SVG)
+4. Set zoom to 200%
+5. Download image
+6. Insert image into Confluence page
+```
+
+---
+
+### Method 4: Text Diagrams (Fallback)
+
+**Step-by-step:**
+
+```
+1. Open diagrams-visual-text.md in a text editor
+
+2. Find the diagram you want (there are 5 diagrams)
+
+3. Copy the diagram section
+
+4. In Confluence, insert a "Code Block" macro:
+   • Type "/code" and press Enter
+   • OR: Insert → Other macros → Code Block
+
+5. Set language to "text" or "none"
+
+6. Paste the diagram
+
+7. Save
+
+8. Done! ✅
+```
+
+**What you get:**
+- ✅ ASCII art diagrams
+- ✅ Works without plugins
+- ✅ Fixed-width font formatting
+- ❌ No colors or interactivity
+
+---
+
+## What's Included:
+
+### 📄 Complete Documentation Contains:
+
+1. **Architecture Overview**
+   - Two-phase deployment model
+   - Operator vs Operand explanation
+
+2. **Complete Architecture Diagram**
+   - Control Plane (API Server, etcd, Scheduler)
+   - OLM components
+   - Phase 1: Operator resources
+   - Phase 2: Operand resources
+
+3. **RBAC Architecture**
+   - Operator ClusterRole permissions
+   - Operand ClusterRole + Role permissions
+   - Complete permission tables
+
+4. **Deployment Sequence Flow**
+   - 25-step installation timeline
+   - From OLM install to running pods
+
+5. **License Collection Mechanism**
+   - Pod discovery via annotations
+   - VPC calculation (CPU limits → VPCs)
+   - Example pod with annotations
+   - API response examples
+
+6. **Security Context Constraints**
+   - SCC profile: restricted
+   - Allowed and blocked operations
+   - Enforcement mechanism
+
+7. **Control Plane Integration**
+   - API Server authorization
+   - etcd state storage
+   - Scheduler placement
+   - Controller Manager GC
+
+8. **Resource Summary Tables**
+   - Phase 1: 5 resources
+   - Phase 2: 11 resources
+   - Complete with scope and purpose
+
+9. **API Access Guide**
+   - Internal access
+   - External access via Route
+   - Example curl commands
+   - Bearer token authentication
+
+10. **Troubleshooting Commands**
+    - Check operator status
+    - Check operand status
+    - Verify RBAC permissions
+
+### 🎨 Draw.io Diagram Contains:
+
+- OpenShift Control Plane components
+- OLM installation flow
+- Phase 1 & 2 resource boxes
+- RBAC permission flow
+- Service networking
+- Color-coded legend
+- Interactive connections
+
+---
+
+## Troubleshooting:
+
+### ❌ "Insert markup" option not available?
+
+**Solutions:**
+1. Check if you have edit permissions
+2. Try the HTML method instead
+3. Contact Confluence admin - may be restricted
+4. Use "Insert → Other macros → Markup"
+
+---
+
+### ❌ XML paste doesn't work?
+
+**Solutions:**
+1. Make sure you copied the ENTIRE XML file (from `<?xml` to `</ac:confluence>`)
+2. Try pasting in Source Editor mode
+3. Use HTML method instead
+4. Check Confluence version (older versions may not support)
+
+---
+
+### ❌ Formatting looks wrong after HTML paste?
+
+**Solutions:**
+1. Click "Source" or "View source" in editor
+2. Adjust table widths manually
+3. Fix code block formatting
+4. Use "Clear formatting" then reapply
+
+---
+
+### ❌ Draw.io plugin not installed?
+
+**Solutions:**
+1. Ask Confluence admin to install from Atlassian Marketplace
+2. Search: "draw.io Diagrams for Confluence"
+3. Alternative: Use app.diagrams.net → Export as PNG
+4. Insert PNG image into Confluence
+
+---
+
+### ❌ Text diagrams look messy?
+
+**Solutions:**
+1. Use Code Block macro (not pre-formatted text)
+2. Set language to "text" or "plain text"
+3. Enable line numbers: NO
+4. Enable word wrap: NO
+5. Use fixed-width font
+6. Adjust Confluence page width if too narrow
+
+---
+
+## Tips for Best Results:
+
+### ✅ For Confluence Storage Format (XML):
+- Always copy the COMPLETE file
+- Use `Ctrl+A` in text editor to ensure everything is selected
+- Don't modify the XML before pasting
+- If it fails, your Confluence may restrict XML - use HTML instead
+
+### ✅ For HTML:
+- Open in browser first, then copy
+- Don't copy directly from text editor
+- Let browser render it, then copy the rendered content
+- May need to adjust table widths after paste
+
+### ✅ For Draw.io:
+- Diagram is editable after import
+- You can change colors, text, layout
+- Can add more components
+- Export as PNG if you want static image
+
+### ✅ For Text Diagrams:
+- Always use Code Block macro
+- Never use regular paragraph text
+- Disable word wrap
+- Use fixed-width (monospace) font
+
+---
+
+## Which Method Should I Use?
+
+### 🥇 **If you want the BEST result:**
+→ Use **Confluence Storage Format (XML)**
+
+### 🥈 **If XML doesn't work:**
+→ Use **HTML** (very good fallback)
+
+### 🥉 **If you want visual diagrams:**
+→ Use **Draw.io** (requires plugin)
+
+### 🏅 **If you have no plugins:**
+→ Use **Text Diagrams** (works anywhere)
+
+---
+
+## Quick Reference Table:
+
+| Need | Use This | Import Time | Quality |
+|------|----------|-------------|---------|
+| Complete docs with perfect formatting | **XML** | 2 min | ★★★★★ |
+| Quick import, good formatting | **HTML** | 3 min | ★★★★☆ |
+| Interactive visual diagram | **Draw.io** | 5 min | ★★★★★ |
+| Basic diagrams, no plugins | **Text** | 2 min | ★★★☆☆ |
+
+---
+
+## Still Need Help?
+
+**For XML import issues:**
+- Ensure you're in edit mode
+- Try Insert → Other macros → "Markup"
+- Contact Confluence admin if restricted
+
+**For HTML issues:**
+- Try different browser
+- Clear clipboard and try again
+- Paste in Source mode
+
+**For Draw.io issues:**
+- Check Apps → Find new apps
+- Search "Draw.io Diagrams"
+- Install if not available
+- Use export to PNG as alternative
+
+**For general issues:**
+- Start with HTML - most compatible
+- Text diagrams work everywhere
+- Contact me if you need different format
+
+---
+
+## 🎯 Bottom Line:
+
+**Start with `confluence-storage-format.xml`** - It's specifically designed for Confluence and gives you the best results with minimal effort!
+
+If that doesn't work, **use the HTML file** - it's the next best thing and works in all Confluence versions.
+
+For visual diagrams, **add the Draw.io file** to your page for an interactive experience.
+
+---
+
+**Last Updated:** January 2026  
+**Operator Version:** IBM License Operator v4.2.19  
+**Platform:** OpenShift 4.16
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IBM License Operator Architecture - v4.2.19</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f4f5f7;
+        }
+        h1, h2, h3 { color: #172B4D; }
+        h1 { border-bottom: 3px solid #0052CC; padding-bottom: 10px; }
+        h2 { border-bottom: 2px solid #0052CC; padding-bottom: 8px; margin-top: 40px; }
+        .info-box {
+            background-color: #DEEBFF;
+            border-left: 4px solid #0052CC;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .success-box {
+            background-color: #E3FCEF;
+            border-left: 4px solid #00875A;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .warning-box {
+            background-color: #FFF4E6;
+            border-left: 4px solid #FF8B00;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .error-box {
+            background-color: #FFEBE6;
+            border-left: 4px solid #DE350B;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        pre {
+            background-color: #F4F5F7;
+            border: 1px solid #DFE1E6;
+            border-radius: 3px;
+            padding: 15px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+        }
+        code {
+            background-color: #F4F5F7;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            background-color: white;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border: 1px solid #DFE1E6;
+        }
+        th {
+            background-color: #F4F5F7;
+            font-weight: 600;
+        }
+        tr:hover {
+            background-color: #F4F5F7;
+        }
+        ul, ol {
+            padding-left: 30px;
+        }
+        li {
+            margin: 8px 0;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .badge-blue { background-color: #DEEBFF; color: #0052CC; }
+        .badge-green { background-color: #E3FCEF; color: #00875A; }
+        .badge-orange { background-color: #FFF4E6; color: #FF8B00; }
+        .badge-red { background-color: #FFEBE6; color: #DE350B; }
+    </style>
+</head>
+<body>
+
+<h1>IBM License Operator Architecture - v4.2.19</h1>
+<p><strong>OpenShift Version:</strong> 4.16 | <strong>Last Updated:</strong> January 2026</p>
+
+<div class="info-box">
+    <strong>📘 About This Document</strong><br>
+    This document provides comprehensive architecture diagrams and documentation for the IBM License Operator (ibm-licensing-operator) version 4.2.19 on OpenShift 4.16.
+</div>
+
+<hr>
+
+<h2>Table of Contents</h2>
+<ol>
+    <li><a href="#overview">Architecture Overview</a></li>
+    <li><a href="#complete-arch">Complete Architecture Diagram</a></li>
+    <li><a href="#rbac">RBAC Architecture</a></li>
+    <li><a href="#deployment">Deployment Sequence Flow</a></li>
+    <li><a href="#license">License Collection Mechanism</a></li>
+    <li><a href="#security">Security Context Constraints</a></li>
+    <li><a href="#control-plane">Control Plane Integration</a></li>
+    <li><a href="#resources">Resource Summary</a></li>
+    <li><a href="#api">API Access</a></li>
+    <li><a href="#troubleshooting">Troubleshooting</a></li>
+</ol>
+
+<hr>
+
+<h2 id="overview">1. Architecture Overview</h2>
+
+<div class="success-box">
+    <h3>Two-Phase Deployment Model</h3>
+    
+    <h4>Phase 1: Operator Installation (One-time)</h4>
+    <ul>
+        <li>CRD creation (ibmlicensings.operator.ibm.com)</li>
+        <li>Operator ServiceAccount, ClusterRole, ClusterRoleBinding</li>
+        <li>Operator Deployment and Pod</li>
+        <li>Operator watches for IBMLicensing CRs cluster-wide</li>
+    </ul>
+    
+    <h4>Phase 2: Instance Creation (Per IBMLicensing CR)</h4>
+    <ul>
+        <li>Triggered when user creates IBMLicensing Custom Resource</li>
+        <li>Operand RBAC resources (ServiceAccount, Roles, Bindings)</li>
+        <li>Configuration resources (ConfigMap, Secret)</li>
+        <li>Networking resources (Service, Route)</li>
+        <li>Workload resources (Deployments for License Service and Usage Collector)</li>
+    </ul>
+</div>
+
+<hr>
+
+<h2 id="complete-arch">2. Complete Architecture Diagram</h2>
+
+<pre>
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   OPENSHIFT CONTROL PLANE                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │ API Server   │  │ Scheduler    │  │ etcd         │  │ Controller   │       │
+│  │ • Auth       │  │ • Placement  │  │ • State      │  │ Manager      │       │
+│  │ • RBAC       │  │              │  │ Storage      │  │ • GC         │       │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   OPERATOR LIFECYCLE MANAGER (OLM)                              │
+│  ┌───────────────────────────────────────────────────────────────┐             │
+│  │ CatalogSource → Subscription → ClusterServiceVersion (CSV)    │             │
+│  │ ibm-operator-catalog    v4.2      ibm-licensing-operator      │             │
+│  └───────────────────────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+╔═════════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 1: OPERATOR INSTALLATION (namespace: ibm-common-services)                ║
+╚═════════════════════════════════════════════════════════════════════════════════╝
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ CRD: ibmlicensings.operator.ibm.com (v1alpha1)                  │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │ ServiceAccount   │→ │ ClusterRole      │→ │ ClusterRole      │
+  │ ibm-licensing-   │  │ ibm-licensing-   │  │ Binding          │
+  │ operator         │  │ operator         │  │                  │
+  └──────────────────┘  └──────────────────┘  └──────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-operator                              │
+  │   Pod: ibm-licensing-operator-xxx                               │
+  │     Container: manager                                          │
+  │       • Watches IBMLicensing CRs                                │
+  │       • Reconciles resources                                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+                          👇 User Creates IBMLicensing CR
+
+╔═════════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 2: IBMLicensing INSTANCE RESOURCES (created by operator)                ║
+╚═════════════════════════════════════════════════════════════════════════════════╝
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ IBMLicensing CR                                                 │
+  │ apiVersion: operator.ibm.com/v1alpha1                           │
+  │ kind: IBMLicensing                                              │
+  │ metadata:                                                       │
+  │   name: instance1                                               │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  RBAC Resources:
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │ ServiceAccount   │→ │ ClusterRole      │→ │ ClusterRole      │
+  │ ibm-licensing-   │  │ ibm-licensing-   │  │ Binding          │
+  │ service          │  │ service          │  │                  │
+  └──────────────────┘  └──────────────────┘  └──────────────────┘
+  
+  Configuration:
+  ┌──────────────────┐  ┌──────────────────┐
+  │ ConfigMap        │  │ Secret           │
+  │ ibm-licensing-   │  │ ibm-licensing-   │
+  │ config           │  │ token            │
+  └──────────────────┘  └──────────────────┘
+  
+  Networking:
+  ┌──────────────────┐  ┌──────────────────┐
+  │ Service          │← │ Route            │
+  │ Port: 8080       │  │ HTTPS (external) │
+  └──────────────────┘  └──────────────────┘
+  
+  Workloads:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-service-instance1                     │
+  │   Pod: ibm-licensing-service-xxx                                │
+  │     • Exposes API: /status, /snapshot, /products                │
+  │     • Queries K8s API for licensed pods                         │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-usage-instance1                       │
+  │   Pod: ibm-licensing-usage-xxx                                  │
+  │     • Collects license metrics                                  │
+  └─────────────────────────────────────────────────────────────────┘
+</pre>
+
+<hr>
+
+<h2 id="rbac">3. RBAC Architecture</h2>
+
+<h3>3.1 Operator RBAC (Cluster-scoped)</h3>
+
+<div class="success-box">
+    <p><strong>ServiceAccount:</strong> ibm-licensing-operator</p>
+    <p><strong>Namespace:</strong> ibm-common-services</p>
+    
+    <p><strong>ClusterRole Permissions:</strong></p>
+    <table>
+        <tr>
+            <th>API Group</th>
+            <th>Resources</th>
+            <th>Verbs</th>
+        </tr>
+        <tr>
+            <td>operator.ibm.com</td>
+            <td>ibmlicensings, ibmlicensings/status, ibmlicensings/finalizers</td>
+            <td>* (all)</td>
+        </tr>
+        <tr>
+            <td>apps</td>
+            <td>deployments</td>
+            <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+            <td>"" (core)</td>
+            <td>services, secrets, configmaps, serviceaccounts, pods</td>
+            <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+            <td>route.openshift.io</td>
+            <td>routes</td>
+            <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+            <td>rbac.authorization.k8s.io</td>
+            <td>roles, rolebindings, clusterroles, clusterrolebindings</td>
+            <td>get, list, watch, create, update, patch, delete</td>
+        </tr>
+    </table>
+    
+    <p><strong>Purpose:</strong> Operator can create and manage all resources needed for operand deployment</p>
+</div>
+
+<h3>3.2 Operand RBAC (Mixed scope)</h3>
+
+<div class="warning-box">
+    <p><strong>ServiceAccount:</strong> ibm-licensing-service</p>
+    <p><strong>Namespace:</strong> ibm-common-services</p>
+    
+    <p><strong>ClusterRole Permissions (Cluster-wide):</strong></p>
+    <table>
+        <tr>
+            <th>API Group</th>
+            <th>Resources</th>
+            <th>Verbs</th>
+        </tr>
+        <tr>
+            <td>"" (core)</td>
+            <td>pods, services, namespaces, nodes, limitranges, resourcequotas</td>
+            <td>list, get, watch</td>
+        </tr>
+        <tr>
+            <td>apps</td>
+            <td>deployments, statefulsets, daemonsets</td>
+            <td>list, get</td>
+        </tr>
+    </table>
+    
+    <p><strong>Role Permissions (Namespace-scoped):</strong></p>
+    <table>
+        <tr>
+            <th>API Group</th>
+            <th>Resources</th>
+            <th>Verbs</th>
+        </tr>
+        <tr>
+            <td>"" (core)</td>
+            <td>configmaps, secrets, pods, services</td>
+            <td>get, list, watch</td>
+        </tr>
+    </table>
+    
+    <p><strong>Purpose:</strong> Operand can discover licensed pods across the cluster and read configuration from its namespace</p>
+</div>
+
+<hr>
+
+<h2 id="license">5. License Collection Mechanism</h2>
+
+<div class="success-box">
+    <h3>How License Data is Collected</h3>
+    
+    <h4>Step 1: Pod Discovery</h4>
+    <ul>
+        <li>License Service queries Kubernetes API to list all pods</li>
+        <li>Filters pods that have license annotations</li>
+        <li>Required annotations: productName, productID, productMetric, productChargedContainers</li>
+    </ul>
+    
+    <h4>Step 2: Resource Calculation</h4>
+    <ul>
+        <li>Extracts CPU limits from charged containers in each pod</li>
+        <li>Converts CPU limits to VPCs (Virtual Processor Cores)</li>
+        <li>Formula: <strong>1000m (1 CPU core) = 1 VPC</strong></li>
+        <li>Example: Container with 2000m CPU limit = 2 VPCs</li>
+    </ul>
+    
+    <h4>Step 3: Aggregation</h4>
+    <ul>
+        <li>Groups usage by productName and productID</li>
+        <li>Sums total VPCs per product across all pods</li>
+        <li>Updates metrics every 30 minutes (polling interval)</li>
+    </ul>
+    
+    <h4>Step 4: API Exposure</h4>
+    <ul>
+        <li>GET /status - Service health check</li>
+        <li>GET /products - List of detected products</li>
+        <li>POST /snapshot - Complete license usage snapshot (JSON)</li>
+        <li>Authentication: Bearer token from Secret (ibm-licensing-token)</li>
+    </ul>
+</div>
+
+<h3>Example Pod Annotations</h3>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-0
+  namespace: kafka-prod
+  annotations:
+    productName: "IBM Event Streams"
+    productID: "5737-H33"
+    productVersion: "11.0.0"
+    productMetric: "VIRTUAL_PROCESSOR_CORE"
+    productChargedContainers: "kafka"
+spec:
+  containers:
+  - name: kafka
+    image: cp.icr.io/cp/ibm-eventstreams-kafka:11.0.0
+    resources:
+      limits:
+        cpu: "2"        # 2 CPU cores = 2 VPCs
+        memory: 4Gi
+</code></pre>
+
+<hr>
+
+<h2 id="api">9. API Access</h2>
+
+<div class="info-box">
+    <h3>Accessing the License Service API</h3>
+    
+    <h4>Internal Access (within cluster):</h4>
+    <pre>http://ibm-licensing-service-instance1.ibm-common-services.svc:8080</pre>
+    
+    <h4>External Access (via Route):</h4>
+    <pre># Get the route URL
+oc get route ibm-licensing-service-instance1 -n ibm-common-services
+
+# Get the API token
+TOKEN=$(oc get secret ibm-licensing-token -n ibm-common-services -o jsonpath='{.data.token}' | base64 -d)
+
+# Call the API
+curl -k -H "Authorization: Bearer $TOKEN" \
+  https://ibm-licensing-service-instance1-ibm-common-services.apps.cluster.domain/snapshot</pre>
+    
+    <h4>Available Endpoints:</h4>
+    <ul>
+        <li><code>GET /status</code> - Service health and version</li>
+        <li><code>GET /products</code> - List of detected licensed products</li>
+        <li><code>POST /snapshot</code> - Current license usage snapshot (JSON)</li>
+    </ul>
+</div>
+
+<hr>
+
+<h2 id="troubleshooting">10. Troubleshooting Commands</h2>
+
+<h3>Check Operator Status</h3>
+<pre># Check operator pod
+oc get pods -n ibm-common-services -l name=ibm-licensing-operator
+
+# Check operator logs
+oc logs -n ibm-common-services -l name=ibm-licensing-operator
+
+# Check operator RBAC
+oc get clusterrole ibm-licensing-operator
+oc get clusterrolebinding ibm-licensing-operator
+</pre>
+
+<h3>Check Operand Status</h3>
+<pre># Check IBMLicensing CR
+oc get ibmlicensing -n ibm-common-services
+
+# Check operand pods
+oc get pods -n ibm-common-services -l app.kubernetes.io/name=ibm-licensing
+
+# Check service and route
+oc get svc,route -n ibm-common-services -l app.kubernetes.io/name=ibm-licensing
+</pre>
+
+<h3>Verify RBAC Permissions</h3>
+<pre># Check if operator SA can create deployments
+oc auth can-i create deployments \
+  --as=system:serviceaccount:ibm-common-services:ibm-licensing-operator \
+  -n ibm-common-services
+
+# Check if operand SA can list pods cluster-wide
+oc auth can-i list pods \
+  --as=system:serviceaccount:ibm-common-services:ibm-licensing-service \
+  --all-namespaces
+</pre>
+
+<hr>
+
+<div class="info-box">
+    <h3>📌 Important Notes</h3>
+    <ul>
+        <li><strong>Version:</strong> IBM License Operator v4.2.19 on OpenShift 4.16</li>
+        <li><strong>Installation:</strong> Operator installed via OLM in ibm-common-services namespace (or custom)</li>
+        <li><strong>Two Phases:</strong> Phase 1 deploys operator controller, Phase 2 deploys operand resources</li>
+        <li><strong>RBAC:</strong> Operator has cluster-wide create/delete. Operand has cluster-wide READ only.</li>
+        <li><strong>Security:</strong> All components run under OpenShift restricted SCC</li>
+        <li><strong>Monitoring:</strong> License Service polls every 30 minutes for pod discovery</li>
+        <li><strong>API:</strong> External access via Route with bearer token authentication</li>
+    </ul>
+</div>
+
+<hr>
+
+<p><em>Document created: January 2026 | IBM License Operator v4.2.19 | OpenShift 4.16</em></p>
+
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<ac:confluence xmlns:ac="http://www.atlassian.com/schema/confluence/4/ac/" xmlns:ri="http://www.atlassian.com/schema/confluence/4/ri/" xmlns="http://www.atlassian.com/schema/confluence/4/">
+
+<h1>IBM License Operator Architecture - v4.2.19</h1>
+<p><strong>OpenShift Version:</strong> 4.16 | <strong>Last Updated:</strong> January 2026</p>
+
+<ac:structured-macro ac:name="info">
+  <ac:rich-text-body>
+    <p>This document provides comprehensive architecture diagrams and documentation for the IBM License Operator (ibm-licensing-operator) version 4.2.19 on OpenShift 4.16.</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>Table of Contents</h2>
+<p>
+<ac:structured-macro ac:name="toc">
+  <ac:parameter ac:name="maxLevel">3</ac:parameter>
+</ac:structured-macro>
+</p>
+
+<hr/>
+
+<h2>1. Architecture Overview</h2>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="title">Two-Phase Deployment Model</ac:parameter>
+  <ac:parameter ac:name="borderColor">#0052CC</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>Phase 1: Operator Installation</strong> (One-time setup)</p>
+    <ul>
+      <li>CRD creation (ibmlicensings.operator.ibm.com)</li>
+      <li>Operator ServiceAccount, ClusterRole, ClusterRoleBinding</li>
+      <li>Operator Deployment and Pod</li>
+      <li>Operator watches for IBMLicensing CRs cluster-wide</li>
+    </ul>
+    
+    <p><strong>Phase 2: Instance Creation</strong> (Per IBMLicensing CR)</p>
+    <ul>
+      <li>Triggered when user creates IBMLicensing Custom Resource</li>
+      <li>Operand RBAC resources (ServiceAccount, Roles, Bindings)</li>
+      <li>Configuration resources (ConfigMap, Secret)</li>
+      <li>Networking resources (Service, Route)</li>
+      <li>Workload resources (Deployments for License Service and Usage Collector)</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>2. Complete Architecture Diagram</h2>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">text</ac:parameter>
+  <ac:parameter ac:name="title">Complete Architecture Flow</ac:parameter>
+  <ac:parameter ac:name="collapse">false</ac:parameter>
+  <ac:plain-text-body><![CDATA[
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   OPENSHIFT CONTROL PLANE                                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │ API Server   │  │ Scheduler    │  │ etcd         │  │ Controller   │       │
+│  │ • Auth       │  │ • Placement  │  │ • State      │  │ Manager      │       │
+│  │ • RBAC       │  │              │  │ Storage      │  │ • GC         │       │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                   OPERATOR LIFECYCLE MANAGER (OLM)                              │
+│  ┌───────────────────────────────────────────────────────────────┐             │
+│  │ CatalogSource → Subscription → ClusterServiceVersion (CSV)    │             │
+│  │ ibm-operator-catalog    v4.2      ibm-licensing-operator      │             │
+│  └───────────────────────────────────────────────────────────────┘             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+╔═════════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 1: OPERATOR INSTALLATION (namespace: ibm-common-services)                ║
+╚═════════════════════════════════════════════════════════════════════════════════╝
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ CRD: ibmlicensings.operator.ibm.com (v1alpha1)                  │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │ ServiceAccount   │→ │ ClusterRole      │→ │ ClusterRole      │
+  │ ibm-licensing-   │  │ ibm-licensing-   │  │ Binding          │
+  │ operator         │  │ operator         │  │                  │
+  └──────────────────┘  └──────────────────┘  └──────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-operator                              │
+  │   Pod: ibm-licensing-operator-xxx                               │
+  │     Container: manager                                          │
+  │       • Watches IBMLicensing CRs                                │
+  │       • Reconciles resources                                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+                          👇 User Creates IBMLicensing CR
+
+╔═════════════════════════════════════════════════════════════════════════════════╗
+║  PHASE 2: IBMLicensing INSTANCE RESOURCES (created by operator)                ║
+╚═════════════════════════════════════════════════════════════════════════════════╝
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ IBMLicensing CR                                                 │
+  │ apiVersion: operator.ibm.com/v1alpha1                           │
+  │ kind: IBMLicensing                                              │
+  │ metadata:                                                       │
+  │   name: instance1                                               │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  RBAC Resources:
+  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+  │ ServiceAccount   │→ │ ClusterRole      │→ │ ClusterRole      │
+  │ ibm-licensing-   │  │ ibm-licensing-   │  │ Binding          │
+  │ service          │  │ service          │  │                  │
+  └──────────────────┘  └──────────────────┘  └──────────────────┘
+  
+  ┌──────────────────┐  ┌──────────────────┐
+  │ Role (NS-scoped) │→ │ RoleBinding      │
+  │ ibm-licensing-   │  │                  │
+  │ service          │  │                  │
+  └──────────────────┘  └──────────────────┘
+  
+  Configuration:
+  ┌──────────────────┐  ┌──────────────────┐
+  │ ConfigMap        │  │ Secret           │
+  │ ibm-licensing-   │  │ ibm-licensing-   │
+  │ config           │  │ token            │
+  └──────────────────┘  └──────────────────┘
+  
+  Networking:
+  ┌──────────────────┐  ┌──────────────────┐
+  │ Service          │← │ Route            │
+  │ Port: 8080       │  │ HTTPS (external) │
+  └──────────────────┘  └──────────────────┘
+  
+  Workloads:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-service-instance1                     │
+  │   Pod: ibm-licensing-service-xxx                                │
+  │     • Exposes API: /status, /snapshot, /products                │
+  │     • Queries K8s API for licensed pods                         │
+  │     • CPU: 200m limit, Memory: 850Mi limit                      │
+  └─────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────┐
+  │ Deployment: ibm-licensing-usage-instance1                       │
+  │   Pod: ibm-licensing-usage-xxx                                  │
+  │     • Collects license metrics                                  │
+  │     • Calculates VPCs from CPU limits                           │
+  └─────────────────────────────────────────────────────────────────┘
+]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>3. RBAC Architecture</h2>
+
+<h3>3.1 Operator RBAC (Cluster-scoped)</h3>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="bgColor">#E3FCEF</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>ServiceAccount:</strong> ibm-licensing-operator</p>
+    <p><strong>Namespace:</strong> ibm-common-services</p>
+    
+    <p><strong>ClusterRole Permissions:</strong></p>
+    <table>
+      <tbody>
+        <tr>
+          <th>API Group</th>
+          <th>Resources</th>
+          <th>Verbs</th>
+        </tr>
+        <tr>
+          <td>operator.ibm.com</td>
+          <td>ibmlicensings, ibmlicensings/status, ibmlicensings/finalizers</td>
+          <td>* (all)</td>
+        </tr>
+        <tr>
+          <td>apps</td>
+          <td>deployments</td>
+          <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+          <td>"" (core)</td>
+          <td>services, secrets, configmaps, serviceaccounts, pods</td>
+          <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+          <td>route.openshift.io</td>
+          <td>routes</td>
+          <td>list, watch, get, create, update, patch, delete</td>
+        </tr>
+        <tr>
+          <td>rbac.authorization.k8s.io</td>
+          <td>roles, rolebindings, clusterroles, clusterrolebindings</td>
+          <td>get, list, watch, create, update, patch, delete</td>
+        </tr>
+      </tbody>
+    </table>
+    
+    <p><strong>Purpose:</strong> Operator can create and manage all resources needed for operand deployment</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h3>3.2 Operand RBAC (Mixed scope)</h3>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="bgColor">#FFF4E6</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>ServiceAccount:</strong> ibm-licensing-service</p>
+    <p><strong>Namespace:</strong> ibm-common-services</p>
+    
+    <p><strong>ClusterRole Permissions (Cluster-wide):</strong></p>
+    <table>
+      <tbody>
+        <tr>
+          <th>API Group</th>
+          <th>Resources</th>
+          <th>Verbs</th>
+        </tr>
+        <tr>
+          <td>"" (core)</td>
+          <td>pods, services, namespaces, nodes, limitranges, resourcequotas</td>
+          <td>list, get, watch</td>
+        </tr>
+        <tr>
+          <td>apps</td>
+          <td>deployments, statefulsets, daemonsets</td>
+          <td>list, get</td>
+        </tr>
+      </tbody>
+    </table>
+    
+    <p><strong>Role Permissions (Namespace-scoped):</strong></p>
+    <table>
+      <tbody>
+        <tr>
+          <th>API Group</th>
+          <th>Resources</th>
+          <th>Verbs</th>
+        </tr>
+        <tr>
+          <td>"" (core)</td>
+          <td>configmaps, secrets, pods, services</td>
+          <td>get, list, watch</td>
+        </tr>
+      </tbody>
+    </table>
+    
+    <p><strong>Purpose:</strong> Operand can discover licensed pods across the cluster and read configuration from its namespace</p>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>4. Deployment Sequence Flow</h2>
+
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Click to view detailed deployment sequence</ac:parameter>
+  <ac:rich-text-body>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">text</ac:parameter>
+      <ac:parameter ac:name="title">Installation Timeline</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+PHASE 1: OPERATOR INSTALLATION
+================================
+
+Step 1: Admin installs operator via OLM Subscription
+        ↓
+Step 2: OLM creates CRD (ibmlicensings.operator.ibm.com)
+        ↓
+Step 3: OLM creates ClusterRole (operator permissions)
+        ↓
+Step 4: OLM creates ClusterRoleBinding (bind SA → ClusterRole)
+        ↓
+Step 5: OLM creates ServiceAccount (ibm-licensing-operator)
+        ↓
+Step 6: OLM creates Deployment (ibm-licensing-operator)
+        ↓
+Step 7: Scheduler starts Operator Pod
+        ↓
+Step 8: Operator Pod starts watching for IBMLicensing CRs
+
+════════════════════════════════════════════════════════════
+PHASE 1 COMPLETE - Operator Running
+════════════════════════════════════════════════════════════
+
+PHASE 2: INSTANCE CREATION
+===========================
+
+Step 9: User/System creates IBMLicensing CR (instance1)
+        ↓
+Step 10: API Server notifies Operator of CR creation
+        ↓
+Step 11: Operator reconciliation loop begins
+        ↓
+Step 12: Operator creates ServiceAccount (ibm-licensing-service)
+        ↓
+Step 13: Operator creates ClusterRole (operand permissions)
+        ↓
+Step 14: Operator creates ClusterRoleBinding
+        ↓
+Step 15: Operator creates Role (namespace-scoped)
+        ↓
+Step 16: Operator creates RoleBinding
+        ↓
+Step 17: Operator creates ConfigMap (ibm-licensing-config)
+        ↓
+Step 18: Operator creates Secret (ibm-licensing-token)
+        ↓
+Step 19: Operator creates Service (ClusterIP on port 8080)
+        ↓
+Step 20: Operator creates Route (external HTTPS access)
+        ↓
+Step 21: Operator creates Deployment (ibm-licensing-service)
+        ↓
+Step 22: Operator creates Deployment (ibm-licensing-usage)
+        ↓
+Step 23: Scheduler starts License Service Pods
+        ↓
+Step 24: Pods query K8s API for licensed pods
+        ↓
+Step 25: Operator updates IBMLicensing CR Status: Ready
+
+════════════════════════════════════════════════════════════
+PHASE 2 COMPLETE - License Service Running
+════════════════════════════════════════════════════════════
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>5. License Collection Mechanism</h2>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="title">How License Data is Collected</ac:parameter>
+  <ac:parameter ac:name="borderColor">#00875A</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>Step 1: Pod Discovery</strong></p>
+    <ul>
+      <li>License Service queries Kubernetes API to list all pods</li>
+      <li>Filters pods that have license annotations</li>
+      <li>Required annotations: productName, productID, productMetric, productChargedContainers</li>
+    </ul>
+    
+    <p><strong>Step 2: Resource Calculation</strong></p>
+    <ul>
+      <li>Extracts CPU limits from charged containers in each pod</li>
+      <li>Converts CPU limits to VPCs (Virtual Processor Cores)</li>
+      <li>Formula: 1000m (1 CPU core) = 1 VPC</li>
+      <li>Example: Container with 2000m CPU limit = 2 VPCs</li>
+    </ul>
+    
+    <p><strong>Step 3: Aggregation</strong></p>
+    <ul>
+      <li>Groups usage by productName and productID</li>
+      <li>Sums total VPCs per product across all pods</li>
+      <li>Updates metrics every 30 minutes (polling interval)</li>
+    </ul>
+    
+    <p><strong>Step 4: API Exposure</strong></p>
+    <ul>
+      <li>GET /status - Service health check</li>
+      <li>GET /products - List of detected products</li>
+      <li>POST /snapshot - Complete license usage snapshot (JSON)</li>
+      <li>Authentication: Bearer token from Secret (ibm-licensing-token)</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<h3>5.1 Example Pod Annotations</h3>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">yaml</ac:parameter>
+  <ac:parameter ac:name="title">Licensed Pod Example</ac:parameter>
+  <ac:plain-text-body><![CDATA[
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-0
+  namespace: kafka-prod
+  annotations:
+    productName: "IBM Event Streams"
+    productID: "5737-H33"
+    productVersion: "11.0.0"
+    productMetric: "VIRTUAL_PROCESSOR_CORE"
+    productChargedContainers: "kafka"
+spec:
+  containers:
+  - name: kafka
+    image: cp.icr.io/cp/ibm-eventstreams-kafka:11.0.0
+    resources:
+      limits:
+        cpu: "2"        # 2 CPU cores = 2 VPCs
+        memory: 4Gi
+      requests:
+        cpu: "1"
+        memory: 2Gi
+]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<h3>5.2 Example API Response</h3>
+
+<ac:structured-macro ac:name="code">
+  <ac:parameter ac:name="language">json</ac:parameter>
+  <ac:parameter ac:name="title">License Snapshot Response</ac:parameter>
+  <ac:plain-text-body><![CDATA[
+{
+  "products": [
+    {
+      "name": "IBM Event Streams",
+      "id": "5737-H33",
+      "metric": "VIRTUAL_PROCESSOR_CORE",
+      "usage": 6
+    },
+    {
+      "name": "IBM MQ",
+      "id": "5724-H72",
+      "metric": "VIRTUAL_PROCESSOR_CORE",
+      "usage": 1
+    }
+  ],
+  "timestamp": "2026-01-14T12:00:00Z",
+  "clusterId": "openshift-cluster-123"
+}
+]]></ac:plain-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>6. Security Context Constraints (SCC)</h2>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="bgColor">#FFEBE6</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>Profile:</strong> restricted (OpenShift default SCC)</p>
+    
+    <p><strong>Allowed:</strong></p>
+    <ul>
+      <li>RunAsAny UID strategy</li>
+      <li>Limited volume types: ConfigMap, Secret, EmptyDir</li>
+      <li>Read-only root filesystem (where applicable)</li>
+    </ul>
+    
+    <p><strong>Restricted (Not Allowed):</strong></p>
+    <ul>
+      <li>❌ No privileged containers</li>
+      <li>❌ No host network access</li>
+      <li>❌ No host PID/IPC access</li>
+      <li>❌ No root user (unless explicitly configured)</li>
+    </ul>
+    
+    <p><strong>Enforcement:</strong></p>
+    <ul>
+      <li>Applied via ServiceAccount isolation</li>
+      <li>All operator and operand pods run under restricted SCC</li>
+      <li>Validated by OpenShift admission controllers</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>7. Control Plane Integration</h2>
+
+<table>
+  <tbody>
+    <tr>
+      <th>Component</th>
+      <th>Role</th>
+      <th>Interaction</th>
+    </tr>
+    <tr>
+      <td><strong>API Server</strong></td>
+      <td>Central hub for all operations</td>
+      <td>
+        • Validates all resource requests<br/>
+        • Enforces RBAC authorization<br/>
+        • Stores resources in etcd<br/>
+        • Sends watch events to operator
+      </td>
+    </tr>
+    <tr>
+      <td><strong>etcd</strong></td>
+      <td>Cluster state storage</td>
+      <td>
+        • Stores all resource definitions<br/>
+        • Maintains IBMLicensing CR state<br/>
+        • Provides consistency guarantees
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Scheduler</strong></td>
+      <td>Pod placement</td>
+      <td>
+        • Places operator pod on suitable node<br/>
+        • Places operand pods based on resource requests<br/>
+        • Respects affinity/anti-affinity rules
+      </td>
+    </tr>
+    <tr>
+      <td><strong>Controller Manager</strong></td>
+      <td>Resource lifecycle</td>
+      <td>
+        • Garbage collects resources when CR deleted<br/>
+        • Manages owner references<br/>
+        • Handles finalizers
+      </td>
+    </tr>
+    <tr>
+      <td><strong>RBAC Engine</strong></td>
+      <td>Authorization</td>
+      <td>
+        • Validates ServiceAccount permissions<br/>
+        • Checks ClusterRole/Role rules<br/>
+        • Denies unauthorized operations
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h2>8. Resource Summary</h2>
+
+<h3>8.1 Phase 1: Operator Installation Resources</h3>
+
+<table>
+  <tbody>
+    <tr>
+      <th>Resource Type</th>
+      <th>Name</th>
+      <th>Scope</th>
+      <th>Purpose</th>
+    </tr>
+    <tr>
+      <td>CRD</td>
+      <td>ibmlicensings.operator.ibm.com</td>
+      <td>Cluster</td>
+      <td>Defines IBMLicensing resource schema</td>
+    </tr>
+    <tr>
+      <td>ServiceAccount</td>
+      <td>ibm-licensing-operator</td>
+      <td>Namespace</td>
+      <td>Operator identity</td>
+    </tr>
+    <tr>
+      <td>ClusterRole</td>
+      <td>ibm-licensing-operator</td>
+      <td>Cluster</td>
+      <td>Operator permissions</td>
+    </tr>
+    <tr>
+      <td>ClusterRoleBinding</td>
+      <td>ibm-licensing-operator</td>
+      <td>Cluster</td>
+      <td>Binds operator SA to ClusterRole</td>
+    </tr>
+    <tr>
+      <td>Deployment</td>
+      <td>ibm-licensing-operator</td>
+      <td>Namespace</td>
+      <td>Operator controller</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>8.2 Phase 2: IBMLicensing Instance Resources</h3>
+
+<table>
+  <tbody>
+    <tr>
+      <th>Resource Type</th>
+      <th>Name Pattern</th>
+      <th>Scope</th>
+      <th>Purpose</th>
+    </tr>
+    <tr>
+      <td>ServiceAccount</td>
+      <td>ibm-licensing-service</td>
+      <td>Namespace</td>
+      <td>Operand identity</td>
+    </tr>
+    <tr>
+      <td>ClusterRole</td>
+      <td>ibm-licensing-service</td>
+      <td>Cluster</td>
+      <td>Cluster-wide read permissions</td>
+    </tr>
+    <tr>
+      <td>ClusterRoleBinding</td>
+      <td>ibm-licensing-service</td>
+      <td>Cluster</td>
+      <td>Binds operand SA to ClusterRole</td>
+    </tr>
+    <tr>
+      <td>Role</td>
+      <td>ibm-licensing-service</td>
+      <td>Namespace</td>
+      <td>Namespace-scoped permissions</td>
+    </tr>
+    <tr>
+      <td>RoleBinding</td>
+      <td>ibm-licensing-service</td>
+      <td>Namespace</td>
+      <td>Binds operand SA to Role</td>
+    </tr>
+    <tr>
+      <td>ConfigMap</td>
+      <td>ibm-licensing-config</td>
+      <td>Namespace</td>
+      <td>Configuration data</td>
+    </tr>
+    <tr>
+      <td>Secret</td>
+      <td>ibm-licensing-token</td>
+      <td>Namespace</td>
+      <td>API authentication token</td>
+    </tr>
+    <tr>
+      <td>Service</td>
+      <td>ibm-licensing-service-{instance}</td>
+      <td>Namespace</td>
+      <td>Service endpoint (port 8080)</td>
+    </tr>
+    <tr>
+      <td>Route</td>
+      <td>ibm-licensing-service-{instance}</td>
+      <td>Namespace</td>
+      <td>External HTTPS access</td>
+    </tr>
+    <tr>
+      <td>Deployment</td>
+      <td>ibm-licensing-service-{instance}</td>
+      <td>Namespace</td>
+      <td>Main license service</td>
+    </tr>
+    <tr>
+      <td>Deployment</td>
+      <td>ibm-licensing-usage-{instance}</td>
+      <td>Namespace</td>
+      <td>Usage data collector</td>
+    </tr>
+  </tbody>
+</table>
+
+<hr/>
+
+<h2>9. API Access</h2>
+
+<ac:structured-macro ac:name="panel">
+  <ac:parameter ac:name="title">Accessing the License Service API</ac:parameter>
+  <ac:parameter ac:name="borderColor">#0052CC</ac:parameter>
+  <ac:rich-text-body>
+    <p><strong>Internal Access (within cluster):</strong></p>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+http://ibm-licensing-service-instance1.ibm-common-services.svc:8080
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+    
+    <p><strong>External Access (via Route):</strong></p>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+# Get the route URL
+oc get route ibm-licensing-service-instance1 -n ibm-common-services
+
+# Get the API token
+TOKEN=$(oc get secret ibm-licensing-token -n ibm-common-services -o jsonpath='{.data.token}' | base64 -d)
+
+# Call the API
+curl -k -H "Authorization: Bearer $TOKEN" \
+  https://ibm-licensing-service-instance1-ibm-common-services.apps.cluster.domain/snapshot
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+    
+    <p><strong>Available Endpoints:</strong></p>
+    <ul>
+      <li><code>GET /status</code> - Service health and version</li>
+      <li><code>GET /products</code> - List of detected licensed products</li>
+      <li><code>POST /snapshot</code> - Current license usage snapshot (JSON)</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>10. Troubleshooting Commands</h2>
+
+<ac:structured-macro ac:name="expand">
+  <ac:parameter ac:name="title">Common Troubleshooting Commands</ac:parameter>
+  <ac:rich-text-body>
+    <h4>Check Operator Status</h4>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+# Check operator pod
+oc get pods -n ibm-common-services -l name=ibm-licensing-operator
+
+# Check operator logs
+oc logs -n ibm-common-services -l name=ibm-licensing-operator
+
+# Check operator RBAC
+oc get clusterrole ibm-licensing-operator
+oc get clusterrolebinding ibm-licensing-operator
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+    
+    <h4>Check Operand Status</h4>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+# Check IBMLicensing CR
+oc get ibmlicensing -n ibm-common-services
+
+# Check operand pods
+oc get pods -n ibm-common-services -l app.kubernetes.io/name=ibm-licensing
+
+# Check service and route
+oc get svc,route -n ibm-common-services -l app.kubernetes.io/name=ibm-licensing
+
+# Check operand logs
+oc logs -n ibm-common-services -l app.kubernetes.io/name=ibm-licensing -c ibm-licensing
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+    
+    <h4>Verify RBAC Permissions</h4>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[
+# Check if operator SA can create deployments
+oc auth can-i create deployments \
+  --as=system:serviceaccount:ibm-common-services:ibm-licensing-operator \
+  -n ibm-common-services
+
+# Check if operand SA can list pods cluster-wide
+oc auth can-i list pods \
+  --as=system:serviceaccount:ibm-common-services:ibm-licensing-service \
+  --all-namespaces
+]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>11. Important Notes</h2>
+
+<ac:structured-macro ac:name="note">
+  <ac:rich-text-body>
+    <ul>
+      <li><strong>Version:</strong> IBM License Operator v4.2.19 on OpenShift 4.16</li>
+      <li><strong>Installation:</strong> Operator installed via OLM in ibm-common-services namespace (or custom)</li>
+      <li><strong>Two Phases:</strong> Phase 1 deploys operator controller, Phase 2 deploys operand resources</li>
+      <li><strong>RBAC:</strong> Operator has cluster-wide create/delete. Operand has cluster-wide READ only.</li>
+      <li><strong>Security:</strong> All components run under OpenShift restricted SCC</li>
+      <li><strong>Monitoring:</strong> License Service polls every 30 minutes for pod discovery</li>
+      <li><strong>API:</strong> External access via Route with bearer token authentication</li>
+    </ul>
+  </ac:rich-text-body>
+</ac:structured-macro>
+
+<hr/>
+
+<h2>12. Related Links</h2>
+
+<ul>
+  <li><strong>GitHub Repository:</strong> <a href="https://github.com/IBM/ibm-licensing-operator">https://github.com/IBM/ibm-licensing-operator</a></li>
+  <li><strong>Red Hat Operator Catalog:</strong> <a href="https://catalog.redhat.com/software/containers/opencloudio/ibm-licensing-operator">IBM License Service Operator</a></li>
+  <li><strong>IBM Documentation:</strong> <a href="https://www.ibm.com/docs">IBM Cloud Pak foundational services</a></li>
+</ul>
+
+<hr/>
+
+<p><em>Document created: January 2026 | IBM License Operator v4.2.19 | OpenShift 4.16</em></p>
+
+</ac:confluence>
