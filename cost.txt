@@ -1,3 +1,152 @@
+
+# Context: Red Hat Cost Management for ARO DEV — exploring options
+
+## My role and environment
+I'm a senior platform engineer working on OpenShift Container Platform
+(OCP) on Azure at a regulated financial institution. I manage ARO and
+self-managed OCP clusters across dev/sat/uat/prod in Canada Central
+and Canada East.
+
+This specific project: Red Hat Cost Management Service integration for
+an ARO DEV cluster. The project has been stalled approximately one
+year due to SPN access-control challenges with our security/IAM team.
+I am now revisiting it to determine which integration path (or
+combination) is actually feasible for our environment.
+
+## Architecture: two independent data flows
+
+**Flow A — In-cluster operator (no Azure permissions needed)**
+ARO cluster -> costmanagement-metrics-operator -> tar.gz over HTTPS ->
+console.redhat.com /api/ingress/v1/upload
+- Auth: cluster pull-secret token
+- Data sent: Prometheus usage metrics only — CPU-seconds,
+  memory-byte-seconds, storage, network. No dollar amounts.
+- Provides: per-namespace usage hierarchy, Resource Optimization
+  (ROS-OCP) recommendations, foundation for cost models.
+
+**Flow B — Azure-side cost export (requires SPN)**
+Azure Cost Management Export -> Storage Account (daily CSV) <- pulled
+server-side by Red Hat using SPN
+- Provides: real Azure dollar amounts, invoice reconciliation,
+  storage/network/egress cost attribution, ARO subscription cost.
+- Roles required: contradiction in Red Hat's own docs:
+  - docs.redhat.com generic Azure integration guide says:
+    Storage Blob Data Reader (storage account scope) +
+    Cost Management Reader (subscription scope)
+  - docs.redhat.com ARO-specific learning path says:
+    Storage Account Contributor (resource group scope) +
+    Cost Management Reader (resource group scope)
+  This contradiction is unresolved. A Red Hat support case is the
+  cleanest way to get an authoritative answer.
+
+The two flows are independent. Console.redhat.com correlates them
+server-side using cluster ID when both are present. Flow A alone gives
+usage-only showback; Flow B alone is pointless without OpenShift
+context; both together gives full per-namespace dollar showback.
+
+## What I'm trying to figure out
+
+I have NOT chosen Flow A or Flow B. I'm exploring whether either —
+or both — is feasible to implement in our environment given:
+
+1. Banking-regulated environment with strict change/security controls
+2. CIBC-style approval workflow for SPN creation (creating an SPN is
+   not something I can self-serve)
+3. Storage account access via access key (data plane) is something I
+   already have, but that does NOT translate to RBAC role-assignment
+   rights at subscription scope
+4. About a year of organizational stall on this project, so whichever
+   path I pursue needs to actually be deliverable, not just
+   technically correct
+5. The DEV cluster has direct egress to console.redhat.com (no proxy)
+   and a valid pull secret with cloud.openshift.com auth
+
+## What I want from you
+
+I'd like a structured feasibility analysis covering:
+
+1. **Flow A feasibility for our environment** — what could prevent
+   this from working in a banking ARO DEV cluster? Pull-secret
+   gotchas, egress assumptions, OpenShift version dependencies,
+   anything operator-specific that's failed in regulated environments
+   before. Honest red flags, not a pitch.
+
+2. **Flow B feasibility analysis** — given the role-assignment
+   discrepancy, the year-long stall, and the fact that I need IAM
+   to create an SPN, what's the realistic path to landing this?
+   Including:
+   - How to frame the role ask to security given the docs disagreement
+   - Whether federated workload identity is a viable alternative to
+     long-lived client secrets (which CIBC-style policies discourage)
+   - What evidence/artifacts to produce upfront to make the security
+     review tractable
+
+3. **Combined-flow assessment** — if Flow A is deployable today and
+   Flow B takes weeks/months, is starting with Flow A and adding Flow
+   B later a coherent strategy, or does it create technical debt /
+   confuse stakeholders / mislead with usage-only data?
+
+4. **Manual CSV alternative analysis** — I asked about pushing Azure
+   billing CSVs manually to console.redhat.com. Findings so far:
+   - The /api/ingress/v1/upload endpoint is hardcoded for the
+     operator's tarball format, not a generic CSV importer.
+   - Red Hat's "filtered integration" with manual CSV upload still
+     requires SPN access — it's about data filtering via an Azure
+     Function, not avoiding the SPN.
+   - No documented public path exists for manually pushing Azure
+     cost CSVs to console.redhat.com.
+   Is there anything I missed, or any partner/support channel that
+   exposes such a path? If not, confirm so I can stop chasing it.
+
+5. **Synthetic cost model option** — using Flow A only, then defining
+   a cost model in console.redhat.com with made-up per-unit rates
+   (e.g., $0.05/CPU-hour) to produce dollar-looking dashboards
+   against real usage data. Useful for proving the pipeline and
+   demoing to stakeholders, even though numbers don't reconcile to
+   Azure invoice. Is this a defensible interim state in a banking
+   environment, or will FinOps reject it as misleading?
+
+## What I'd like the deliverable to look like
+
+A feasibility comparison I can take to my manager and security
+stakeholders. Roughly:
+
+- A table comparing Flow A, Flow B, both-combined, and manual-CSV
+  paths across: time to first data, ongoing toil, security posture,
+  IAM dependency, accuracy of cost reporting, audit story
+- Recommended path with explicit reasoning
+- The 3-5 questions I should answer before committing to either flow
+- What artifacts I should produce now regardless of path (e.g.,
+  pull-secret verification, egress test, Red Hat support case for
+  the role discrepancy)
+
+## My scripting and formatting preferences (if you generate code)
+- printf over cat/heredoc in bash
+- Plain ASCII only — no emojis, unicode, box-drawing, special chars
+  in echo/printf output, log lines, comments, or separators
+- timeZone: America/New_York in CronJob specs
+- Never real company/team/org names — use Company XXX, Team XXX
+- set -euo pipefail at the top of every bash script
+- [ -z "$x" ] form, not [[ ]]
+- Prefer az CLI over Azure SDK when both work
+
+## What I do NOT want
+- Picking Flow A or Flow B for me without showing the reasoning
+- Glossing over the role-assignment doc discrepancy
+- Generic "it depends" non-answers — I want a recommendation with
+  caveats, not refusal to recommend
+- Underplaying the year-long stall: whichever path I pick has to be
+  realistically deliverable in this organization, not just correct
+  on paper
+
+Start by asking me any clarifying question that would materially
+change the feasibility analysis. If none, dive into the comparison.
+
+
+
+
+
+
 ---
 # 02-cost-config.yaml
 #
