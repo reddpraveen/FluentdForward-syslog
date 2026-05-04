@@ -1,0 +1,411 @@
+---
+# 02-cost-config.yaml
+#
+# CostManagementMetricsConfig CR.
+#
+# Mode: token auth + direct egress to console.redhat.com.
+#
+# Auth: The operator uses the cluster pull secret (already present at
+# openshift-config/pull-secret) to authenticate to console.redhat.com.
+# No additional Secret needs to be created.
+#
+# IMPORTANT: Before applying this CR, create the integration in the
+# Hybrid Cloud Console first:
+#   1. Log in to https://console.redhat.com
+#   2. Settings (gear icon) -> Integrations -> Cloud tab -> Add integration
+#   3. Type: Red Hat OpenShift Container Platform
+#   4. Name: aro-dev-cluster   (must match source.name below)
+#   5. The wizard will offer to install the operator for you - SKIP that,
+#      since this YAML installs it. Just complete the integration record.
+#   6. Copy the cluster identifier the wizard expects, then apply this CR.
+---
+apiVersion: costmanagement-metrics-cfg.openshift.io/v1beta1
+kind: CostManagementMetricsConfig
+metadata:
+  name: costmanagementmetricscfg
+  namespace: costmanagement-metrics-operator
+spec:
+  # ----- Authentication -----
+  authentication:
+    type: token
+
+  # ----- Packaging behavior -----
+  packaging:
+    max_reports_to_store: 30
+    max_size_MB: 100
+
+  # ----- Upload behavior -----
+  # upload_cycle is in MINUTES. 360 = every 6 hours.
+  # During initial testing you may want to set this to 60 (every hour)
+  # for faster feedback. Restore to 360 once data flow is confirmed.
+  upload:
+    upload_toggle: true
+    upload_cycle: 360
+    upload_wait: 10
+
+  # ----- Prometheus collection -----
+  # collect_previous_data on first install backfills up to the cluster
+  # monitoring retention period (default 14 days, max 90 days).
+  prometheus_config:
+    collect_previous_data: true
+    disable_metrics_collection_cost_management: false
+    disable_metrics_collection_resource_optimization: false
+
+  # ----- Source / integration on console.redhat.com -----
+  # create_source: false because the integration is created manually in
+  # the Hybrid Cloud Console UI before applying this CR.
+  source:
+    name: aro-dev-cluster
+    create_source: false
+    check_cycle: 1440
+
+  # ----- API endpoint -----
+  api_url: https://console.redhat.com
+
+
+
+
+
+
+#!/usr/bin/env bash
+#
+# verify-flow-a.sh
+#
+# Confirms the costmanagement-metrics-operator is healthy and that
+# data is reaching console.redhat.com.
+#
+# Run this AFTER applying the manifests. The first useful run is
+# about 5 minutes after install (operator should be up, CR reconciling).
+# Run again 6+ hours later to verify the first upload succeeded.
+#
+set -euo pipefail
+
+NS="costmanagement-metrics-operator"
+CR_NAME="costmanagementmetricscfg"
+
+log()  { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+pass() { printf 'PASS: %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*"; FAILED=1; }
+warn() { printf 'WARN: %s\n' "$*"; }
+
+FAILED=0
+
+# ---------------------------------------------------------------------------
+# 1. Subscription
+# ---------------------------------------------------------------------------
+log "Checking Subscription"
+SUB_STATE="$(oc -n "$NS" get subscription costmanagement-metrics-operator \
+    -o jsonpath='{.status.state}' 2>/dev/null || true)"
+if [ "$SUB_STATE" = "AtLatestKnown" ]; then
+    pass "Subscription is AtLatestKnown"
+else
+    fail "Subscription state: $SUB_STATE (expected AtLatestKnown)"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. ClusterServiceVersion
+# ---------------------------------------------------------------------------
+log "Checking CSV"
+CSV_NAME="$(oc -n "$NS" get subscription costmanagement-metrics-operator \
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true)"
+if [ -z "$CSV_NAME" ]; then
+    fail "No installed CSV found"
+else
+    CSV_PHASE="$(oc -n "$NS" get csv "$CSV_NAME" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "$CSV_PHASE" = "Succeeded" ]; then
+        pass "CSV $CSV_NAME is Succeeded"
+    else
+        fail "CSV $CSV_NAME phase: $CSV_PHASE"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Operator pod
+# ---------------------------------------------------------------------------
+log "Checking operator pod"
+POD_NAME="$(oc -n "$NS" get pod \
+    -l app=costmanagement-metrics-operator \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+if [ -z "$POD_NAME" ]; then
+    POD_NAME="$(oc -n "$NS" get pod \
+        -l control-plane=controller-manager \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+fi
+
+if [ -z "$POD_NAME" ]; then
+    fail "Operator pod not found"
+else
+    POD_PHASE="$(oc -n "$NS" get pod "$POD_NAME" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    if [ "$POD_PHASE" = "Running" ]; then
+        pass "Operator pod $POD_NAME is Running"
+    else
+        fail "Operator pod $POD_NAME phase: $POD_PHASE"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4. CR exists and has status
+# ---------------------------------------------------------------------------
+log "Checking CostManagementMetricsConfig CR"
+CR_EXISTS="$(oc -n "$NS" get costmanagementmetricsconfig "$CR_NAME" \
+    -o name 2>/dev/null || true)"
+if [ -z "$CR_EXISTS" ]; then
+    fail "CR $CR_NAME not found"
+else
+    pass "CR $CR_NAME exists"
+
+    CLUSTER_ID="$(oc -n "$NS" get costmanagementmetricsconfig "$CR_NAME" \
+        -o jsonpath='{.status.clusterID}' 2>/dev/null || true)"
+    if [ -n "$CLUSTER_ID" ]; then
+        pass "Cluster ID resolved: $CLUSTER_ID"
+    else
+        warn "Cluster ID not yet populated in CR status"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Egress reachability
+# ---------------------------------------------------------------------------
+log "Testing egress to console.redhat.com from operator pod"
+if [ -n "$POD_NAME" ]; then
+    HTTP_CODE="$(oc -n "$NS" exec "$POD_NAME" -c manager -- \
+        curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time 10 \
+        https://console.redhat.com/api/ingress/v1/version 2>/dev/null || echo "000")"
+    case "$HTTP_CODE" in
+        200|401|403)
+            pass "console.redhat.com reachable (HTTP $HTTP_CODE)"
+            ;;
+        000)
+            fail "console.redhat.com unreachable from operator pod"
+            ;;
+        *)
+            warn "console.redhat.com returned HTTP $HTTP_CODE (may still be OK)"
+            ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Reports being generated
+# ---------------------------------------------------------------------------
+log "Checking for generated reports"
+if [ -n "$POD_NAME" ]; then
+    REPORT_COUNT="$(oc -n "$NS" exec "$POD_NAME" -c manager -- \
+        sh -c 'ls /tmp/costmanagement-metrics-operator-reports/upload 2>/dev/null | wc -l' \
+        2>/dev/null || echo 0)"
+    if [ "$REPORT_COUNT" -gt 0 ]; then
+        pass "$REPORT_COUNT report bundle(s) present in upload directory"
+    else
+        warn "No reports yet (operator may still be in initial collection cycle)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Last successful upload
+# ---------------------------------------------------------------------------
+log "Checking last successful upload time"
+LAST_UPLOAD="$(oc -n "$NS" get costmanagementmetricsconfig "$CR_NAME" \
+    -o jsonpath='{.status.upload.last_successful_upload_time}' 2>/dev/null || true)"
+if [ -z "$LAST_UPLOAD" ] || [ "$LAST_UPLOAD" = "null" ]; then
+    warn "No successful upload recorded yet (allow up to 6 hours after install)"
+else
+    pass "Last successful upload: $LAST_UPLOAD"
+fi
+
+LAST_UPLOAD_STATUS="$(oc -n "$NS" get costmanagementmetricsconfig "$CR_NAME" \
+    -o jsonpath='{.status.upload.last_upload_status}' 2>/dev/null || true)"
+[ -n "$LAST_UPLOAD_STATUS" ] && log "Last upload status: $LAST_UPLOAD_STATUS"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+printf '\n=== Recent operator log lines (last 20) ===\n'
+if [ -n "$POD_NAME" ]; then
+    oc -n "$NS" logs "$POD_NAME" -c manager --tail=20 2>/dev/null || true
+fi
+
+printf '\n=== Result ===\n'
+if [ "$FAILED" -eq 0 ]; then
+    log "All hard checks passed. WARN items resolve once the upload cycle elapses."
+    exit 0
+else
+    fail "One or more hard checks failed. Review output above."
+    exit 1
+fi
+
+
+
+
+
+# Flow A: ARO -> console.redhat.com (in-cluster operator only)
+
+## What this deploys
+
+The cluster-side piece only. The `costmanagement-metrics-operator`
+runs inside the ARO DEV cluster, scrapes Prometheus every hour,
+packages reports, and uploads them to `console.redhat.com` over HTTPS
+using the cluster pull secret.
+
+No Azure SPN. No storage account. No IAM ticket. Deployable today.
+
+What you get: per-namespace, per-pod usage data (CPU-seconds,
+memory-byte-seconds, storage-byte-seconds, network) visible at
+console.redhat.com/openshift/cost-management. You will NOT see dollar
+amounts from Flow A alone - that requires Flow B (Azure cost
+integration). You'll see the showback hierarchy and the structure
+that Flow B later layers cost onto.
+
+## Configuration assumptions
+
+| Assumption           | Setting                                                |
+|----------------------|--------------------------------------------------------|
+| Egress to internet   | Direct (no proxy)                                      |
+| Authentication mode  | Token (uses cluster pull secret)                       |
+| Source name          | aro-dev-cluster (change in 02-cost-config.yaml if needed) |
+| Upload cycle         | Every 6 hours                                          |
+| Backfill on install  | Up to cluster monitoring retention (default 14 days)   |
+
+## Prerequisites
+
+| Requirement                                  | How to verify                                          |
+|----------------------------------------------|--------------------------------------------------------|
+| cluster-admin on the ARO DEV cluster         | `oc auth can-i '*' '*' --all-namespaces`               |
+| Egress to console.redhat.com                 | `oc debug node/<any-worker-node> -- curl -sS -o /dev/null -w '%{http_code}\n' https://console.redhat.com` (expect 200) |
+| Valid cluster pull secret                    | See command below                                      |
+| Red Hat account with Cloud Administrator     | Log in to console.redhat.com, check User Access        |
+
+Verify the pull secret contains `cloud.openshift.com`:
+
+```bash
+oc get secret pull-secret -n openshift-config \
+    -o jsonpath='{.data.\.dockerconfigjson}' \
+    | base64 -d \
+    | jq '.auths | keys'
+```
+
+You should see `"cloud.openshift.com"` in the list. If not, the cluster
+was deployed in ARO's "limited" mode - the operator will install but
+uploads will return 401 until you update the pull secret. Microsoft's
+docs cover that procedure separately.
+
+## Deploy sequence
+
+```bash
+# 1. Install the operator
+oc apply -f 01-namespace-operator.yaml
+
+# 2. Wait for the operator pod
+oc -n costmanagement-metrics-operator wait \
+    --for=condition=Ready pod \
+    -l control-plane=controller-manager \
+    --timeout=300s
+
+# 3. Create the integration in Hybrid Cloud Console FIRST
+#    https://console.redhat.com -> Settings -> Integrations -> Cloud
+#    -> Add integration
+#    Type: Red Hat OpenShift Container Platform
+#    Name: aro-dev-cluster   (must match source.name in the CR)
+#    Skip the operator-install steps in the wizard - we install via YAML.
+
+# 4. Apply the config CR
+oc apply -f 02-cost-config.yaml
+
+# 5. Wait for first reconcile
+sleep 60
+
+# 6. Verify
+chmod +x verify-flow-a.sh
+./verify-flow-a.sh
+```
+
+## Expected timeline
+
+| Time       | Event                                                        |
+|------------|--------------------------------------------------------------|
+| T+0        | Manifests applied                                            |
+| T+1 min    | Operator picks up CR, begins first Prometheus query cycle    |
+| T+1 hour   | First report packaged into the operator's upload directory   |
+| T+6 hours  | First upload attempt (per upload_cycle: 360)                 |
+| T+24 hours | Data visible in cost management UI                           |
+| T+48 hours | Dashboard fully populated                                    |
+
+For faster initial feedback, drop `upload.upload_cycle` to 60 in the CR.
+Restore to 360 once you've confirmed the data flow.
+
+## Useful runtime commands
+
+```bash
+# Tail operator logs
+oc -n costmanagement-metrics-operator logs -f \
+    -l control-plane=controller-manager -c manager
+
+# Inspect CR status (where the interesting fields live)
+oc -n costmanagement-metrics-operator get costmanagementmetricsconfig \
+    costmanagementmetricscfg -o yaml | yq .status
+
+# Check upload status field directly
+oc -n costmanagement-metrics-operator get costmanagementmetricsconfig \
+    costmanagementmetricscfg \
+    -o jsonpath='{.status.upload.last_successful_upload_time}{"\n"}'
+
+# Look at staged report bundles inside the operator pod
+POD=$(oc -n costmanagement-metrics-operator get pod \
+    -l control-plane=controller-manager -o name | head -1)
+oc -n costmanagement-metrics-operator exec "$POD" -c manager -- \
+    ls -la /tmp/costmanagement-metrics-operator-reports/upload
+```
+
+## What to check at console.redhat.com
+
+After ~24 hours:
+
+1. Go to https://console.redhat.com/openshift/cost-management/
+2. Filter by source name (`aro-dev-cluster`)
+3. You should see CPU-hours and memory-byte-seconds by project
+4. NO dollar amounts (expected without Flow B)
+
+## Common failure modes
+
+| Symptom                                       | Likely cause                              | Fix                                                                 |
+|-----------------------------------------------|-------------------------------------------|---------------------------------------------------------------------|
+| CSV stuck in Pending                          | OperatorHub catalog source not healthy    | `oc get catsrc -n openshift-marketplace`                            |
+| Operator pod CrashLoopBackOff                 | Bad CR spec                               | `oc describe costmanagementmetricsconfig` for validation errors     |
+| Upload returns 401                            | Pull secret missing cloud.openshift.com   | Update the cluster pull secret per Red Hat / Microsoft docs         |
+| Source not found at upload                    | Integration not pre-created                | Create integration in console.redhat.com UI first                  |
+| `last_successful_upload_time` stays empty     | upload_cycle not yet elapsed              | Wait the full upload_cycle, or drop it to 60 for testing            |
+
+## Decommission
+
+```bash
+oc delete -f 02-cost-config.yaml
+oc delete -f 01-namespace-operator.yaml
+```
+
+The integration on console.redhat.com remains until manually deleted
+under Settings -> Integrations.
+
+## Files
+
+| File                          | Purpose                                              |
+|-------------------------------|------------------------------------------------------|
+| 01-namespace-operator.yaml    | Namespace, OperatorGroup, Subscription               |
+| 02-cost-config.yaml           | CostManagementMetricsConfig CR                       |
+| verify-flow-a.sh              | Health check script                                  |
+| README.md                     | This file                                            |
+
+## What this is NOT
+
+- Does not give dollar-cost showback. Usage units only.
+- Does not require any Azure permissions, SPN, or storage account.
+- Does not need IAM team involvement.
+- Does not pull Azure billing data.
+
+If/when Flow B (Azure SPN + cost export) is added later,
+console.redhat.com correlates the two automatically. No changes needed
+to this Flow A deployment.
+
+
+
+
